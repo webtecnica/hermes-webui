@@ -1587,6 +1587,9 @@ function applyBotName(){
   // options are enough for first paint; the dynamic provider list can settle
   // after the saved session is visible.
   const _hydrateBootModelDropdown=()=>populateModelDropdown({preferProfileDefaultOnFreshBoot:true}).then(()=>{
+    const sessionModelState=S.session&&S.session.model
+      ? {model:S.session.model,model_provider:S.session.model_provider||null}
+      : null;
     const savedState=(typeof _readPersistedModelState==='function')
       ? _readPersistedModelState()
       : (localStorage.getItem('hermes-webui-model')?{model:localStorage.getItem('hermes-webui-model'),model_provider:null}:null);
