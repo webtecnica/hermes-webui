@@ -3,6 +3,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- WebUI streaming sessions created under a non-default profile now attach `session_search` to that profile's `state.db` instead of the server's default profile database. (#2965)
+
 ## [v0.51.141] — 2026-05-26 — Release DM (stage-batch23 — 4-PR second hold-bucket pass)
 
 ### Added

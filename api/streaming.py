@@ -4231,7 +4231,8 @@ def _run_agent_streaming(
             _session_db = None
             try:
                 from hermes_state import SessionDB
-                _session_db = SessionDB()
+                _state_db_path = (Path(_profile_home) / "state.db") if _profile_home else None
+                _session_db = SessionDB(db_path=_state_db_path)
             except Exception as _db_err:
                 print(f"[webui] WARNING: SessionDB init failed — session_search will be unavailable: {_db_err}", flush=True)
             resolved_model, resolved_provider, resolved_base_url = resolve_model_provider(
