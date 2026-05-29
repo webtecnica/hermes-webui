@@ -12969,6 +12969,11 @@ def _joplin_api_get(path: str, params: dict | None = None) -> dict:
         raise ValueError("Joplin token is not configured")
     safe_path = "/" + str(path or "").lstrip("/")
     query = dict(params or {})
+    # Joplin Web Clipper builds can reject header-only auth on /search even when
+    # they accept it elsewhere. Keep the Authorization header for defense in
+    # depth and add the query token only for /search compatibility.
+    if safe_path == "/search":
+        query["token"] = token
     url = f"{base_url}{safe_path}?{urlencode(query)}"
     request = Request(url, headers={"Authorization": f"token {token}"})
     try:

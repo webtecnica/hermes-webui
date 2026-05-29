@@ -3,6 +3,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Joplin notes search now keeps the `Authorization` header and adds a query-token compatibility shim only for Web Clipper `/search` calls, covering clipper builds that return HTTP 403 for header-only search auth while keeping other Joplin API URLs token-free.
+
 ## [v0.51.157] — 2026-05-28 — Release EC (stage-batch39 — 5-PR mixed-risk cleanup: gateway prefill forward + prefill budget + compressed-continuation sidebar + browser-transcript memory guidance + reasoning max parity)
 
 ### Added
