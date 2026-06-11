@@ -9230,6 +9230,10 @@ def _handle_session_export(handler, parsed):
         s = get_session(sid)
     except KeyError:
         return bad(handler, "Session not found", 404)
+    from api.profiles import get_active_profile_name
+
+    if not _profiles_match(getattr(s, "profile", None), get_active_profile_name()):
+        return bad(handler, "Session not found", 404)
     safe = redact_session_data(s.__dict__)
     payload = json.dumps(safe, ensure_ascii=False, indent=2)
     handler.send_response(200)
