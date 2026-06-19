@@ -2344,14 +2344,51 @@ function _kanbanRunHtml(run){
   </div>`;
 }
 
+function _kanbanJsArg(s){
+  // Encode a value for safe interpolation inside an inline on* handler's JS
+  // string literal. JSON.stringify quotes/escapes for JS context; esc() then
+  // makes it safe inside the HTML attribute. Without this, a task id containing
+  // a quote breaks out of the handler (esc() alone is HTML-escaping, which the
+  // browser decodes BEFORE executing the inline handler). (#3797)
+  return esc(JSON.stringify(String(s == null ? '' : s)));
+}
+function _kanbanLinkableTaskOptions(excludeId){
+  // Datalist of existing task ids (with title as the option label) so the
+  // dependency field is a pick-from-real-tasks autocomplete rather than a blind
+  // free-text opaque-id box. Mirrors the tenant datalist pattern.
+  const cols = (_kanbanBoard && _kanbanBoard.columns) || [];
+  const seen = new Set();
+  const opts = [];
+  for (const col of cols) {
+    for (const task of (col.tasks || [])) {
+      const id = task && task.id;
+      if (!id || id === excludeId || seen.has(id)) continue;
+      seen.add(id);
+      opts.push(`<option value="${esc(id)}">${esc(_kanbanTaskTitle(task))}</option>`);
+    }
+  }
+  return opts.join('');
+}
 function _kanbanLinksHtml(links){
   const parents = (links && links.parents) || [];
   const children = (links && links.children) || [];
-  if (!parents.length && !children.length) return '';
-  const item = id => `<code>${esc(id)}</code>`;
-  return `<div class="kanban-detail-links-grid">
-    <div><strong>${esc(t('kanban_parents'))}</strong><div>${parents.length ? parents.map(item).join(' ') : esc(t('kanban_empty'))}</div></div>
-    <div><strong>${esc(t('kanban_children'))}</strong><div>${children.length ? children.map(item).join(' ') : esc(t('kanban_empty'))}</div></div>
+  const taskId = _kanbanCurrentTaskId;
+  const item = (id, isParent) => {
+    const parentId = isParent ? id : taskId;
+    const childId = isParent ? taskId : id;
+    return `<code>${esc(id)} <button class="btn mini" onclick="removeKanbanDependency(${_kanbanJsArg(parentId)},${_kanbanJsArg(childId)})" data-i18n="kanban_remove_dependency" title="${esc(t('kanban_remove_dependency') || 'Remove')}">✕</button></code>`;
+  };
+  const hasLinks = parents.length || children.length;
+  return `<div class="kanban-detail-links-section">
+    ${hasLinks ? `<div class="kanban-detail-links-grid">
+      <div><strong>${esc(t('kanban_parents'))}</strong><div>${parents.length ? parents.map(id => item(id, true)).join(' ') : esc(t('kanban_empty'))}</div></div>
+      <div><strong>${esc(t('kanban_children'))}</strong><div>${children.length ? children.map(id => item(id, false)).join(' ') : esc(t('kanban_empty'))}</div></div>
+    </div>` : ''}
+    <div class="kanban-detail-links-controls">
+      <input type="text" id="kanbanDependencyInput" class="kanban-detail-links-input" list="kanbanDependencyOptions" maxlength="255" autocomplete="off" data-i18n-placeholder="kanban_dependency_placeholder" placeholder="Task ID to link">
+      <datalist id="kanbanDependencyOptions">${_kanbanLinkableTaskOptions(taskId)}</datalist>
+      <button class="btn secondary" onclick="addKanbanDependency(${_kanbanJsArg(taskId)})" data-i18n="kanban_add_dependency">Add dependency</button>
+    </div>
   </div>`;
 }
 
@@ -2628,12 +2665,20 @@ function _kanbanResetTaskModalFields(values){
 function _kanbanSetTaskModalLabels(mode){
   const titleH = document.getElementById('kanbanTaskModalTitle');
   const submitBtn = document.getElementById('kanbanTaskModalSubmit');
+  const workspaceKindEl = document.getElementById('kanbanTaskModalWorkspaceKind');
+  const workspacePathEl = document.getElementById('kanbanTaskModalWorkspacePath');
   if (mode === 'edit') {
     if (titleH) titleH.textContent = t('kanban_edit_task') || 'Edit task';
     if (submitBtn) submitBtn.textContent = t('save') || 'Save';
+    // Disable workspace fields during edit since they are not handled by the backend
+    if (workspaceKindEl) workspaceKindEl.disabled = true;
+    if (workspacePathEl) workspacePathEl.disabled = true;
   } else {
     if (titleH) titleH.textContent = t('kanban_new_task') || 'New task';
     if (submitBtn) submitBtn.textContent = t('create') || 'Create';
+    // Enable workspace fields during create
+    if (workspaceKindEl) workspaceKindEl.disabled = false;
+    if (workspacePathEl) workspacePathEl.disabled = false;
   }
 }
 
@@ -2727,6 +2772,14 @@ function _kanbanTaskModalKey(ev){
   }
 }
 
+function _kanbanOnWorkspaceKindChange(){
+  const kindEl = document.getElementById('kanbanTaskModalWorkspaceKind');
+  const pathRowEl = document.getElementById('kanbanTaskModalWorkspacePathRow');
+  if (!kindEl || !pathRowEl) return;
+  const kind = kindEl.value;
+  pathRowEl.style.display = (kind === 'scratch') ? 'none' : 'block';
+}
+
 async function submitKanbanTaskModal(){
   const titleEl = document.getElementById('kanbanTaskModalTitleInput');
   const bodyEl = document.getElementById('kanbanTaskModalBody');
@@ -2734,6 +2787,8 @@ async function submitKanbanTaskModal(){
   const assigneeEl = document.getElementById('kanbanTaskModalAssignee');
   const tenantEl = document.getElementById('kanbanTaskModalTenant');
   const priorityEl = document.getElementById('kanbanTaskModalPriority');
+  const workspaceKindEl = document.getElementById('kanbanTaskModalWorkspaceKind');
+  const workspacePathEl = document.getElementById('kanbanTaskModalWorkspacePath');
   const errEl = document.getElementById('kanbanTaskModalError');
   const submitBtn = document.getElementById('kanbanTaskModalSubmit');
   const title = titleEl ? titleEl.value.trim() : '';
@@ -2745,12 +2800,23 @@ async function submitKanbanTaskModal(){
   // Build payload — for create we omit defaulted fields so the backend chooses;
   // for edit we send every field so users can clear assignee/tenant/body.
   const isEdit = _kanbanTaskModalMode === 'edit';
+  // Validate workspace path for non-scratch workspace kinds (create mode only)
+  const workspaceKind = workspaceKindEl ? workspaceKindEl.value : 'scratch';
+  if (!isEdit && workspaceKind !== 'scratch') {
+    const workspacePath = workspacePathEl ? workspacePathEl.value.trim() : '';
+    if (!workspacePath) {
+      if (errEl) errEl.textContent = t('kanban_workspace_path_required') || 'Workspace path is required for non-scratch workspaces.';
+      if (workspacePathEl) workspacePathEl.focus();
+      return;
+    }
+  }
   const payload = {title};
   const bodyVal = bodyEl ? bodyEl.value : '';
   const assigneeVal = assigneeEl ? assigneeEl.value.trim() : '';
   const tenantVal = tenantEl ? tenantEl.value.trim() : '';
   const statusVal = statusEl ? statusEl.value : '';
   const priorityRaw = priorityEl ? priorityEl.value : '';
+  const workspacePathVal = workspacePathEl ? workspacePathEl.value.trim() : '';
   if (isEdit) {
     payload.body = bodyVal;
     payload.assignee = assigneeVal || null;
@@ -2764,6 +2830,8 @@ async function submitKanbanTaskModal(){
     }
     const n = parseInt(priorityRaw, 10);
     payload.priority = Number.isNaN(n) ? 0 : n;
+    // Note: workspace_kind and workspace_path are not sent on edit because
+    // the backend _patch_task does not handle them (they are dropped).
   } else {
     if (bodyVal.trim()) payload.body = bodyVal;
     if (statusVal) payload.status = statusVal;
@@ -2773,6 +2841,8 @@ async function submitKanbanTaskModal(){
       const n = parseInt(priorityRaw, 10);
       if (!Number.isNaN(n)) payload.priority = n;
     }
+    payload.workspace_kind = workspaceKind;
+    if (workspacePathVal) payload.workspace_path = workspacePathVal;
   }
   // Soft warning: a Ready task with the explicit "Unassigned" option will sit
   // forever because the dispatcher skips unassigned rows (kanban_db.py:3567).
@@ -2842,6 +2912,40 @@ async function addKanbanComment(taskId){
     });
     if (input) input.value = '';
     await loadKanbanTask(taskId);
+  } catch(e) { showToast(t('kanban_unavailable') + ': ' + (e.message || e), 'error'); }
+}
+
+async function addKanbanDependency(taskId){
+  const input = document.getElementById('kanbanDependencyInput');
+  const linkTo = input ? input.value.trim() : '';
+  if (!taskId || !linkTo) return;
+  if (linkTo === taskId) {
+    showToast(t('kanban_dependency_self') || 'A task cannot depend on itself', 'error');
+    return;
+  }
+  try {
+    // "Add dependency" on task X means "X depends on linkTo" → linkTo is the
+    // prerequisite (parent) that must complete before X (child). The backend
+    // models a (parent_id, child_id) row as parent=prerequisite/child=dependent
+    // (api/kanban_bridge.py), so linkTo is the parent and the current task is
+    // the child. (#3797)
+    await api('/api/kanban/links' + _kanbanBoardQuery(), {
+      method: 'POST',
+      body: JSON.stringify({parent_id: linkTo, child_id: taskId}),
+    });
+    if (input) input.value = '';
+    await loadKanbanTask(taskId);
+  } catch(e) { showToast(t('kanban_unavailable') + ': ' + (e.message || e), 'error'); }
+}
+
+async function removeKanbanDependency(parentId, childId){
+  if (!parentId || !childId) return;
+  try {
+    await api('/api/kanban/links/delete' + _kanbanBoardQuery(), {
+      method: 'POST',
+      body: JSON.stringify({parent_id: parentId, child_id: childId}),
+    });
+    await loadKanbanTask(_kanbanCurrentTaskId);
   } catch(e) { showToast(t('kanban_unavailable') + ': ' + (e.message || e), 'error'); }
 }
 
