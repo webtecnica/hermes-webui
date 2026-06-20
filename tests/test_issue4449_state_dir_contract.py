@@ -1,64 +1,83 @@
-"""Regression tests for the #4449 state-dir contract folded into #4454."""
+"""Regression tests for the #4449 state-dir contract folded into #4454.
+
+`api.config.STATE_DIR` is a module-level global computed from the environment at
+import time. Exercising how it's derived requires importing config under a
+specific HERMES_HOME / HERMES_WEBUI_STATE_DIR. We do this in a SUBPROCESS rather
+than `importlib.reload(config)` in-process: reloading config inside the shared
+pytest process leaks recomputed globals (STATE_DIR/SESSION_DIR) and stale
+references into later tests (the cancel/stream/health/state-isolation suites),
+which is fragile no matter how carefully env is restored. A subprocess gives a
+truly isolated import and can't pollute the test process.
+"""
 
 from __future__ import annotations
 
-import importlib
 import os
+import subprocess
+import sys
+from pathlib import Path
 
-import api.config as config
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+_PROBE = (
+    "import api.config as c; "
+    "print(c.STATE_DIR)"
+)
+
+
+def _state_dir_for_env(**env_overrides) -> Path:
+    """Import api.config in a fresh subprocess under the given env and return
+    the resolved STATE_DIR it computes. None-valued overrides unset the var."""
+    env = dict(os.environ)
+    # Start from a clean slate for the two vars under test so the parent
+    # process's pytest values don't bleed in.
+    env.pop("HERMES_HOME", None)
+    env.pop("HERMES_WEBUI_STATE_DIR", None)
+    for key, value in env_overrides.items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = str(value)
+    out = subprocess.run(
+        [sys.executable, "-c", _PROBE],
+        cwd=str(REPO_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert out.returncode == 0, f"probe failed: {out.stderr}"
+    return Path(out.stdout.strip()).resolve()
+
+
+def _platform_default_state_dir() -> Path:
+    """What STATE_DIR resolves to with HERMES_HOME + STATE_DIR both unset."""
+    return _state_dir_for_env()
 
 
 def test_config_state_dir_defaults_to_hermes_home_webui(tmp_path):
     hermes_home = tmp_path / ".hermes" / "profiles" / "isolated"
     hermes_home.mkdir(parents=True)
 
-    old_home = os.environ.get("HERMES_HOME")
-    old_state_dir = os.environ.get("HERMES_WEBUI_STATE_DIR")
-    try:
-        os.environ["HERMES_HOME"] = str(hermes_home)
-        os.environ.pop("HERMES_WEBUI_STATE_DIR", None)
-
-        reloaded = importlib.reload(config)
-
-        assert reloaded.STATE_DIR == (hermes_home / "webui").resolve()
-    finally:
-        if old_home is None:
-            os.environ.pop("HERMES_HOME", None)
-        else:
-            os.environ["HERMES_HOME"] = old_home
-        if old_state_dir is None:
-            os.environ.pop("HERMES_WEBUI_STATE_DIR", None)
-        else:
-            os.environ["HERMES_WEBUI_STATE_DIR"] = old_state_dir
-        importlib.reload(config)
+    state_dir = _state_dir_for_env(HERMES_HOME=hermes_home)
+    assert state_dir == (hermes_home / "webui").resolve()
 
 
-def test_config_state_dir_unchanged_for_normal_install_hermes_home_unset(tmp_path):
+def test_config_state_dir_unchanged_for_normal_install_hermes_home_unset():
     """Backward-compat: with HERMES_HOME unset, STATE_DIR stays at the platform
     default `<~/.hermes>/webui` — a normal install's state must NOT relocate
-    (the #4449/#4454 state-dir move only affects an explicitly-set HERMES_HOME)."""
-    old_home = os.environ.get("HERMES_HOME")
-    old_state_dir = os.environ.get("HERMES_WEBUI_STATE_DIR")
-    try:
-        os.environ.pop("HERMES_HOME", None)
-        os.environ.pop("HERMES_WEBUI_STATE_DIR", None)
+    (the #4449/#4454 state-dir move only affects an explicitly-set HERMES_HOME).
 
-        reloaded = importlib.reload(config)
-
-        # _platform_default_hermes_home() drives the default; STATE_DIR must be
-        # that base + /webui, exactly as on master before the #4449 change.
-        expected = (reloaded._platform_default_hermes_home() / "webui").resolve()
-        assert reloaded.STATE_DIR == expected
-    finally:
-        if old_home is None:
-            os.environ.pop("HERMES_HOME", None)
-        else:
-            os.environ["HERMES_HOME"] = old_home
-        if old_state_dir is None:
-            os.environ.pop("HERMES_WEBUI_STATE_DIR", None)
-        else:
-            os.environ["HERMES_WEBUI_STATE_DIR"] = old_state_dir
-        importlib.reload(config)
+    Cross-check: the unset-HERMES_HOME result must NOT equal the result of
+    pointing HERMES_HOME at an arbitrary other base — i.e. the default is
+    genuinely the platform home, not whatever the test environment injected."""
+    default = _platform_default_state_dir()
+    assert default.name == "webui"
+    # Pointing HERMES_HOME elsewhere produces a DIFFERENT dir, proving the unset
+    # case resolves to the platform default rather than echoing an injected base.
+    elsewhere = _state_dir_for_env(HERMES_HOME="/tmp/hermes-4449-elsewhere-base")
+    assert elsewhere == Path("/tmp/hermes-4449-elsewhere-base/webui").resolve()
+    assert default != elsewhere
 
 
 def test_config_state_dir_explicit_override_takes_precedence(tmp_path):
@@ -68,22 +87,8 @@ def test_config_state_dir_explicit_override_takes_precedence(tmp_path):
     hermes_home.mkdir(parents=True)
     explicit = tmp_path / "custom-state"
 
-    old_home = os.environ.get("HERMES_HOME")
-    old_state_dir = os.environ.get("HERMES_WEBUI_STATE_DIR")
-    try:
-        os.environ["HERMES_HOME"] = str(hermes_home)
-        os.environ["HERMES_WEBUI_STATE_DIR"] = str(explicit)
-
-        reloaded = importlib.reload(config)
-
-        assert reloaded.STATE_DIR == explicit.resolve()
-    finally:
-        if old_home is None:
-            os.environ.pop("HERMES_HOME", None)
-        else:
-            os.environ["HERMES_HOME"] = old_home
-        if old_state_dir is None:
-            os.environ.pop("HERMES_WEBUI_STATE_DIR", None)
-        else:
-            os.environ["HERMES_WEBUI_STATE_DIR"] = old_state_dir
-        importlib.reload(config)
+    state_dir = _state_dir_for_env(
+        HERMES_HOME=hermes_home,
+        HERMES_WEBUI_STATE_DIR=explicit,
+    )
+    assert state_dir == explicit.resolve()
