@@ -1283,6 +1283,13 @@ def _get_provider_api_key(provider_id: str) -> str | None:
                     return cp_key
     # Fallback: try credential pool (e.g. bothub key stored via auth.json)
     for entry in _pool_entry_payloads(provider_id):
+        status = str(entry.get("last_status") or "").strip().lower()
+        if status == "dead":
+            continue
+        if status == "exhausted":
+            ns = SimpleNamespace(**entry)
+            if _entry_is_pool_exhausted(ns):
+                continue
         key = str(
             entry.get("runtime_api_key")
             or entry.get("agent_key")
