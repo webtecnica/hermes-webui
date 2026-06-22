@@ -3,6 +3,12 @@
 
 ## [Unreleased]
 
+## [v0.51.593] — 2026-06-22 — Release UZ (gateway-poll visibility-listener cleanup)
+
+### Fixed
+
+- **The gateway-poll fallback's tab-refocus catch-up listener is now removed when polling stops and correctly re-attaches when it restarts.** Follow-up to #4730: the `visibilitychange` catch-up listener was added once via a sticky flag but never removed in `stopGatewayPollFallback()` — so after the poll stopped (e.g. when live SSE reconnects) the listener lingered, and on a later poll restart the sticky flag prevented re-attaching it, leaving the refocus catch-up silently disabled. The handler is now tracked in a module variable, removed on stop, and re-added on the next start. Thanks @akrhin. (#4730)
+
 ## [v0.51.592] — 2026-06-22 — Release UY (skip gateway poll when hidden/streaming + smd re-init)
 
 ### Fixed

@@ -4098,6 +4098,8 @@ function ensureSessionEventsSSE(){
 
 if(typeof window!=='undefined') window.refreshSessionList = refreshSessionList;
 
+let _gatewayPollVisibilityHandler = null; // saved so stopGatewayPollFallback can remove it
+
 function startGatewayPollFallback(ms){
   const intervalMs = Math.max(5000, Number(ms) || _gatewayFallbackPollMs);
   if(_gatewayPollTimer) clearInterval(_gatewayPollTimer);
@@ -4110,13 +4112,14 @@ function startGatewayPollFallback(ms){
   }, intervalMs);
   // Visibility catch-up: refresh immediately when tab re-gains focus,
   // so no gateway updates are dropped during hidden-skip periods.
-  if(typeof document !== 'undefined' && !document._hermesGatewayPollVisibilityHook){
-    document.addEventListener('visibilitychange', () => {
+  // Save the handler so stopGatewayPollFallback can removeEventListener it (#4730 review).
+  if(typeof document !== 'undefined' && !_gatewayPollVisibilityHandler){
+    _gatewayPollVisibilityHandler = () => {
       if(!document.hidden && typeof renderSessionList === 'function'){
         void renderSessionList({deferWhileInteracting:false});
       }
-    });
-    document._hermesGatewayPollVisibilityHook = true;
+    };
+    document.addEventListener('visibilitychange', _gatewayPollVisibilityHandler);
   }
 }
 
@@ -4124,6 +4127,10 @@ function stopGatewayPollFallback(){
   if(_gatewayPollTimer){
     clearInterval(_gatewayPollTimer);
     _gatewayPollTimer = null;
+  }
+  if(_gatewayPollVisibilityHandler && typeof document !== 'undefined'){
+    document.removeEventListener('visibilitychange', _gatewayPollVisibilityHandler);
+    _gatewayPollVisibilityHandler = null;
   }
 }
 
