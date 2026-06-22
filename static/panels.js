@@ -6113,6 +6113,11 @@ async function switchToProfile(name) {
       }
       if (_workspaceVisibleAtStart && S.session && S.session.workspace && typeof loadDir === 'function') {
         loadDir('.');
+      } else if (_workspaceVisibleAtStart && typeof clearWorkspaceTreeSkeleton === 'function') {
+        // No workspace to restore on the (still-current) previous profile —
+        // clear the up-front workspace skeleton so it doesn't strand on a switch
+        // failure, mirroring the success-path no-workspace handling (#4662).
+        clearWorkspaceTreeSkeleton();
       }
     }
   } finally {

@@ -58,6 +58,17 @@ class TestSwitchWiring:
         catch = body[body.index("} catch (e) {"):]
         assert "renderSessionListFromCache()" in catch, "failed switch must restore real list"
 
+    def test_failure_path_clears_workspace_skeleton_when_no_workspace(self):
+        # The success path clears a stranded workspace skeleton when the profile
+        # has no bound workspace; the failure path must do the same — otherwise a
+        # switch failure while the workspace panel is open and the (still-current)
+        # session has no workspace strands the up-front skeleton forever (#4662).
+        body = _switch_body()
+        catch = body[body.index("} catch (e) {"):]
+        assert "clearWorkspaceTreeSkeleton()" in catch, (
+            "failed switch must clear the workspace skeleton when there's no workspace to restore"
+        )
+
     def test_noop_self_switch_early_returns(self):
         # Opus gate #4662: a switch to the already-active profile must bail before
         # showing a skeleton (activateCurrentProfile() doesn't pre-check), else it
