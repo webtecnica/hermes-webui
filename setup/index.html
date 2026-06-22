@@ -223,6 +223,17 @@
   .faq summary::after { content: '+'; color: var(--accent); font-size: 1.4rem; font-weight: 400; transition: transform 0.2s; flex-shrink: 0; }
   .faq details[open] summary::after { content: '−'; }
   .faq details p { font-size: 0.92rem; padding: 0 4px 18px; margin: 0; color: var(--text-secondary); }
+  /* Inline "advanced / manual install" disclosure — collapsed by default to keep Step 1 clean. */
+  .adv-reveal { margin: 4px 0 8px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-secondary); overflow: hidden; }
+  .adv-reveal > summary { cursor: pointer; padding: 12px 16px; font-size: 0.88rem; font-weight: 600; color: var(--text-secondary); list-style: none; display: flex; align-items: center; gap: 8px; transition: color 0.15s, background 0.15s; }
+  .adv-reveal > summary:hover { color: var(--accent); background: var(--bg-tertiary); }
+  .adv-reveal > summary::-webkit-details-marker { display: none; }
+  .adv-reveal > summary::before { content: '▸'; color: var(--accent); font-size: 0.8rem; transition: transform 0.2s; }
+  .adv-reveal[open] > summary::before { transform: rotate(90deg); }
+  .adv-reveal[open] > summary { border-bottom: 1px solid var(--border); }
+  .adv-reveal-body { padding: 16px; }
+  .adv-reveal-body > *:first-child { margin-top: 0; }
+  .adv-reveal-body > *:last-child { margin-bottom: 0; }
 
   /* FINAL CTA */
   .final-cta { text-align: center; padding: 64px 24px 48px; position: relative; }
@@ -345,24 +356,30 @@
       <div class="code-head"><span class="code-label">bash — one-liner</span><button class="code-copy">Copy</button></div>
       <pre><code>curl -fsSL https://get-hermes.ai/install.sh | bash</code></pre>
     </div>
-    <p class="reveal">Clones the Web UI to <code>~/hermes-webui</code> and starts it. Safe to re-run to update. Prefer to read it first? <a href="../install.sh" target="_blank" rel="noopener">View the script</a>, or clone &amp; start by hand:</p>
-    <div class="code reveal">
-      <div class="code-head"><span class="code-label">bash — manual</span><button class="code-copy">Copy</button></div>
-      <pre><code>git clone https://github.com/nesquena/hermes-webui.git
+    <p class="reveal">Clones the Web UI to <code>~/hermes-webui</code>, installs Hermes Agent if it's missing, and starts the server on <code>127.0.0.1:8787</code>. Safe to re-run to update. Open that URL in any browser and the full Web UI is there. To relaunch later, run <code>./start.sh</code>.</p>
+
+    <details class="adv-reveal reveal">
+      <summary>Install manually, or set up Hermes Agent yourself</summary>
+      <div class="adv-reveal-body">
+        <p>Prefer to read the script first? <a href="../install.sh" target="_blank" rel="noopener">View install.sh</a>. Or clone &amp; start by hand:</p>
+        <div class="code">
+          <div class="code-head"><span class="code-label">bash — manual</span><button class="code-copy">Copy</button></div>
+          <pre><code>git clone https://github.com/nesquena/hermes-webui.git
 cd hermes-webui
 python3 bootstrap.py</code></pre>
-    </div>
-    <p class="reveal">By default the server listens on <code>127.0.0.1:8787</code> — local-only until you expose it in Step 2. Open that URL in any browser and the full Web UI is already there. To relaunch later, run <code>./start.sh</code>.</p>
+        </div>
 
-    <h3 class="sub reveal">Need Hermes Agent first?</h3>
-    <p class="reveal">Hermes WebUI runs on the <a href="https://hermes-agent.nousresearch.com/" target="_blank">Hermes Agent</a>. If it isn't installed, <code>bootstrap.py</code> offers to install it — or set it up directly:</p>
-    <div class="code reveal">
-      <div class="code-head"><span class="code-label">bash — install Hermes Agent</span><button class="code-copy">Copy</button></div>
-      <pre><code>curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+        <h3 class="sub">Need Hermes Agent first?</h3>
+        <p>Hermes WebUI runs on the <a href="https://hermes-agent.nousresearch.com/" target="_blank">Hermes Agent</a>. The one-liner installs it automatically if it's missing — or set it up directly:</p>
+        <div class="code">
+          <div class="code-head"><span class="code-label">bash — install Hermes Agent</span><button class="code-copy">Copy</button></div>
+          <pre><code>curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
 source ~/.bashrc      <span class="c-cmt"># reload your shell</span>
 hermes model          <span class="c-cmt"># choose your LLM provider</span></code></pre>
-    </div>
-    <p class="reveal">Full walkthrough: <a href="https://hermes-agent.nousresearch.com/docs/getting-started/installation" target="_blank">the Hermes installation guide →</a></p>
+        </div>
+        <p>Full walkthrough: <a href="https://hermes-agent.nousresearch.com/docs/getting-started/installation" target="_blank">the Hermes installation guide →</a></p>
+      </div>
+    </details>
 
     <h3 class="sub reveal">Set a password before you expose it</h3>
     <p class="reveal">Auth is off by default on localhost. Before putting the server on a network (Step 2), set a password — in the Web UI's Settings panel, or inline:</p>
