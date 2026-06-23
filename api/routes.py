@@ -2384,8 +2384,12 @@ def warm_session_list_cache(profile_name: str | None = None) -> bool:
     #4769's sidebar_source=webui path no longer touches for sidebar loads.
 
     MUST run with the target profile's request-profile TLS established (the caller, e.g.
-    a detached worker, uses profile_scope_for_detached_worker) so active_profile resolves
-    to the target, not the process default.
+    the post-switch detached worker, uses set_request_profile/clear_request_profile) so
+    active_profile resolves to the target, not the process default. Deliberately bind ONLY
+    the TLS here — NOT profile_scope_for_detached_worker — since this path resolves the
+    profile entirely via get_active_profile_name()/get_active_hermes_home() (both TLS) and
+    reads process-global settings; its os.environ['HERMES_HOME'] mutation would open a
+    cross-profile bleed window on this multithreaded server for the full build (#4718 Opus gate).
 
     Returns True if a warm build ran, False if it was deduped or skipped. Never raises.
     """
