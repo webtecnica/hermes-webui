@@ -107,6 +107,64 @@ assert.strictEqual(_programmaticScroll, false);
     subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
 
 
+def test_live_anchor_rebuild_guard_holds_height_and_marks_reader_unpinned():
+    """Live anchor rebuilds must not let the scroll container collapse mid-read."""
+
+    script = f"""
+const assert = require('assert');
+let _messageUserUnpinned = false;
+let _scrollPinned = true;
+let _nearBottomCount = 2;
+const messages = {{
+  scrollTop: 2000,
+  scrollHeight: 5000,
+  clientHeight: 600,
+}};
+const inner = {{ style: {{ minHeight: '' }}, dataset: {{}} }};
+function $(id) {{
+  if (id === 'messages') return messages;
+  if (id === 'msgInner') return inner;
+  return null;
+}}
+{_function_body(UI_JS, "_prepareLiveAnchorScrollRebuildGuard")}
+const snapshot = {{
+  top: 2000,
+  bottom: 0,
+  scrollHeight: 5000,
+  pinned: true,
+  userUnpinned: false,
+}};
+const guard = _prepareLiveAnchorScrollRebuildGuard(snapshot);
+assert.strictEqual(guard.readerAwayFromBottom, true);
+assert.strictEqual(snapshot.pinned, false);
+assert.strictEqual(snapshot.userUnpinned, true);
+assert.strictEqual(snapshot.bottom, 2400);
+assert.strictEqual(_messageUserUnpinned, true);
+assert.strictEqual(_scrollPinned, false);
+assert.strictEqual(_nearBottomCount, 0);
+assert.strictEqual(inner.style.minHeight, '5000px');
+assert.strictEqual(inner.dataset.liveAnchorScrollGuardPreviousMinHeight, '');
+messages.scrollHeight = 5200;
+const nestedSnapshot = {{
+  top: 2000,
+  bottom: 0,
+  scrollHeight: 5200,
+  pinned: true,
+  userUnpinned: false,
+}};
+const nestedGuard = _prepareLiveAnchorScrollRebuildGuard(nestedSnapshot);
+assert.strictEqual(nestedGuard.readerAwayFromBottom, true);
+assert.strictEqual(inner.style.minHeight, '5200px');
+assert.strictEqual(inner.dataset.liveAnchorScrollGuardPreviousMinHeight, '');
+guard.release();
+assert.strictEqual(inner.style.minHeight, '');
+nestedGuard.release();
+assert.strictEqual(inner.style.minHeight, '');
+assert.strictEqual(Object.prototype.hasOwnProperty.call(inner.dataset, 'liveAnchorScrollGuardPreviousMinHeight'), false);
+"""
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
 def test_restore_message_scroll_snapshot_keeps_intermediate_distance_state():
     script = f"""
 const assert = require('assert');

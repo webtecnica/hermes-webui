@@ -9571,6 +9571,39 @@ function _projectLiveAnchorActivitySceneForStream(streamId, mode){
     return null;
   }
 }
+function _prepareLiveAnchorScrollRebuildGuard(scrollSnapshot){
+  const messagesEl=$('messages');
+  if(!messagesEl||!scrollSnapshot) return {readerAwayFromBottom:false,release:null};
+  const beforeBottomDistance=Math.max(0,messagesEl.scrollHeight-messagesEl.scrollTop-messagesEl.clientHeight);
+  const readerAwayFromBottom=beforeBottomDistance>250&&(_messageUserUnpinned||messagesEl.scrollTop>0);
+  if(!readerAwayFromBottom) return {readerAwayFromBottom:false,release:null};
+  scrollSnapshot.pinned=false;
+  scrollSnapshot.userUnpinned=true;
+  scrollSnapshot.bottom=beforeBottomDistance;
+  _messageUserUnpinned=true;
+  _scrollPinned=false;
+  _nearBottomCount=0;
+  const msgInner=$('msgInner');
+  if(!msgInner||!msgInner.style) return {readerAwayFromBottom:true,release:null};
+  const guardPreviousKey='liveAnchorScrollGuardPreviousMinHeight';
+  let previousMinHeight=msgInner.style.minHeight||'';
+  if(msgInner.dataset&&Object.prototype.hasOwnProperty.call(msgInner.dataset,guardPreviousKey)){
+    previousMinHeight=msgInner.dataset[guardPreviousKey]||'';
+  }else if(msgInner.dataset){
+    msgInner.dataset[guardPreviousKey]=previousMinHeight;
+  }
+  const guardHeight=Math.max(messagesEl.scrollHeight,Number(scrollSnapshot.scrollHeight)||0);
+  if(guardHeight>0) msgInner.style.minHeight=`${guardHeight}px`;
+  return {
+    readerAwayFromBottom:true,
+    release:()=>{
+      msgInner.style.minHeight=previousMinHeight;
+      if(msgInner.dataset&&msgInner.dataset[guardPreviousKey]===previousMinHeight){
+        delete msgInner.dataset[guardPreviousKey];
+      }
+    },
+  };
+}
 function renderLiveAnchorActivityScene(streamId, scene, opts){
   opts=opts||{};
   if(typeof isCompactWorklogMode==='function'&&!isCompactWorklogMode()) return false;
@@ -9595,6 +9628,7 @@ function renderLiveAnchorActivityScene(streamId, scene, opts){
     ? _captureWorklogDetailDisclosureState(blocks)
     : null;
   const scrollSnapshot=_captureMessageScrollSnapshot();
+  const scrollRebuildGuard=_prepareLiveAnchorScrollRebuildGuard(scrollSnapshot);
   blocks.querySelectorAll('[data-anchor-scene-owner="1"],[data-anchor-scene-row="1"]').forEach(el=>el.remove());
   blocks.querySelectorAll('.live-worklog[data-live-worklog-shell="1"],.tool-worklog-group[data-live-tool-call-group="1"],.tool-call-group[data-live-tool-call-group="1"],.tool-card-row[data-live-tid]:not(.transparent-event-row),.agent-activity-thinking[data-live-thinking="1"],.interim-collapse-toggle').forEach(el=>el.remove());
   blocks.querySelectorAll('[data-live-assistant="1"]').forEach(el=>{
@@ -9619,7 +9653,13 @@ function renderLiveAnchorActivityScene(streamId, scene, opts){
   _dedupeLiveProcessedWorklogAnchors(turn);
   if(typeof _moveLiveRunStatusToTurnEnd==='function') _moveLiveRunStatusToTurnEnd();
   _restoreMessageScrollSnapshotSameFrame(scrollSnapshot);
-  if(typeof scrollIfPinned==='function') scrollIfPinned();
+  if(scrollRebuildGuard&&scrollRebuildGuard.release){
+    requestAnimationFrame(()=>{
+      scrollRebuildGuard.release();
+      _restoreMessageScrollSnapshotSameFrame(scrollSnapshot);
+    });
+  }
+  if(!scrollRebuildGuard.readerAwayFromBottom&&typeof scrollIfPinned==='function') scrollIfPinned();
   return true;
 }
 function _renderLiveAnchorActivitySceneForStream(streamId, sessionId, opts){
