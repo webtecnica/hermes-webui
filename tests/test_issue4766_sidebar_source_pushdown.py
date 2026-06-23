@@ -358,6 +358,7 @@ global._mergeOptimisticFirstTurnSessions = rows => rows;
 global._syncSessionAttentionSoundState = () => {{}};
 global._pruneLineageReportCacheToVisibleSessions = () => {{}};
 global._markPollingCompletionUnreadTransitions = () => {{}};
+global._recordSessionProfileCount = () => {{}};
 global._isSessionEffectivelyStreaming = () => false;
 global.startStreamingPoll = () => {{}};
 global.stopStreamingPoll = () => {{}};
