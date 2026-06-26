@@ -3,6 +3,12 @@
 
 ## [Unreleased]
 
+## [v0.51.674] — 2026-06-26 — Release YD (server no longer exhausts threads under sidebar-poll load)
+
+### Fixed
+
+- **The server no longer runs out of OS threads (and stops accepting connections) under sustained `/api/sessions` load.** The slow-request diagnostics helper spawned a fresh `threading.Timer` — one OS thread — for every tracked request (the high-frequency sidebar poll and chat-start), held alive until the request finished. Under sustained load that exhausted the per-process thread cap (`RuntimeError: can't start new thread`), failing both the diagnostics timer and the HTTP request worker, after which new connections were refused. The per-request timer is replaced with a single process-global watchdog daemon thread that scans in-flight requests on a ~1s tick, so timeout tracking now costs one thread per process regardless of request rate. Diagnostics behavior (slow-request warnings) is unchanged. Reported by enihcam. (#4973)
+
 ## [v0.51.673] — 2026-06-26 — Release YC (a stale approval card clears instead of dead-ending)
 
 ### Fixed
