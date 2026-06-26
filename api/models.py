@@ -5405,6 +5405,19 @@ def _state_db_anchor_index(state_messages: list, anchor_key) -> int | None:
     return None
 
 
+def _tool_call_assistant_should_precede_content_assistant(existing: dict, msg: dict) -> bool:
+    return (
+        isinstance(existing, dict)
+        and isinstance(msg, dict)
+        and str(msg.get("role") or "").lower() == "assistant"
+        and bool(msg.get("tool_calls"))
+        and not _message_content_text(msg).strip()
+        and str(existing.get("role") or "").lower() == "assistant"
+        and not existing.get("tool_calls")
+        and bool(_message_content_text(existing).strip())
+    )
+
+
 def _insert_state_message_chronologically(messages: list, msg: dict) -> bool:
     """Insert a state.db-only row before newer sidecar rows when safe.
 
@@ -5424,8 +5437,13 @@ def _insert_state_message_chronologically(messages: list, msg: dict) -> bool:
             existing_timestamp > timestamp
             or (
                 existing_timestamp == timestamp
-                and msg.get("role") == "user"
-                and existing.get("role") == "assistant"
+                and (
+                    (
+                        msg.get("role") == "user"
+                        and existing.get("role") == "assistant"
+                    )
+                    or _tool_call_assistant_should_precede_content_assistant(existing, msg)
+                )
             )
         )
         if not should_insert:
@@ -5477,6 +5495,7 @@ def _insert_state_message_chronologically(messages: list, msg: dict) -> bool:
                 and idx > 0
                 and messages[idx - 1].get("role") == msg.get("role")
                 and _message_timestamp_as_float(messages[idx]) == timestamp
+                and not _tool_call_assistant_should_precede_content_assistant(messages[idx], msg)
             ):
                 idx += 1
                 advanced = True
@@ -5822,7 +5841,17 @@ def merge_session_messages_append_only(
                 if _tc:
                     _ck = _session_message_content_key(msg)
                     if _ck in seen_content_keys and dedup_key not in seen_dedup_keys:
-                        pass  # different tool_calls from sidecar — preserve
+                        # Different tool_calls from sidecar — preserve, but keep
+                        # the row in timestamp order. Falling through to the
+                        # generic append path would move older tool-call-only
+                        # assistant rows after the settled final answer.
+                        if _insert_state_message_chronologically(merged_messages, msg):
+                            seen_message_keys.add(key)
+                            seen_dedup_keys.add(dedup_key)
+                            seen_content_keys.add(_session_message_content_key(msg))
+                            seen_visible_keys.add(visible_key)
+                            _remember_merged_message(msg)
+                        continue
                     else:
                         _merge_session_display_metadata(merged_by_message_key.get(key), msg)
                         continue
