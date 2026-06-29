@@ -151,12 +151,17 @@ def test_openai_tts_config_overrides(monkeypatch):
     assert captured["body"] == {"model": "tts-custom", "input": "Hello", "voice": "nova"}
 
 
-def test_openai_tts_rejects_invalid_base_url_config(monkeypatch):
+@pytest.mark.parametrize("base_url", [
+    "http://169.254.169.254/v1",
+    "https://user:pass@api.example.com/v1",
+    "http://user:pass@localhost:8080/v1",
+])
+def test_openai_tts_rejects_invalid_base_url_config(monkeypatch, base_url):
     import api.config as config
 
     monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
     monkeypatch.setattr(config, "get_config", lambda: {
-        "tts": {"openai": {"base_url": "http://169.254.169.254/v1"}}
+        "tts": {"openai": {"base_url": base_url}}
     })
     h = _post({"text": "Hello", "engine": "openai"}, client="10.82.0.5")
     routes._handle_tts(h, None)

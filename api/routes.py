@@ -14774,6 +14774,8 @@ def _normalized_openai_tts_base_url(base_url: str) -> str:
     raw = str(base_url or "").strip()
     parsed = urlsplit(raw)
     hostname = (parsed.hostname or "").strip().lower()
+    if parsed.username or parsed.password:
+        raise ValueError("invalid OpenAI base_url in config")
     if not parsed.scheme or not parsed.netloc or parsed.query or parsed.fragment:
         raise ValueError("invalid OpenAI base_url in config")
     if parsed.scheme == "https":
