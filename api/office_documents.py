@@ -67,10 +67,13 @@ def _office_format_for_path(path: str | Path) -> str:
     return Path(str(path)).suffix.lower().lstrip(".")
 
 
-def _normalise_preview_text(value) -> str:
+def _normalise_preview_text(value, max_chars: int | None = None) -> str:
     if value is None:
         return ""
-    return str(value).replace("\r", "\n").replace("\n", " ").strip()
+    text = str(value)
+    if max_chars is not None and max_chars >= 0 and len(text) > max_chars:
+        text = text[:max_chars]
+    return text.replace("\r", "\n").replace("\n", " ").strip()
 
 
 def _preview_line_count(content: str) -> int:
@@ -89,46 +92,155 @@ def _finalize_preview_text(content: str, truncated: bool = False) -> tuple[str, 
     return text, truncated
 
 
+class _PreviewBuilder:
+    def __init__(self, char_limit: int | None = None) -> None:
+        self._char_limit = MAX_OFFICE_PREVIEW_CHARS if char_limit is None else max(char_limit, 0)
+        self._parts: list[str] = []
+        self._length = 0
+        self._started = False
+        self.truncated = False
+
+    @property
+    def remaining_chars(self) -> int:
+        return max(self._char_limit - self._length, 0)
+
+    @property
+    def started(self) -> bool:
+        return self._started
+
+    @property
+    def has_content(self) -> bool:
+        return bool(self._parts)
+
+    @property
+    def text(self) -> str:
+        return "".join(self._parts)
+
+    def _append_piece(self, piece: str) -> bool:
+        if self.truncated:
+            return False
+        if not piece:
+            return True
+        remaining = self.remaining_chars
+        if remaining <= 0:
+            self.truncated = True
+            return False
+        if len(piece) > remaining:
+            piece = piece[:remaining].rstrip()
+            self.truncated = True
+        if piece:
+            self._parts.append(piece)
+            self._length += len(piece)
+        return not self.truncated
+
+    def start_line(self) -> bool:
+        if self._started:
+            return self._append_piece("\n")
+        self._started = True
+        return True
+
+    def start_section(self) -> bool:
+        if self._started:
+            return self._append_piece("\n\n")
+        self._started = True
+        return True
+
+    def append_text(self, text: str) -> bool:
+        if not self._started:
+            self._started = True
+        return self._append_piece(text)
+
+    def finish(self) -> tuple[str, bool]:
+        return _finalize_preview_text(self.text, self.truncated)
+
+
+def _append_normalized_preview_text(builder: _PreviewBuilder, value) -> bool:
+    if builder.truncated:
+        return False
+    remaining = builder.remaining_chars
+    if remaining <= 0:
+        builder.truncated = True
+        return False
+    raw_text = "" if value is None else str(value)
+    clipped = len(raw_text) > remaining
+    if not builder.append_text(_normalise_preview_text(raw_text, remaining)):
+        return False
+    if clipped:
+        builder.truncated = True
+        return False
+    return True
+
+
+def _iter_docx_text_nodes(element):
+    for node in element.iter():
+        if node.tag == f"{_WORD_NAMESPACE}t" and node.text:
+            yield node.text
+
+
+def _append_docx_element_text(builder: _PreviewBuilder, element) -> bool:
+    for text in _iter_docx_text_nodes(element):
+        if not _append_normalized_preview_text(builder, text):
+            return False
+    return True
+
+
+def _append_docx_cell_text(builder: _PreviewBuilder, cell_element) -> bool:
+    first_paragraph = True
+    for child in cell_element:
+        if child.tag != f"{_WORD_NAMESPACE}p":
+            continue
+        if not first_paragraph and not builder.append_text("\n"):
+            return False
+        if not _append_docx_element_text(builder, child):
+            return False
+        first_paragraph = False
+    return True
+
+
 def _docx_preview_text(document) -> tuple[str, bool]:
-    chunks: list[str] = []
-    paragraphs_by_element = {paragraph._p: paragraph for paragraph in document.paragraphs}
-    tables_by_element = {
-        table._tbl: (table_index, table) for table_index, table in enumerate(document.tables, start=1)
-    }
+    builder = _PreviewBuilder()
     body_blocks_seen = 0
     table_cells_seen = 0
-    truncated = False
+    table_index = 0
     for child in document._element.body:
         if child.tag == f"{_WORD_NAMESPACE}sectPr":
             continue
         body_blocks_seen += 1
         if body_blocks_seen > MAX_DOCX_PREVIEW_BLOCKS:
-            truncated = True
+            builder.truncated = True
             break
         if child.tag == f"{_WORD_NAMESPACE}p":
-            paragraph = paragraphs_by_element.get(child)
-            if paragraph is not None:
-                chunks.append(paragraph.text or "")
+            if not builder.start_line() or not _append_docx_element_text(builder, child):
+                break
             continue
         if child.tag != f"{_WORD_NAMESPACE}tbl":
             continue
-        table_index, table = tables_by_element[child]
-        table_lines = [f"Table {table_index}"]
-        for row in table.rows:
-            cells = []
-            for cell in row.cells:
+        table_index += 1
+        if not builder.start_line() or not builder.append_text(f"Table {table_index}"):
+            break
+        for row in child:
+            if row.tag != f"{_WORD_NAMESPACE}tr":
+                continue
+            if not builder.start_line():
+                break
+            first_cell = True
+            for cell in row:
+                if cell.tag != f"{_WORD_NAMESPACE}tc":
+                    continue
                 table_cells_seen += 1
                 if table_cells_seen > MAX_DOCX_TABLE_CELLS:
-                    truncated = True
+                    builder.truncated = True
                     break
-                cells.append(_normalise_preview_text(cell.text))
-            if truncated:
+                if not first_cell and not builder.append_text("\t"):
+                    break
+                if not _append_docx_cell_text(builder, cell):
+                    break
+                first_cell = False
+            if builder.truncated:
                 break
-            table_lines.append("\t".join(cells))
-        chunks.append("\n".join(table_lines))
-        if truncated:
+        if builder.truncated:
             break
-    return _finalize_preview_text("\n".join(chunks), truncated)
+    return builder.finish()
 
 
 def _docx_paragraph_properties_are_safe(properties) -> bool:
@@ -208,42 +320,56 @@ def _preview_xlsx(raw: bytes) -> tuple[str, bool]:
         raise
     except Exception as exc:  # pragma: no cover - library-specific failure mode
         raise ValueError("Unable to read XLSX preview") from exc
-    chunks: list[str] = []
-    truncated = False
+    builder = _PreviewBuilder()
     try:
         for sheet_index, sheet in enumerate(workbook.worksheets, start=1):
             if sheet_index > MAX_XLSX_PREVIEW_SHEETS:
-                truncated = True
+                builder.truncated = True
                 break
-            sheet_lines = [f"Sheet: {sheet.title}"]
+            if not builder.start_section() or not builder.append_text(f"Sheet: {sheet.title}"):
+                break
             rows_seen = 0
             cells_seen = 0
-            for row in sheet.iter_rows(values_only=True):
+            max_row = min(getattr(sheet, "max_row", MAX_XLSX_PREVIEW_ROWS_PER_SHEET), MAX_XLSX_PREVIEW_ROWS_PER_SHEET)
+            max_col = min(getattr(sheet, "max_column", MAX_XLSX_PREVIEW_CELLS_PER_SHEET), MAX_XLSX_PREVIEW_CELLS_PER_SHEET)
+            for row in sheet.iter_rows(values_only=True, max_row=max_row, max_col=max_col):
                 rows_seen += 1
-                if rows_seen > MAX_XLSX_PREVIEW_ROWS_PER_SHEET:
-                    truncated = True
-                    break
-                values = []
+                row_budget = builder.remaining_chars - (1 if builder.started else 0)
+                row_builder = _PreviewBuilder(row_budget)
                 for value in row:
                     cells_seen += 1
                     if cells_seen > MAX_XLSX_PREVIEW_CELLS_PER_SHEET:
-                        truncated = True
+                        builder.truncated = True
                         break
-                    values.append(_normalise_preview_text(value))
-                if truncated:
+                    if row_builder.has_content and not row_builder.append_text("\t"):
+                        break
+                    if not _append_normalized_preview_text(row_builder, value):
+                        if not row_builder.truncated:
+                            builder.truncated = True
+                        break
+                if builder.truncated:
                     break
-                if any(values):
-                    sheet_lines.append("\t".join(values))
-            chunks.append("\n".join(sheet_lines).strip())
-            if truncated:
+                if row_builder.has_content:
+                    if not builder.start_line() or not builder.append_text(row_builder.text):
+                        break
+                    if row_builder.truncated:
+                        builder.truncated = True
+                        break
+            if builder.truncated:
+                break
+            if getattr(sheet, "max_row", rows_seen) > MAX_XLSX_PREVIEW_ROWS_PER_SHEET:
+                builder.truncated = True
+                break
+            if getattr(sheet, "max_column", 0) > MAX_XLSX_PREVIEW_CELLS_PER_SHEET:
+                builder.truncated = True
                 break
     finally:
         close = getattr(workbook, "close", None)
         if callable(close):
             close()
-    if not chunks:
-        return _finalize_preview_text("Empty workbook", truncated)
-    return _finalize_preview_text("\n\n".join(chunk for chunk in chunks if chunk).strip() or "Empty workbook", truncated)
+    if not builder.has_content:
+        return _finalize_preview_text("Empty workbook", builder.truncated)
+    return builder.finish()
 
 
 def _preview_pptx(raw: bytes) -> tuple[str, bool]:
@@ -253,33 +379,33 @@ def _preview_pptx(raw: bytes) -> tuple[str, bool]:
         raise
     except Exception as exc:  # pragma: no cover - library-specific failure mode
         raise ValueError("Unable to read PPTX preview") from exc
-    chunks: list[str] = []
-    truncated = False
+    builder = _PreviewBuilder()
     for slide_index, slide in enumerate(presentation.slides, start=1):
         if slide_index > MAX_PPTX_PREVIEW_SLIDES:
-            truncated = True
+            builder.truncated = True
             break
-        slide_lines = [f"Slide {slide_index}"]
+        if not builder.start_section() or not builder.append_text(f"Slide {slide_index}"):
+            break
         shapes_seen = 0
+        has_text = False
         for shape in slide.shapes:
             shapes_seen += 1
             if shapes_seen > MAX_PPTX_PREVIEW_SHAPES_PER_SLIDE:
-                truncated = True
+                builder.truncated = True
                 break
-            text = _normalise_preview_text(getattr(shape, "text", ""))
-            if text:
-                slide_lines.append(text)
-        if len(slide_lines) == 1:
-            slide_lines.append("(empty slide)")
-        chunks.append("\n".join(slide_lines).strip())
-        if truncated:
+            text = getattr(shape, "text", "")
+            if not _normalise_preview_text(text):
+                continue
+            if not builder.start_line() or not _append_normalized_preview_text(builder, text):
+                break
+            has_text = True
+        if builder.truncated:
             break
-    if not chunks:
-        return _finalize_preview_text("Empty presentation", truncated)
-    return _finalize_preview_text(
-        "\n\n".join(chunk for chunk in chunks if chunk).strip() or "Empty presentation",
-        truncated,
-    )
+        if not has_text and (not builder.start_line() or not builder.append_text("(empty slide)")):
+            break
+    if not builder.has_content:
+        return _finalize_preview_text("Empty presentation", builder.truncated)
+    return builder.finish()
 
 
 def preview_office_document(path: str | Path, raw: bytes) -> dict:

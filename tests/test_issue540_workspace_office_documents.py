@@ -204,6 +204,22 @@ def test_docx_preview_truncation_disables_editing(monkeypatch):
     assert office_documents.OFFICE_PREVIEW_TRUNCATED_NOTICE in preview["content"]
 
 
+def test_docx_preview_char_budget_disables_editing(monkeypatch):
+    monkeypatch.setattr(office_documents, "MAX_OFFICE_PREVIEW_CHARS", 5)
+    monkeypatch.setattr(
+        office_documents,
+        "_docx_editability",
+        lambda _document: pytest.fail("char-budget truncation should not run full editability scan"),
+    )
+
+    preview = preview_office_document("story.docx", _simple_docx_bytes("alphabet", "beta"))
+
+    assert preview["truncated"] is True
+    assert preview["editable"] is False
+    assert preview["edit_blocked_reason"] == "docx preview exceeds safe limits"
+    assert office_documents.OFFICE_PREVIEW_TRUNCATED_NOTICE in preview["content"]
+
+
 def _office_state_block() -> str:
     marker = "if(data.preview_kind==='office'){"
     start = WORKSPACE_JS.find(marker)
@@ -255,6 +271,35 @@ def test_xlsx_preview_is_bounded(monkeypatch):
     monkeypatch.setattr(office_documents, "MAX_XLSX_PREVIEW_ROWS_PER_SHEET", 1)
 
     preview = preview_office_document("budget.xlsx", _simple_xlsx_bytes())
+
+    assert preview["truncated"] is True
+    assert office_documents.OFFICE_PREVIEW_TRUNCATED_NOTICE in preview["content"]
+
+
+def test_xlsx_preview_stops_when_char_budget_is_exhausted(monkeypatch):
+    class FakeSheet:
+        title = "Summary"
+        max_row = 9_999
+        max_column = 9_999
+
+        def iter_rows(self, *, values_only, max_row, max_col):
+            assert values_only is True
+            assert max_row == office_documents.MAX_XLSX_PREVIEW_ROWS_PER_SHEET
+            assert max_col == office_documents.MAX_XLSX_PREVIEW_CELLS_PER_SHEET
+            yield ("x" * 200, "y" * 200)
+            pytest.fail("xlsx preview should stop after the preview budget is exhausted")
+
+    class FakeWorkbook:
+        def __init__(self):
+            self.worksheets = [FakeSheet()]
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(office_documents, "MAX_OFFICE_PREVIEW_CHARS", 32)
+    monkeypatch.setattr(office_documents, "_load_workbook_reader", lambda: lambda *_args, **_kwargs: FakeWorkbook())
+
+    preview = preview_office_document("budget.xlsx", b"placeholder")
 
     assert preview["truncated"] is True
     assert office_documents.OFFICE_PREVIEW_TRUNCATED_NOTICE in preview["content"]
