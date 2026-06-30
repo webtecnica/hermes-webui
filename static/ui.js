@@ -1182,6 +1182,11 @@ async function jumpToTurnQuestion(questionRawIdx, assistantRawIdx){
 }
 
 const DASHBOARD_STATUS_TTL_MS=60000;
+// Explicitly expose on window so other scripts (outline.js's IIFE, #5106 content-
+// search jump) can reach the virtualization-aware jump even if this file is ever
+// module-scoped. Top-level fns are already global in classic scripts; this makes
+// the cross-script contract explicit.
+if(typeof window!=='undefined') window.jumpToTurnQuestion=jumpToTurnQuestion;
 let _dashboardStatusCache=null;
 let _dashboardStatusFetchedAt=0;
 let _dashboardLastNonNeverMode='auto'; // Server-scoped dashboard config keeps this restore target session-global on purpose.

@@ -188,7 +188,7 @@ def test_full_session_jump_translates_full_to_local_and_forceloads():
     src = _OUTLINE_JS.read_text()
     # body of the full-session helper
     start = src.index("function _jumpToFullSessionMessage(")
-    body = src[start:start + 1800]
+    body = src[start:start + 2600]
     # (a) full -> local translation via _oldestIdx
     assert "_oldestIdx" in body and "fullIdx - off" in body, (
         "_jumpToFullSessionMessage must translate full-session index to local via _oldestIdx"
@@ -220,3 +220,21 @@ def test_full_session_jump_resolves_assistant_segments_and_guards_session():
     sess = _SESSIONS_JS.read_text()
     assert "_jumpToFullSessionMessage(_jumpIdx, _jumpSid)" in sess
     assert "_jumpSid=s.session_id" in sess
+
+
+def test_full_session_jump_delegates_to_virtualization_aware_jump():
+    """#5106 round 3: long transcripts stay VIRTUALIZED even after msg_limit=9999,
+    so a raw getElementById can miss a valid target. _jumpToFullSessionMessage must
+    delegate to jumpToTurnQuestion (which materializes a virtualized target via
+    _messageVisibleIndexForRawIdx + virtual scrollTop), and ui.js must expose it on
+    window for the cross-<script> call."""
+    outline = _OUTLINE_JS.read_text()
+    start = outline.index("function _jumpToFullSessionMessage(")
+    body = outline[start:start + 2600]
+    assert "window.jumpToTurnQuestion" in body, (
+        "_jumpToFullSessionMessage must delegate to the virtualization-aware jumpToTurnQuestion"
+    )
+    ui = _UI_JS.read_text() if (globals().get("_UI_JS")) else (_REPO / "static" / "ui.js").read_text()
+    assert "window.jumpToTurnQuestion=jumpToTurnQuestion" in ui, (
+        "ui.js must expose jumpToTurnQuestion on window for the cross-script content-search jump"
+    )

@@ -150,9 +150,17 @@ function _jumpToFullSessionMessage(fullIdx, targetSid) {
     const off = (typeof _oldestIdx !== 'undefined' && Number.isFinite(Number(_oldestIdx))) ? Number(_oldestIdx) : 0;
     const localIdx = fullIdx - off;
     if (localIdx < 0) return false;
-    // User-message rows carry msg-user-<localIdx>; assistant rows render as
-    // .assistant-segment[data-msg-idx=<localIdx>] with no msg-user id. A content
-    // search can match EITHER role, so resolve both (#5106 Codex follow-up).
+    // Delegate to jumpToTurnQuestion (#5106 round 3): it already materializes a
+    // target in a VIRTUALIZED transcript (msg_limit=9999 still virtualizes to the
+    // viewport+tail, so a raw getElementById can miss a valid target) via
+    // _messageVisibleIndexForRawIdx + _messageVirtualScrollTopForVisibleIdx, and
+    // it handles BOTH a user-message row and an assistant segment (passing
+    // localIdx as both the question and the assistant-segment candidate). It does
+    // its own scroll + highlight, so we don't double-flash here.
+    if (typeof window.jumpToTurnQuestion === 'function') {
+      try { window.jumpToTurnQuestion(localIdx, localIdx); return true; } catch (_e) { /* fall through */ }
+    }
+    // Fallback (jumpToTurnQuestion unavailable): direct DOM resolve, user then assistant.
     let target = document.getElementById('msg-user-' + localIdx);
     if (!target) {
       const seg = document.querySelector('.assistant-segment[data-msg-idx="' + localIdx + '"]');
