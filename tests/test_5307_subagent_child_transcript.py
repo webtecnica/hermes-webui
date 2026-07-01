@@ -320,7 +320,6 @@ def test_materialize_helper_refuses_persisted_writable_subagent_sidecar(
     materialized before this fix) must still be refused by
     _get_or_materialize_session on the happy path — chat-start cannot use it as
     a writable session (#5307 Codex round 6)."""
-    import api.models as _models
 
     class _FakeSession:
         session_id = "persisted-sa"
