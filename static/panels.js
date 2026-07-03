@@ -2240,6 +2240,73 @@ async function hardRefreshWebUIClient(){
   window.location.reload();
 }
 
+function _normalizeWebUIVersion(value){
+  if(!value) return '';
+  const s=String(value).trim();
+  if(!s||s==='__WEBUI_VERSION__'||s==='not detected') return '';
+  return s;
+}
+
+function _currentWebUIBundleVersion(){
+  try{
+    const raw=window.__HERMES_WEBUI_BUNDLE_VERSION__;
+    if(!raw) return '';
+    let s=String(raw);
+    try{ s=decodeURIComponent(s.replace(/\+/g,' ')); }catch(_){}
+    return _normalizeWebUIVersion(s);
+  }catch(_){ return ''; }
+}
+
+function _showStaleWebUIClientBanner(clientVersion,serverVersion){
+  const banner=document.getElementById('staleClientBanner');
+  if(!banner) return;
+  const msg=document.getElementById('staleClientMessage');
+  const versions=document.getElementById('staleClientVersions');
+  if(msg) msg.textContent='This tab is running a different WebUI version. Hard refresh to restore full functionality.';
+  if(versions) versions.textContent='Running: '+clientVersion+' → Server: '+serverVersion;
+  banner.style.display='flex';
+}
+
+function checkWebUIVersionSkew(settings){
+  try{
+    if(!settings) return;
+    const client=_currentWebUIBundleVersion();
+    const server=_normalizeWebUIVersion(settings.webui_version);
+    if(!client||!server) return;
+    if(client===server) return;
+    _showStaleWebUIClientBanner(client,server);
+  }catch(_){}
+}
+window.checkWebUIVersionSkew=checkWebUIVersionSkew;
+
+function _startWebUIVersionSkewMonitor(){
+  let _pollTimer=null;
+  function _isBannerVisible(){
+    const banner=document.getElementById('staleClientBanner');
+    return !!(banner&&banner.style.display==='flex');
+  }
+  function _check(){
+    if(_isBannerVisible()) return;
+    Promise.resolve().then(function(){ return api('/api/settings'); }).then(function(s){ checkWebUIVersionSkew(s); }).catch(function(){});
+  }
+  function _startPoll(){
+    if(_pollTimer||document.hidden) return;
+    _pollTimer=setInterval(function(){
+      if(document.hidden){ clearInterval(_pollTimer); _pollTimer=null; return; }
+      if(_isBannerVisible()){ clearInterval(_pollTimer); _pollTimer=null; return; }
+      _check();
+    },60000);
+  }
+  _check();
+  document.addEventListener('visibilitychange',function(){
+    if(!document.hidden){ _check(); _startPoll(); }
+    else if(_pollTimer){ clearInterval(_pollTimer); _pollTimer=null; }
+  });
+  window.addEventListener('focus',function(){ _check(); });
+  _startPoll();
+}
+_startWebUIVersionSkewMonitor();
+
 function _kanbanLooksLikeStaleClientError(err){
   const msg = String((err && err.message) || err || '').toLowerCase();
   return !!(err && err.status === 404 && (
@@ -8277,6 +8344,7 @@ function _syncSettingsMaxTokensPlaceholder(field, fallbackValue){
 async function loadSettingsPanel(){
   try{
     const settings=await api('/api/settings');
+    checkWebUIVersionSkew(settings);
     // Populate the version badges from the server — keeps them in sync with git
     // tags automatically without any manual release step.
     const webuiBadge = $('settings-webui-version-badge');
