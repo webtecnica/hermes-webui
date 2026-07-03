@@ -307,5 +307,9 @@ def test_session_gesture_finish_ignores_idle_state():
         "Missing idle-state guard at the beginning of _finishSessionGesture"
     
     # Also verify that the fork row handler has the same guard (consistency check)
-    fork_start = SESSIONS_JS.find("rowEl.onpointerup=(e)=>{\n          if(e.pointerType==='mouse'||_gestureState==='idle') return;")
-    assert fork_start != -1, "Fork row pointerup handler should have idle guard"
+    # Fork handler pattern: rowEl.onpointerup followed by pointerType/button check, then idle guard
+    fork_handler_start = SESSIONS_JS.find("rowEl.onpointerup=(e)=>{")
+    assert fork_handler_start != -1, "Fork row pointerup handler not found"
+    fork_handler_snippet = SESSIONS_JS[fork_handler_start:fork_handler_start+200]
+    assert "if(_gestureState==='idle') return;" in fork_handler_snippet, \
+        "Fork row pointerup handler should have idle guard"
