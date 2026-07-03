@@ -133,6 +133,68 @@ def test_session_event_profile_filter_tolerates_default_root_aliases():
     assert "S.activeProfileIsDefault = !!data.is_default;" in PANELS_JS
 
 
+def test_session_list_render_signature_serializes_full_rows_not_a_narrow_allowlist():
+    """The render-skip signature must serialize the FULL applied rows (+ reference
+    rows), not a curated field subset — a narrow allowlist silently false-skips
+    when a rendered field it omits changes (Codex #5467: it dropped pending/running
+    streaming state, attention dots, and the source/lineage cluster, so an
+    approval/clarify transition or a row starting to stream could keep a stale
+    sidebar). Serializing the whole row objects covers every field the render
+    helpers read, present and future.
+    """
+    start = SESSIONS_JS.find("function _sessionListRenderSignature()")
+    assert start != -1
+    block = SESSIONS_JS[start:start + 900]
+    # Full-object serialization, not a hand-picked allowlist.
+    assert "const sessionKeys = [" not in block, \
+        "signature must not use a narrow field allowlist (it false-skips on omitted fields)"
+    assert "sessionKeys.forEach" not in block
+    assert "_allSessions," in block, "signature must serialize the full applied rows"
+    assert "_sidebarReferenceSessions," in block, \
+        "signature must include the hidden reference/nesting rows the sidebar renders"
+    # Fail-open on serialization failure (never skip on null).
+    assert "catch(_){ return null; }" in block
+
+
+def test_session_list_render_signature_changes_on_pending_running_and_attention():
+    """Regression for the Codex #5467 CORE/SILENT false-skips: because the
+    signature serializes whole rows, a change to pending/running state or the
+    attention dot changes the signature (so the sidebar repaints, not skips).
+    This is a structural guarantee of full-row serialization — assert the
+    signature does not strip those fields back out.
+    """
+    start = SESSIONS_JS.find("function _sessionListRenderSignature()")
+    block = SESSIONS_JS[start:start + 900]
+    # None of the previously-omitted, render-consumed fields may be filtered out.
+    for stripped in (
+        "delete out.active_stream_id",
+        "delete out.attention",
+        "delete out.has_pending_user_message",
+    ):
+        assert stripped not in block, f"signature must not strip {stripped!r}"
+    # The whole-object arrays are passed straight to JSON.stringify.
+    assert "JSON.stringify([" in block
+
+
+def test_session_list_render_signature_does_not_skip_recovering_from_skeleton_or_error():
+    """The render-skip must never fire when recovering from a skeleton or the
+    'Could not load conversations' banner — both are rendered OUTSIDE the
+    signature path, so an identical-signature match (empty/same-shaped profile,
+    or a transient fetch failure healing with identical rows) would leave the
+    skeleton/error DOM on screen instead of the real list. (Codex #5467 re-gate)
+    """
+    start = SESSIONS_JS.find("function _applySessionListPayload(")
+    assert start != -1
+    body = SESSIONS_JS[start:start + 12000]
+    assert "const _hadSessionListSkeleton = _sessionListSkeletonActive;" in body
+    assert "const _hadSessionListLoadError = !!_sessionListLoadError;" in body
+    assert "const _mustForceRender = _hadSessionListSkeleton || _hadSessionListLoadError;" in body
+    assert "!_mustForceRender" in body, "the force flag must gate the identical-signature skip"
+    # captured BEFORE the respective clears
+    assert body.index("const _hadSessionListSkeleton") < body.index("_sessionListSkeletonActive = false;")
+    assert body.index("const _hadSessionListLoadError") < body.index("_sessionListLoadError = null;")
+
+
 def test_pwa_pull_to_refresh_refreshes_session_list_not_page_when_available():
     assert "window.refreshSessionList('pull', {force:true, refreshActive:true})" in UI_JS
     assert "Promise.resolve(window.refreshSessionList('pull', {force:true, refreshActive:true})).catch(()=>{}).finally(_ptrReset)" in UI_JS

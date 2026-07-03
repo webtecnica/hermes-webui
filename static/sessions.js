@@ -4346,6 +4346,36 @@ function _syncSessionAttentionSoundState(sessions){
   next.forEach((sig,sid)=>_sessionAttentionSoundState.set(sid,sig));
 }
 
+// Signature of everything the sidebar render reads. Used to skip the full DOM
+// rebuild when a poll returns data identical to what is already on screen (the
+// common idle case). We serialize the FULL applied row objects (not a curated
+// field subset) plus the reference/nesting rows and the coarse display state, so
+// ANY server- or client-visible field the render helpers read (streaming/pending
+// state, attention dots, source/read-only/worktree/lineage/child/model/profile
+// meta, etc.) is covered — a narrow allowlist silently false-skips the moment a
+// new rendered field is added (Codex #5467 gate: it omitted pending/running,
+// attention, and the source/lineage cluster). A streaming/pending row's fields
+// advance each poll so its signature changes and it still renders. Serialization
+// failure returns null → never skip (fail-open). (#5455 WS2.4)
+let _lastSessionListRenderSig = null;
+function _sessionListRenderSignature(){
+  try{
+    const search=($('sessionSearch')&&$('sessionSearch').value)||'';
+    return JSON.stringify([
+      _allSessions,
+      _sidebarReferenceSessions,
+      _allProjects,
+      _activeSessionIdForSidebar(),
+      search,
+      _sessionSourceFilter,
+      !!_sessionSelectMode,
+      (window._sidebarDensity==='detailed'?'d':'c'),
+      !!_showAllProfiles,
+      _otherProfileCount,_archivedWebuiCount,_archivedCliCount,
+      _serverWebuiSessionCount,_serverCliSessionCount,
+    ]);
+  }catch(_){ return null; }
+}
 function _applySessionListPayload(sessData, projData){
   // Server's other_profile_count tells us how many sessions exist outside the
   // active profile so the "Show N from other profiles" toggle can render
@@ -4406,6 +4436,11 @@ function _applySessionListPayload(sessData, projData){
   _syncSessionAttentionSoundState(_allSessions);
   _pruneLineageReportCacheToVisibleSessions(_allSessions);
   _allProjects = projData.projects||[];
+  // Capture the recovering-from-error state BEFORE clearing it: the error banner
+  // DOM was rendered outside the signature path, so if this payload heals with
+  // rows identical to the last render, the identical-signature skip below would
+  // leave the stale "Could not load conversations" banner on screen. (Codex #5467)
+  const _hadSessionListLoadError = !!_sessionListLoadError;
   _sessionListLoadError = null;
   _sessionListHasLoadedOnce = true;
   _markPollingCompletionUnreadTransitions(_allSessions);
@@ -4427,7 +4462,28 @@ function _applySessionListPayload(sessData, projData){
   // holds the CURRENT profile's rows. Clear the skeleton flag right before painting so this
   // authoritative render replaces the profile-switch skeleton — while unrelated renders that
   // fire before this point stay blocked by the guard in renderSessionListFromCache().
+  const _hadSessionListSkeleton = _sessionListSkeletonActive;
   _sessionListSkeletonActive = false;
+  // No-op fast path: if this payload renders identically to what is already on
+  // screen (the common case for idle polls) and no entrance animation is
+  // pending, skip the full DOM rebuild. Only applies here in the fetch/apply
+  // path; the 60s relative-time refresh and every other render trigger call
+  // renderSessionListFromCache directly and are unaffected. Guarded by the same
+  // conditions renderSessionListFromCache bails on, so a bailed render never
+  // caches a signature that would suppress the next real repaint. (#5455 WS2.4)
+  // NEVER skip when recovering from a skeleton or error-banner DOM state: those
+  // are rendered outside the signature path, so an identical-signature match
+  // would leave the skeleton/error on screen instead of the real list. (Codex #5467)
+  const _canRenderNow = !_renamingSid && !_sessionActionMenu;
+  const _mustForceRender = _hadSessionListSkeleton || _hadSessionListLoadError;
+  const _renderSig = _sessionListRenderSignature();
+  if(_canRenderNow && !_mustForceRender && !_sessionListRefreshAnimationPending && _renderSig && _renderSig===_lastSessionListRenderSig){
+    // Preserve the per-refresh INFLIGHT cleanup that renderSessionListFromCache
+    // would otherwise perform, then skip only the DOM rebuild.
+    if(typeof _purgeStaleInflightEntries==='function') _purgeStaleInflightEntries();
+    return;
+  }
+  if(_canRenderNow) _lastSessionListRenderSig = _renderSig;
   renderSessionListFromCache();  // no-ops if rename is in progress
 }
 
