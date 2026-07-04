@@ -4105,7 +4105,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     return typeof isTransparentStream==='function'&&isTransparentStream();
   }
   function _shouldUseLiveProseFade(){
-    return _shouldUseStreamFade() || _shouldUseTransparentStreamFade();
+    return !_streamFadeReduceMotionEnabled() && (_shouldUseStreamFade() || _shouldUseTransparentStreamFade());
   }
   function _streamFadeSkipNode(node){
     if(!node||node.nodeType!==1) return false;
@@ -4382,7 +4382,6 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _streamFadeDomText=String(next.text||'');
       return next.caughtUp;
     }
-    _streamFadeBindCleanup(assistantBody);
     if(_smdParser){
       _smdEndParser();
       assistantBody.textContent='';
@@ -4397,7 +4396,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _streamFadeDomText='';
     }
     const delta=String(next.text||'').slice(_streamFadeDomText.length);
-    _streamFadeAppendText(assistantBody,delta);
+    if(delta) assistantBody.appendChild(document.createTextNode(delta));
     _streamFadeDomText=String(next.text||'');
     return next.caughtUp;
   }

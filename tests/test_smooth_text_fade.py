@@ -169,15 +169,16 @@ def test_stream_fade_uses_incremental_renderer_without_changing_default_path():
             "_smdNewParser(assistantBody,true)",
             "_smdWrite(next.text,true)",
             "_sanitizeSmdLinks(assistantBody)",
-            "_streamFadeBindCleanup(assistantBody)",
-            "_streamFadeAppendText(assistantBody,delta)",
+            "assistantBody.appendChild(document.createTextNode(delta))",
             "_streamFadeDomText=String(next.text||'')",
             "stream-fade-active",
         ],
     )
     assert render_block.index("_smdWrite(next.text,true)") < render_block.index(
-        "_streamFadeAppendText(assistantBody,delta)"
+        "assistantBody.appendChild(document.createTextNode(delta))"
     )
+    assert "_streamFadeAppendText(assistantBody,delta)" not in render_block
+    assert "_streamFadeBindCleanup(assistantBody)" not in render_block
     append_block = function_block(MESSAGES_JS, "_streamFadeAppendText")
     assert_contains_all(
         append_block,
@@ -276,12 +277,93 @@ def test_transparent_anchor_prose_uses_fade_renderer_when_enabled():
     assert_contains_all(
         predicate_block,
         [
+            "!_streamFadeReduceMotionEnabled()",
             "_shouldUseStreamFade()",
             "_shouldUseTransparentStreamFade()",
         ],
     )
     assert "function _shouldUseTransparentStreamFade()" in MESSAGES_JS
     assert "typeof isTransparentStream==='function'&&isTransparentStream()" in MESSAGES_JS
+
+
+def test_reduced_motion_disables_live_prose_fade_predicate():
+    script = (
+        "\n".join(
+            function_block(MESSAGES_JS, name)
+            for name in [
+                "_shouldUseStreamFade",
+                "_shouldUseTransparentStreamFade",
+                "_streamFadeReduceMotionEnabled",
+                "_shouldUseLiveProseFade",
+            ]
+        )
+        + r"""
+let _streamFadeReduceMotionMql=null;
+let _streamFadeReduceMotion=false;
+let _streamFadeReduceMotionOnChange=null;
+let transparent=true;
+let reduceMotion=true;
+global.window={
+  _fadeTextEffect:true,
+  matchMedia(){
+    return {
+      get matches(){ return reduceMotion; },
+      addEventListener(){},
+      removeEventListener(){},
+    };
+  },
+};
+function isTransparentStream(){ return transparent; }
+if(_shouldUseLiveProseFade()) throw new Error('reduced motion allowed live prose fade');
+_streamFadeReduceMotionMql=null;
+reduceMotion=false;
+window._fadeTextEffect=false;
+if(!_shouldUseLiveProseFade()) throw new Error('transparent stream fade should work when motion is allowed');
+_streamFadeReduceMotionMql=null;
+transparent=false;
+window._fadeTextEffect=true;
+if(!_shouldUseLiveProseFade()) throw new Error('regular fade preference should work when motion is allowed');
+"""
+    )
+    run_node(script)
+
+
+def test_transparent_stream_hidden_body_appends_plain_text_only():
+    script = (
+        function_block(MESSAGES_JS, "_renderStreamingFadeMarkdown")
+        + r"""
+let _streamFadeDomText='';
+let _smdParser=null;
+let _smdReconnect=false;
+let parserEnded=false;
+function _streamFadeNextText(){ return {changed:true,caughtUp:false,text:'alpha beta'}; }
+function _shouldUseTransparentStreamFade(){ return true; }
+function _smdEndParser(){ parserEnded=true; }
+const assistantBody={
+  textContent:'',
+  innerHTML:'',
+  children:[],
+  classList:{added:[],add(name){ this.added.push(name); }},
+  appendChild(node){
+    this.children.push(node);
+    this.textContent += String(node.textContent || '');
+    return node;
+  },
+};
+global.document={
+  createTextNode(text){ return {type:'text',textContent:String(text)}; },
+};
+const caughtUp=_renderStreamingFadeMarkdown('alpha beta');
+if(caughtUp) throw new Error('expected fade playout to remain catching up');
+if(assistantBody.textContent!=='alpha beta') throw new Error(`wrong hidden text: ${assistantBody.textContent}`);
+if(_streamFadeDomText!=='alpha beta') throw new Error(`wrong dom text: ${_streamFadeDomText}`);
+if(assistantBody.children.some(node=>node.className==='stream-fade-word is-new')){
+  throw new Error('hidden body received fade span');
+}
+if(!assistantBody.classList.added.includes('stream-fade-active')) throw new Error('missing stream fade active marker');
+"""
+    )
+    run_node(script)
 
 
 def test_transparent_anchor_prose_receives_revealed_fade_text():
