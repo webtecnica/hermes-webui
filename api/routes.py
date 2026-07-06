@@ -16155,7 +16155,7 @@ def _handle_sse_stream(handler, parsed):
     return True
 
 
-def _handle_session_sse_stream_for_session(handler, parsed, session_id):
+def _handle_session_events_stream_for_session(handler, parsed, session_id):
     if not _session_id_visible_to_request_profile(handler, session_id):
         return True
     try:
@@ -16266,6 +16266,9 @@ def _handle_session_sse_stream_for_session(handler, parsed, session_id):
     except _CLIENT_DISCONNECT_ERRORS:
         pass
     return True
+
+
+_handle_session_sse_stream_for_session = _handle_session_events_stream_for_session
 
 
 def _terminal_session_lookup(body_or_query):
