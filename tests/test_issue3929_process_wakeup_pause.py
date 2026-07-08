@@ -531,6 +531,134 @@ def test_process_wakeup_pause_revalidates_status_recovery_without_fingerprint_ch
     assert saved.process_wakeup_pause == {}
 
 
+def test_process_wakeup_pause_revalidates_at_provider_model_with_canonical_provider(tmp_path, monkeypatch):
+    session = Session(
+        session_id="wakeup_pause_at_model_recovered",
+        workspace=str(tmp_path),
+        model="@test-provider:test-model",
+        model_provider=None,
+    )
+    pause = models.record_process_wakeup_provider_unavailable_pause(
+        session,
+        classification="credential_pool_empty",
+        model="test-model",
+        provider="test-provider",
+    )
+    assert pause is not None
+    session.save()
+    models.SESSIONS[session.session_id] = session
+
+    calls = []
+
+    def _provider_has_usable_credential(provider_id, *, refresh=False):
+        calls.append((provider_id, refresh))
+        return provider_id == "test-provider"
+
+    captured = {}
+
+    def _fake_start_run(s, **kwargs):
+        captured["source"] = kwargs.get("source")
+        captured["model"] = kwargs.get("model")
+        captured["model_provider"] = kwargs.get("model_provider")
+        return {"stream_id": "stream-at-provider-recovered", "session_id": s.session_id, "_status": 200}
+
+    _patch_process_wakeup_route(
+        monkeypatch,
+        tmp_path,
+        model="@test-provider:test-model",
+        provider=None,
+    )
+    monkeypatch.setattr(routes, "provider_has_usable_credential", _provider_has_usable_credential)
+    monkeypatch.setattr(routes, "_start_run", _fake_start_run)
+
+    response = routes.start_session_turn(
+        session.session_id,
+        "[IMPORTANT: Background process completed after @provider recovery.]",
+        source="process_wakeup",
+    )
+
+    assert response["_status"] == 200
+    assert response["stream_id"] == "stream-at-provider-recovered"
+    assert calls == [("test-provider", True)]
+    assert captured == {
+        "source": "process_wakeup",
+        "model": "@test-provider:test-model",
+        "model_provider": None,
+    }
+    saved = Session.load(session.session_id)
+    assert saved is not None
+    assert saved.process_wakeup_pause == {}
+
+
+def test_process_wakeup_pause_revalidation_uses_session_profile_not_default(tmp_path, monkeypatch):
+    base_home = tmp_path / "hermes-home"
+    (base_home / "profiles" / "work").mkdir(parents=True)
+    monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", base_home)
+    monkeypatch.setattr(profiles, "_is_isolated_profile_mode", lambda: False)
+    profiles.clear_request_profile()
+
+    session = Session(
+        session_id="wakeup_pause_named_profile_revalidation",
+        workspace=str(tmp_path),
+        model="test-model",
+        model_provider="test-provider",
+        profile="work",
+        process_wakeup_pause={
+            "version": 1,
+            "paused": True,
+            "source": "process_wakeup",
+            "classification": "credential_pool_empty",
+            "model": "test-model",
+            "provider": "test-provider",
+            "first_paused_at": 1.0,
+            "last_error_at": 1.0,
+            "visible_error_count": 1,
+            "suppressed_count": 0,
+        },
+    )
+    session.process_wakeup_pause["credential_state_fingerprint"] = (
+        models.process_wakeup_credential_state_fingerprint(session)
+    )
+    session.save()
+    models.SESSIONS[session.session_id] = session
+
+    calls = []
+
+    def _provider_has_usable_credential(provider_id, *, refresh=False):
+        active_profile = profiles.get_active_profile_name()
+        calls.append((provider_id, refresh, active_profile))
+        return active_profile == "default"
+
+    def _unexpected_start_run(*_args, **_kwargs):
+        raise AssertionError("named-profile wakeup must not clear from default-profile credentials")
+
+    _patch_process_wakeup_route(
+        monkeypatch,
+        tmp_path,
+        model="test-model",
+        provider="test-provider",
+    )
+    monkeypatch.setattr(routes, "provider_has_usable_credential", _provider_has_usable_credential)
+    monkeypatch.setattr(routes, "_start_run", _unexpected_start_run)
+
+    try:
+        response = routes.start_session_turn(
+            session.session_id,
+            "[IMPORTANT: Background process completed while named profile is still exhausted.]",
+            source="process_wakeup",
+        )
+    finally:
+        profiles.clear_request_profile()
+
+    assert response["_status"] == 409
+    assert response["error"] == PROCESS_WAKEUP_PAUSE_ERROR
+    assert calls == [("test-provider", True, "work")]
+    saved = Session.load(session.session_id)
+    assert saved is not None
+    assert saved.process_wakeup_pause["suppressed_count"] == 1
+    assert profiles.get_active_profile_name() == "default"
+
+
 def test_process_wakeup_pause_suppresses_at_provider_model_session(tmp_path, monkeypatch):
     session = Session(
         session_id="wakeup_pause_at_model",

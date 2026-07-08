@@ -470,6 +470,7 @@ from api.profiles import (  # noqa: F401, E402  (re-export)
     get_active_profile_name as _get_active_profile_name,
     get_active_hermes_home,
     list_profiles_api,
+    profile_scope_for_detached_worker,
 )
 
 
@@ -2810,6 +2811,7 @@ from api.config import (
     save_settings,
     SETTINGS_FILE,
     set_hermes_default_model,
+    canonical_model_provider_lane,
     model_with_provider_context,
     get_reasoning_status,
     set_reasoning_display,
@@ -19831,6 +19833,38 @@ def _start_run(
     )
 
 
+def _process_wakeup_revalidation_provider(model, provider) -> str:
+    """Return the canonical provider id used for wakeup credential revalidation."""
+    try:
+        _resolved_model, resolved_provider = canonical_model_provider_lane(model, provider)
+    except Exception:
+        logger.debug(
+            "failed to canonicalize process_wakeup revalidation lane for model=%r provider=%r",
+            model,
+            provider,
+            exc_info=True,
+        )
+        resolved_provider = None
+    candidate = resolved_provider if resolved_provider else provider
+    return str(candidate or "").strip()
+
+
+def _process_wakeup_provider_has_usable_credential(session, *, model, provider) -> bool:
+    """Check paused-lane credential recovery in the owning session profile."""
+    provider_id = _process_wakeup_revalidation_provider(model, provider)
+    if not provider_id:
+        return False
+    profile_name = str(getattr(session, "profile", "") or "").strip()
+    if profile_name and not _is_root_profile(profile_name):
+        with profile_scope_for_detached_worker(
+            profile_name,
+            "process_wakeup credential revalidation",
+            logger_override=logger,
+        ):
+            return provider_has_usable_credential(provider_id, refresh=True)
+    return provider_has_usable_credential(provider_id, refresh=True)
+
+
 def start_session_turn(
     session_id: str,
     message: str,
@@ -19932,9 +19966,10 @@ def start_session_turn(
         ):
             _credential_recovered = False
             try:
-                _credential_recovered = provider_has_usable_credential(
-                    model_provider,
-                    refresh=True,
+                _credential_recovered = _process_wakeup_provider_has_usable_credential(
+                    s,
+                    model=model,
+                    provider=model_provider,
                 )
             except Exception:
                 logger.debug(
