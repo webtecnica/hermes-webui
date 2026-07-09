@@ -1488,6 +1488,111 @@ def test_gateway_late_cancel_preserves_completed_webui_turn(tmp_path, monkeypatc
     assert "done" not in queued_events
 
 
+def test_gateway_late_cancel_preserves_existing_pause_for_webui_recovery(tmp_path, monkeypatch):
+    stream_id = "gateway-webui-recovery-late-cancel-stream"
+    session_id = "gateway_webui_recovery_late_cancel"
+    stream_queue = queue.Queue()
+    config.STREAMS[stream_id] = stream_queue
+    monkeypatch.setattr(gateway_chat, "RunJournalWriter", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(gateway_chat, "gateway_approval_unavailable_reason", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(config, "get_config", lambda: {"webui_gateway_base_url": "http://gateway.test"})
+
+    class _GatewayResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def __iter__(self):
+            payload = {"choices": [{"delta": {"content": "Gateway recovery reply"}}]}
+            return iter([
+                ("data: " + json.dumps(payload) + "\n").encode("utf-8"),
+                b"data: [DONE]\n",
+            ])
+
+    monkeypatch.setattr(
+        gateway_chat.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: _GatewayResponse(),
+    )
+
+    previous_pause = {
+        "paused": True,
+        "model": "claude-sonnet-test",
+        "provider": "test-provider",
+        "classification": "credential_pool_empty",
+        "first_paused_at": 1.0,
+        "last_visible_error_at": 1.0,
+        "visible_error_count": 1,
+        "suppressed_count": 2,
+        "credential_state_fingerprint": "fingerprint-before",
+    }
+    previous_messages = [{"role": "user", "content": "before", "timestamp": 1.0}]
+    session = Session(
+        session_id=session_id,
+        workspace=str(tmp_path),
+        model="claude-sonnet-test",
+        model_provider="test-provider",
+        messages=list(previous_messages),
+        context_messages=list(previous_messages),
+        active_stream_id=stream_id,
+        pending_user_message="try recovery",
+        pending_user_source="webui",
+        process_wakeup_pause=dict(previous_pause),
+    )
+    session.save()
+    models.SESSIONS[session_id] = session
+
+    original_save = Session.save
+    save_calls = {"completed": 0}
+
+    def _save_and_cancel_after_completed_recovery_turn(self, *args, **kwargs):
+        result = original_save(self, *args, **kwargs)
+        if (
+            getattr(self, "session_id", None) == session_id
+            and save_calls["completed"] == 0
+            and getattr(self, "active_stream_id", None) is None
+            and getattr(self, "pending_user_message", None) is None
+            and any(
+                msg.get("role") == "assistant" and msg.get("content") == "Gateway recovery reply"
+                for msg in (getattr(self, "messages", None) or [])
+            )
+        ):
+            save_calls["completed"] += 1
+            config.CANCEL_FLAGS[stream_id].set()
+        return result
+
+    monkeypatch.setattr(Session, "save", _save_and_cancel_after_completed_recovery_turn)
+
+    gateway_chat._run_gateway_chat_streaming(
+        session_id,
+        "try recovery",
+        "claude-sonnet-test",
+        str(tmp_path),
+        stream_id,
+        model_provider="test-provider",
+    )
+
+    assert save_calls["completed"] == 1
+    saved = Session.load(session_id)
+    assert saved is not None
+    assert saved.process_wakeup_pause == previous_pause
+    assert [msg.get("content") for msg in saved.messages] == [
+        "before",
+        "try recovery",
+        "Gateway recovery reply",
+    ]
+    assert [msg.get("content") for msg in saved.context_messages] == [
+        "before",
+        "try recovery",
+        "Gateway recovery reply",
+    ]
+    queued_events = [item[0] for item in list(stream_queue.queue)]
+    assert "cancel" in queued_events
+    assert "done" not in queued_events
+
+
 def test_stale_credential_empty_process_wakeup_still_records_pause(tmp_path):
     session = Session(
         session_id="wakeup_pause_stale",
