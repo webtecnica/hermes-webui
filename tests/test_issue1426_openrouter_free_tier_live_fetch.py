@@ -167,10 +167,17 @@ def test_openrouter_free_tier_pricing_fails_closed(
         lambda *_args, **_kwargs: _FakeResponse(fake_payload),
     )
 
-    from hermes_cli import models as hermes_models
-
-    monkeypatch.setattr(hermes_models, "fetch_openrouter_models", lambda **_kwargs: [])
-    monkeypatch.setattr(hermes_models, "provider_model_ids", lambda *_args, **_kwargs: [])
+    # hermes_cli (the agent package) is an optional dependency and is not
+    # installed in the WebUI CI test environment. Force its live-fetch to
+    # return empty when present so the fail-closed static path is exercised;
+    # when absent, that static path is already the only one — mirror the
+    # try/except guard the sibling tests in this file use.
+    try:
+        from hermes_cli import models as hermes_models
+        monkeypatch.setattr(hermes_models, "fetch_openrouter_models", lambda **_kwargs: [])
+        monkeypatch.setattr(hermes_models, "provider_model_ids", lambda *_args, **_kwargs: [])
+    except Exception:
+        pass
 
     grouped = _get_grouped_models()
     openrouter_group = next(
