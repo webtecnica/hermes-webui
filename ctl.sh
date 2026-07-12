@@ -491,7 +491,10 @@ _port_listener_diag() {
   if [[ -z "${line}" ]] && command -v lsof >/dev/null 2>&1; then
     line="$(lsof -nP -iTCP:"${port}" -sTCP:LISTEN 2>/dev/null | awk 'NR==2 {print; exit}')"
   fi
-  [[ -n "${line}" ]] && printf '%s' "${line}"
+  if [[ -n "${line}" ]]; then
+    printf '%s' "${line}"
+  fi
+  return 0
 }
 
 _systemd_webui_conflict() {

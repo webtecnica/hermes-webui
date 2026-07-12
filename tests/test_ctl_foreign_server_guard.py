@@ -346,6 +346,40 @@ def test_status_reports_unmanaged_running_instance(tmp_path):
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX daemon guards")
+@pytest.mark.parametrize(
+    ("command", "expected_output"),
+    [
+        ("status", "running (not managed by ctl.sh)"),
+        ("stop", "NOT managed by ctl.sh"),
+    ],
+)
+def test_unmanaged_instance_commands_survive_missing_listener_diagnostics(
+    tmp_path, command, expected_output
+):
+    """Best-effort listener diagnostics must not abort status/stop under set -e
+    when ss/lsof are unavailable or return no matching listener row."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_port_tools(fake_bin, pid_listens=False)
+    port = _free_port()
+    server = _start_dummy_http_server(port)
+    try:
+        result = run_ctl(
+            tmp_path,
+            command,
+            env=_guard_env(fake_bin, HERMES_WEBUI_PORT=str(port)),
+            timeout=15,
+        )
+        combined = result.stdout + result.stderr
+        assert result.returncode == 0, combined
+        assert expected_output in combined
+        assert "Listener:" not in combined
+        assert server.poll() is None, "ctl.sh must leave a foreign server untouched"
+    finally:
+        _stop_proc(server)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX daemon guards")
 def test_stop_warns_about_unmanaged_instance_and_leaves_it_alone(tmp_path):
     port = _free_port()
     server = _start_dummy_http_server(port)
