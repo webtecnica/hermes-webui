@@ -23344,7 +23344,7 @@ def _resolve_approval_legacy(sid: str, approval_id: str, choice: str) -> bool:
     # Collect keys from both _pending and _gateway_queues
     keys_from_pending = pending.get("pattern_keys") or [pending.get("pattern_key", "")] if pending else []
     all_keys = [k for k in keys_from_pending if k] + [k for k in gateway_keys if k]
-    if choice in ("once", "session"):
+    if choice == "session":
         for k in all_keys:
             approve_session(sid, k)
     elif choice == "always":
@@ -23352,6 +23352,11 @@ def _resolve_approval_legacy(sid: str, approval_id: str, choice: str) -> bool:
             approve_session(sid, k)
             approve_permanent(k)
         save_permanent_allowlist(_permanent_approved)
+    # choice == "once": no persistence — approval lasts this single call only.
+    # resolve_gateway_approval() below unblocks the parked agent thread for
+    # every choice, so "once" still lets the current tool run; we just must not
+    # call approve_session() here, or the next matching guarded call would find
+    # the pattern already session-approved and skip its approval card (#6017).
     # Unblock the agent thread waiting in the gateway approval queue.
     # This is the primary signal when streaming is active — the agent
     # thread is parked in entry.event.wait() and needs to be woken up.
