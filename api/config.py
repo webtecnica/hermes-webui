@@ -9020,6 +9020,7 @@ _SETTINGS_DEFAULTS = {
     "password_hash": None,  # PBKDF2-HMAC-SHA256 hash; None = auth disabled
     "auth_disabled_acknowledged": False,  # user acknowledged unauthenticated risk
     "provider_cost_budget": None,
+    "skip_delete_confirm": False,  # skip "Are you sure?" dialog before deleting a session
 }
 _SETTINGS_SPEECH_KEYS = {
     "tts_enabled",
@@ -9309,6 +9310,7 @@ _SETTINGS_BOOL_KEYS = {
     "hide_composer_status",
     "hide_composer_context",
     "hide_composer_bg_badge",
+    "skip_delete_confirm",
 }
 # Language codes are validated as short alphanumeric BCP-47-like tags (e.g. 'en', 'zh', 'fr')
 _SETTINGS_LANG_RE = __import__("re").compile(r"^[a-zA-Z]{2,10}(-[a-zA-Z0-9]{2,8})?$")
