@@ -25,6 +25,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import json
+import logging
 import os
 import threading
 import time
@@ -43,6 +44,13 @@ _GATEWAY_RUNTIME_STATUS_FILE = "gateway_state.json"
 # minutes. Override is intentionally not exposed: keep the check deterministic
 # and identical across deployments so support diagnostics are reproducible.
 GATEWAY_FRESHNESS_THRESHOLD_S: float = 120.0
+
+# General staleness safety net for any gateway state value (e.g. startup_failed).
+# More generous than the state-specific thresholds because this is a catch-all
+# that must never cause the server to exit based on stale on-disk state (#6086).
+STALE_GATEWAY_STATE_THRESHOLD_S: float = 300.0
+
+_logger = logging.getLogger(__name__)
 
 
 def _checked_at() -> str:
@@ -151,6 +159,42 @@ def _runtime_status_is_stale_running(
     if not isinstance(runtime_status, dict):
         return False
     if runtime_status.get("gateway_state") != "running":
+        return False
+
+    raw_updated_at = runtime_status.get("updated_at")
+    if not isinstance(raw_updated_at, str) or not raw_updated_at:
+        return False
+
+    try:
+        updated_at = datetime.fromisoformat(raw_updated_at)
+    except (TypeError, ValueError):
+        return False
+    if updated_at.tzinfo is None:
+        return False
+
+    reference = now if now is not None else datetime.now(timezone.utc)
+    age_s = (reference - updated_at).total_seconds()
+    return age_s > threshold_s
+
+
+def _runtime_status_is_stale(
+    runtime_status: dict[str, Any] | None,
+    *,
+    now: datetime | None = None,
+    threshold_s: float = STALE_GATEWAY_STATE_THRESHOLD_S,
+) -> bool:
+    """Return ``True`` when the gateway state file is stale regardless of state value.
+
+    A catch-all staleness detector for any ``gateway_state`` value (e.g. ``startup_failed``).
+    Unlike the state-specific checks (``_runtime_status_is_stale_running``,
+    ``_runtime_status_is_stale_stopped``), this does not filter by the state value,
+    so a stale ``startup_failed`` or any other unexpected state is detected.
+    A stale file must never cause the server to exit (#6086).
+
+    Returns ``False`` for missing/unparseable timestamps so we never report stale
+    when we cannot determine the age.
+    """
+    if not isinstance(runtime_status, dict):
         return False
 
     raw_updated_at = runtime_status.get("updated_at")
@@ -809,6 +853,34 @@ def build_agent_health_payload() -> dict[str, Any]:
                 **safe_details,
             },
         }
+
+    # Catch-all staleness safety net (#6086): any residual gateway state file
+    # (e.g. ``startup_failed``) that is older than the threshold must never cause
+    # the server to exit. Treat it as UNKNOWN and log a warning so operators can
+    # investigate while the server continues running.
+    if isinstance(runtime_status, dict):
+        raw_updated_at = runtime_status.get("updated_at")
+        if isinstance(raw_updated_at, str) and raw_updated_at:
+            try:
+                updated_at = datetime.fromisoformat(raw_updated_at)
+                if updated_at.tzinfo is not None:
+                    age_s = (datetime.now(timezone.utc) - updated_at).total_seconds()
+                    if age_s > STALE_GATEWAY_STATE_THRESHOLD_S:
+                        _logger.warning(
+                            "gateway_state.json is stale (%.0f seconds old) — ignoring",
+                            age_s,
+                        )
+                        return {
+                            "alive": None,
+                            "checked_at": checked_at,
+                            "details": {
+                                "state": "unknown",
+                                "reason": "gateway_stale_state",
+                                **safe_details,
+                            },
+                        }
+            except (TypeError, ValueError):
+                pass
 
     if isinstance(runtime_status, dict):
         return {

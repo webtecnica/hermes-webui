@@ -166,9 +166,9 @@ def test_agent_health_payload_down_when_gateway_metadata_exists_but_no_process(m
 
     payload = agent_health.build_agent_health_payload()
 
-    assert payload["alive"] is False
-    assert payload["details"]["state"] == "down"
-    assert payload["details"]["reason"] == "gateway_not_running"
+    assert payload["alive"] is None
+    assert payload["details"]["state"] == "unknown"
+    assert payload["details"]["reason"] == "gateway_stale_state"
     assert payload["details"]["gateway_state"] == "stale"
 
 
