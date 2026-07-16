@@ -6265,18 +6265,37 @@ def _last_resort_sync_from_core(session, stream_id, agent_lock):
         )
 
 
-def _build_session_db_for_stream(state_db_path):
+def _build_session_db_for_stream(state_db_path, attempts: int = 3):
     """Build a per-request SessionDB handle for WebUI session search.
 
-    Returns ``None`` if the helper module or constructor fails so callers can
-    continue without session_search rather than propagating a hard failure.
+    Retries up to ``attempts`` times with exponential backoff + jitter to
+    survive WAL write-lock contention when the gateway is writing to
+    ``state.db`` concurrently. Rejects handles where FTS is not enabled
+    (transient lock loss during schema setup) to avoid silent ``[]`` results.
+
+    Returns ``None`` on repeated failure so callers can continue without
+    session_search rather than propagating a hard failure.
     """
-    try:
-        from hermes_state import SessionDB
-        return SessionDB(db_path=state_db_path)
-    except Exception as _db_err:
-        print(f"[webui] WARNING: SessionDB init failed - session_search will be unavailable: {_db_err}", flush=True)
+    if state_db_path is None:
         return None
+    import random
+    import time
+
+    from hermes_state import SessionDB
+
+    for i in range(attempts):
+        try:
+            db = SessionDB(db_path=state_db_path)
+            # Reject a handle whose FTS schema lost the WAL lock race —
+            # search_messages() would silently return [].
+            if getattr(db, "_fts_enabled", False):
+                return db
+            db.close()
+        except Exception as _db_err:
+            print(f"[webui] SessionDB init attempt {i + 1}/{attempts} failed with WAL contention: {_db_err}", flush=True)
+        # Exponential backoff with jitter: 50ms, 100ms, 200ms, ...
+        time.sleep(0.05 * (2 ** i) + random.uniform(0, 0.05))
+    return None
 
 
 def _replace_session_db_in_kwargs(agent_kwargs, state_db_path):
