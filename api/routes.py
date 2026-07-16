@@ -9715,6 +9715,8 @@ from api.route_approvals import (  # noqa: F401 — re-exports for backward comp
     _approval_sse_notify_locked,
     _approval_sse_notify,
     _GATEWAY_MIRROR_FLAG,
+    _GATEWAY_MIRROR_TOKEN,
+    _gateway_mirror_entry_token,
     gateway_pending_mirror,
     retire_gateway_pending_mirror,
     reconcile_gateway_pending_mirror_locked,
@@ -23806,15 +23808,24 @@ def _resolve_approval_legacy(sid: str, approval_id: str, choice: str, run_id: st
         queue = _pending.get(sid)
         if isinstance(queue, list):
             if approval_id:
-                # Find and remove the specific entry by approval_id.
+                # Prefer a local exact-id match over a mirrored one, so a
+                # preceding remote mirror cannot consume the user's local choice.
+                preferred_index = None
+                fallback_index = None
                 for i, entry in enumerate(queue):
                     if entry.get("approval_id") != approval_id:
                         continue
                     if run_id and str(entry.get("run_id") or "").strip() != run_id:
                         continue
-                    pending = queue.pop(i)
+                    if not entry.get(_GATEWAY_MIRROR_FLAG) or not str(entry.get("run_id") or "").strip():
+                        preferred_index = i
+                        break
+                    if fallback_index is None:
+                        fallback_index = i
+                match_index = preferred_index if preferred_index is not None else fallback_index
+                if match_index is not None:
+                    pending = queue.pop(match_index)
                     found_target = True
-                    break
                 else:
                     # A stale explicit id must not accidentally approve the
                     # oldest queued command; duplicate/stale responses are
@@ -23993,10 +24004,11 @@ def _handle_approval_respond(handler, body):
                 _candidate_run_id = _STREAM_RUN_IDS.get(active_sid)
         local_match = False
         run_backed_gateway_matches = 0
-        if approval_id:
-            with _lock:
-                queue = _pending.get(sid)
-                entries = queue if isinstance(queue, list) else [queue] if queue else []
+        same_run_stale_without_token = False
+        with _lock:
+            queue = _pending.get(sid)
+            entries = queue if isinstance(queue, list) else [queue] if queue else []
+            if approval_id:
                 local_match = any(
                     isinstance(entry, dict)
                     and entry.get("approval_id") == approval_id
@@ -24014,11 +24026,60 @@ def _handle_approval_respond(handler, body):
                     and entry.get(_GATEWAY_MIRROR_FLAG)
                     and str(entry.get("run_id") or "").strip()
                 )
-            if local_match:
-                _candidate_run_id = None
-        matched_mirror = gateway_pending_mirror(
-            sid, approval_id=approval_id, run_id=_candidate_run_id
-        ) if approval_id else None
+                gateway_queue = _gateway_queues.get(sid) or []
+                live_head_data = getattr(gateway_queue[0], "data", None) or {} if gateway_queue else {}
+                live_head_run_id = str(live_head_data.get("run_id") or "").strip()
+                live_head_token = (
+                    _gateway_mirror_entry_token(gateway_queue[0])
+                    if gateway_queue and live_head_data
+                    else None
+                )
+                live_head_approval_id = str(live_head_data.get("approval_id") or "").strip()
+                if not live_head_approval_id and live_head_token and live_head_run_id:
+                    live_head_approval_id = f"gwrun:{live_head_run_id}:{live_head_token}"
+                stale_same_run_id = _candidate_run_id or live_head_run_id
+                if (
+                    stale_same_run_id
+                    and live_head_run_id == stale_same_run_id
+                    and live_head_approval_id
+                    and live_head_approval_id != approval_id
+                ):
+                    same_run_stale_without_token = any(
+                        isinstance(entry, dict)
+                        and entry.get("approval_id") == approval_id
+                        and entry.get(_GATEWAY_MIRROR_FLAG)
+                        and str(entry.get("run_id") or "").strip() == stale_same_run_id
+                        and not str(entry.get(_GATEWAY_MIRROR_TOKEN) or "").strip()
+                        for entry in entries
+                    )
+            else:
+                local_match = any(
+                    isinstance(entry, dict)
+                    and (
+                        not entry.get(_GATEWAY_MIRROR_FLAG)
+                        or not str(entry.get("run_id") or "").strip()
+                    )
+                    for entry in entries
+                )
+        if local_match:
+            _candidate_run_id = None
+        if approval_id and not local_match and same_run_stale_without_token:
+            return j(
+                handler,
+                {
+                    "ok": False,
+                    "choice": choice,
+                    "relayed": False,
+                    "code": "gateway_run_unavailable",
+                    "error": _GATEWAY_APPROVAL_RELAY_UNAVAILABLE,
+                },
+                status=409,
+            )
+        matched_mirror = (
+            gateway_pending_mirror(sid, approval_id=approval_id, run_id=_candidate_run_id)
+            if approval_id and not local_match
+            else None
+        )
         _run_id = matched_mirror["run_id"] if matched_mirror else None
         if not matched_mirror and approval_id:
             if local_match:

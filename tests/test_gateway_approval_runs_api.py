@@ -9,6 +9,8 @@ import urllib.error
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 
 # ---------------------------------------------------------------------------
 # 1. Capability detection
@@ -603,7 +605,10 @@ def test_gateway_approval_relay_does_not_unblock_unrelated_local_head():
     from api.gateway_chat import _STREAM_RUN_IDS
     from api import routes
     import api.route_approvals as approvals
-    import tools.approval as ta
+    ta = pytest.importorskip(
+        "tools.approval",
+        reason="tools.approval not available in this environment",
+    )
 
     sid = "sess-remote-relay-local-head"
     stream_id = "sid-remote-relay-local-head"
@@ -746,6 +751,132 @@ def test_direct_remote_approval_still_mirrors_with_local_gateway_head():
         approvals._gateway_queues.pop(sid, None)
 
 
+def test_legacy_gateway_approval_without_run_gets_browser_visible_id():
+    import api.route_approvals as approvals
+
+    sid = "sess-legacy-no-run-id"
+    approvals._pending.pop(sid, None)
+    approvals._gateway_queues.pop(sid, None)
+    try:
+        approvals._gateway_queues[sid] = [SimpleNamespace(data={"command": "legacy"})]
+        approval = {"command": "legacy"}
+        approvals.submit_gateway_pending_mirror(sid, approval)
+        assert approval.get("approval_id")
+        queue = approvals._pending.get(sid) or []
+        assert queue[0]["approval_id"] == approval["approval_id"]
+    finally:
+        approvals._pending.pop(sid, None)
+        approvals._gateway_queues.pop(sid, None)
+
+
+def test_legacy_gateway_approval_without_run_keeps_its_own_id_beside_local_head():
+    import api.route_approvals as approvals
+
+    sid = "sess-legacy-no-run-local-head"
+    approvals._pending.pop(sid, None)
+    approvals._gateway_queues.pop(sid, None)
+    try:
+        approvals._pending[sid] = [{"approval_id": "local-id", "command": "local"}]
+        approvals._gateway_queues[sid] = [SimpleNamespace(data={"command": "legacy"})]
+        approval = {"command": "legacy"}
+        approvals.submit_gateway_pending_mirror(sid, approval)
+        assert approval.get("approval_id")
+        assert approval["approval_id"] != "local-id"
+        queue = approvals._pending.get(sid) or []
+        mirrors = [
+            entry for entry in queue
+            if entry.get(approvals._GATEWAY_MIRROR_FLAG)
+            and not str(entry.get("run_id") or "").strip()
+        ]
+        assert mirrors
+        assert mirrors[-1]["approval_id"] == approval["approval_id"]
+    finally:
+        approvals._pending.pop(sid, None)
+        approvals._gateway_queues.pop(sid, None)
+
+
+def test_legacy_gateway_approval_without_run_keeps_its_own_id_beside_local_gateway_head():
+    import api.route_approvals as approvals
+    ta = pytest.importorskip(
+        "tools.approval",
+        reason="tools.approval not available in this environment",
+    )
+
+    sid = "sess-legacy-no-run-local-gateway-head"
+    approvals._pending.pop(sid, None)
+    approvals._gateway_queues.pop(sid, None)
+    try:
+        approvals._gateway_queues[sid] = [ta._ApprovalEntry({
+            "approval_id": "local-id",
+            "command": "local-head",
+        })]
+        approval = {"approval_id": "remote-id", "command": "legacy"}
+        approvals.submit_gateway_pending_mirror(sid, approval)
+        assert approval["approval_id"] == "remote-id"
+        queue = approvals._pending.get(sid) or []
+        mirrors = [
+            entry for entry in queue
+            if entry.get(approvals._GATEWAY_MIRROR_FLAG)
+            and not str(entry.get("run_id") or "").strip()
+            and entry.get("approval_id") == "remote-id"
+        ]
+        assert mirrors
+    finally:
+        approvals._pending.pop(sid, None)
+        approvals._gateway_queues.pop(sid, None)
+
+
+def test_identical_legacy_gateway_approvals_without_run_keep_distinct_ids():
+    import api.route_approvals as approvals
+
+    sid = "sess-legacy-no-run-identical"
+    approvals._pending.pop(sid, None)
+    approvals._gateway_queues.pop(sid, None)
+    try:
+        first = {"command": "legacy"}
+        second = {"command": "legacy"}
+        approvals.submit_gateway_pending_mirror(sid, first)
+        approvals.submit_gateway_pending_mirror(sid, second)
+        assert first["approval_id"] != second["approval_id"]
+        queue = approvals._pending.get(sid) or []
+        mirrored_ids = [
+            entry.get("approval_id")
+            for entry in queue
+            if entry.get(approvals._GATEWAY_MIRROR_FLAG)
+            and not str(entry.get("run_id") or "").strip()
+        ]
+        assert mirrored_ids == [first["approval_id"], second["approval_id"]]
+    finally:
+        approvals._pending.pop(sid, None)
+        approvals._gateway_queues.pop(sid, None)
+
+
+def test_identical_legacy_gateway_approvals_with_explicit_ids_keep_distinct_ids():
+    import api.route_approvals as approvals
+
+    sid = "sess-legacy-no-run-identical-explicit"
+    approvals._pending.pop(sid, None)
+    approvals._gateway_queues.pop(sid, None)
+    try:
+        first = {"approval_id": "upstream-a", "command": "legacy"}
+        second = {"approval_id": "upstream-b", "command": "legacy"}
+        approvals.submit_gateway_pending_mirror(sid, first)
+        approvals.submit_gateway_pending_mirror(sid, second)
+        assert first["approval_id"] == "upstream-a"
+        assert second["approval_id"] == "upstream-b"
+        queue = approvals._pending.get(sid) or []
+        mirrored_ids = [
+            entry.get("approval_id")
+            for entry in queue
+            if entry.get(approvals._GATEWAY_MIRROR_FLAG)
+            and not str(entry.get("run_id") or "").strip()
+        ]
+        assert mirrored_ids == ["upstream-a", "upstream-b"]
+    finally:
+        approvals._pending.pop(sid, None)
+        approvals._gateway_queues.pop(sid, None)
+
+
 def test_reconcile_does_not_bind_live_token_by_approval_id_alone():
     import api.route_approvals as approvals
 
@@ -872,6 +1003,30 @@ def test_exact_one_retirement_keeps_same_run_gateway_queue_state():
     finally:
         approvals._pending.pop(sid, None)
         approvals._gateway_queues.pop(sid, None)
+
+
+def test_retire_gateway_pending_mirror_notifies_reconciled_successor_when_target_missing():
+    import api.route_approvals as approvals
+
+    sid = "sess-retire-notify-successor"
+    approvals._pending.pop(sid, None)
+    try:
+        approvals._pending[sid] = [{
+            approvals._GATEWAY_MIRROR_FLAG: True,
+            "run_id": "run-a",
+            "approval_id": "appr-b",
+            "command": "b",
+        }]
+        notifications = []
+
+        def fake_notify(_sid, head, total):
+            notifications.append((head["approval_id"] if head else None, total))
+
+        with patch.object(approvals, "_approval_sse_notify_locked", side_effect=fake_notify):
+            assert approvals.retire_gateway_pending_mirror(sid, approval_id="appr-a", run_id="run-a") is False
+        assert notifications[-1] == ("appr-b", 1)
+    finally:
+        approvals._pending.pop(sid, None)
 
 
 def test_local_stop_uses_runs_api_stop_endpoint():
@@ -1519,6 +1674,162 @@ def test_stale_same_run_gateway_card_does_not_relay_live_head():
     finally:
         _STREAM_RUN_IDS.pop(stream_id, None)
         approvals._pending.pop(sid, None)
+
+
+def test_stale_same_run_gateway_card_without_token_does_not_relay_live_head():
+    from api.gateway_chat import _STREAM_RUN_IDS
+    import api.route_approvals as approvals
+    ta = pytest.importorskip(
+        "tools.approval",
+        reason="tools.approval not available in this environment",
+    )
+
+    sid = "sess-stale-same-run-no-token"
+    stream_id = "sid-stale-same-run-no-token"
+    _STREAM_RUN_IDS[stream_id] = "run-shared"
+    approvals._pending.pop(sid, None)
+    approvals._gateway_queues.pop(sid, None)
+    try:
+        approvals._pending[sid] = [{
+            approvals._GATEWAY_MIRROR_FLAG: True,
+            "run_id": "run-shared",
+            "approval_id": "stale-a",
+            "command": "stale",
+        }]
+        approvals._gateway_queues[sid] = [ta._ApprovalEntry({
+            "run_id": "run-shared",
+            "approval_id": "live-b",
+            "command": "live",
+        })]
+
+        mock_session = MagicMock()
+        mock_session.active_stream_id = stream_id
+        handler = MagicMock()
+        handler.wfile = io.BytesIO()
+
+        with patch("api.routes.get_session", return_value=mock_session), \
+             patch("api.gateway_chat._gateway_base_url", return_value="http://gw:8642"), \
+             patch("api.gateway_chat._gateway_api_key", return_value=""), \
+             patch("api.runner_client.HttpRunnerClient._request_json") as request_json:
+            from api.routes import _handle_approval_respond
+            _handle_approval_respond(handler, {
+                "session_id": sid,
+                "choice": "once",
+                "approval_id": "stale-a",
+            })
+
+        payload = json.loads(handler.wfile.getvalue().decode("utf-8"))
+        assert handler.send_response.call_args.args[0] == 409
+        assert payload["code"] == "gateway_run_unavailable"
+        request_json.assert_not_called()
+        assert approvals.gateway_pending_mirror(sid, approval_id="live-b", run_id="run-shared") is not None
+    finally:
+        _STREAM_RUN_IDS.pop(stream_id, None)
+        approvals._pending.pop(sid, None)
+        approvals._gateway_queues.pop(sid, None)
+
+
+def test_stale_same_run_gateway_card_without_token_after_teardown_does_not_relay_live_head():
+    import api.route_approvals as approvals
+    ta = pytest.importorskip(
+        "tools.approval",
+        reason="tools.approval not available in this environment",
+    )
+
+    sid = "sess-stale-same-run-no-token-teardown"
+    approvals._pending.pop(sid, None)
+    approvals._gateway_queues.pop(sid, None)
+    try:
+        approvals._pending[sid] = [{
+            approvals._GATEWAY_MIRROR_FLAG: True,
+            "run_id": "run-shared",
+            "approval_id": "stale-a",
+            "command": "stale",
+        }]
+        approvals._gateway_queues[sid] = [ta._ApprovalEntry({
+            "run_id": "run-shared",
+            "approval_id": "live-b",
+            "command": "live",
+        })]
+
+        mock_session = MagicMock()
+        mock_session.active_stream_id = None
+        handler = MagicMock()
+        handler.wfile = io.BytesIO()
+
+        with patch("api.routes.get_session", return_value=mock_session), \
+             patch("api.gateway_chat._gateway_base_url", return_value="http://gw:8642"), \
+             patch("api.gateway_chat._gateway_api_key", return_value=""), \
+             patch("api.runner_client.HttpRunnerClient._request_json") as request_json:
+            from api.routes import _handle_approval_respond
+            _handle_approval_respond(handler, {
+                "session_id": sid,
+                "choice": "once",
+                "approval_id": "stale-a",
+            })
+
+        payload = json.loads(handler.wfile.getvalue().decode("utf-8"))
+        assert handler.send_response.call_args.args[0] == 409
+        assert payload["code"] == "gateway_run_unavailable"
+        request_json.assert_not_called()
+        assert approvals.gateway_pending_mirror(sid, approval_id="live-b", run_id="run-shared") is not None
+    finally:
+        approvals._pending.pop(sid, None)
+        approvals._gateway_queues.pop(sid, None)
+
+
+def test_stale_same_run_gateway_card_without_token_does_not_relay_live_head_when_live_id_is_synthesized():
+    from api.gateway_chat import _STREAM_RUN_IDS
+    import api.route_approvals as approvals
+    ta = pytest.importorskip(
+        "tools.approval",
+        reason="tools.approval not available in this environment",
+    )
+
+    sid = "sess-stale-same-run-no-token-synthesized-live-id"
+    stream_id = "sid-stale-same-run-no-token-synthesized-live-id"
+    _STREAM_RUN_IDS[stream_id] = "run-shared"
+    approvals._pending.pop(sid, None)
+    approvals._gateway_queues.pop(sid, None)
+    try:
+        approvals._pending[sid] = [{
+            approvals._GATEWAY_MIRROR_FLAG: True,
+            "run_id": "run-shared",
+            "approval_id": "stale-a",
+            "command": "stale",
+        }]
+        approvals._gateway_queues[sid] = [ta._ApprovalEntry({
+            "run_id": "run-shared",
+            "command": "live",
+        })]
+
+        mock_session = MagicMock()
+        mock_session.active_stream_id = stream_id
+        handler = MagicMock()
+        handler.wfile = io.BytesIO()
+
+        with patch("api.routes.get_session", return_value=mock_session), \
+             patch("api.gateway_chat._gateway_base_url", return_value="http://gw:8642"), \
+             patch("api.gateway_chat._gateway_api_key", return_value=""), \
+             patch("api.runner_client.HttpRunnerClient._request_json") as request_json:
+            from api.routes import _handle_approval_respond
+            _handle_approval_respond(handler, {
+                "session_id": sid,
+                "choice": "once",
+                "approval_id": "stale-a",
+            })
+
+        payload = json.loads(handler.wfile.getvalue().decode("utf-8"))
+        assert handler.send_response.call_args.args[0] == 409
+        assert payload["code"] == "gateway_run_unavailable"
+        request_json.assert_not_called()
+        live_mirror = approvals.gateway_pending_mirror(sid, run_id="run-shared")
+        assert live_mirror is not None
+        assert live_mirror["approval_id"] != "stale-a"
+    finally:
+        _STREAM_RUN_IDS.pop(stream_id, None)
+        approvals._pending.pop(sid, None)
+        approvals._gateway_queues.pop(sid, None)
 
 
 def test_token_stale_same_run_gateway_card_does_not_relay_advanced_live_head():

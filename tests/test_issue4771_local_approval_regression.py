@@ -278,6 +278,109 @@ def test_local_live_head_beats_active_remote_candidate_run():
         _cleanup(sid)
 
 
+def test_local_plain_pending_exact_id_beats_remote_mirror():
+    sid = f"local-plain-pending-id-{uuid.uuid4().hex[:8]}"
+    session = _register_session(sid)
+    stream_id = f"remote-stream-{uuid.uuid4().hex[:8]}"
+    session.active_stream_id = stream_id
+    _STREAM_RUN_IDS[stream_id] = "remote-run"
+    try:
+        with ta._lock:
+            ta._pending[sid] = [
+                {"approval_id": "shared-id", "command": "local"},
+                {
+                    ra._GATEWAY_MIRROR_FLAG: True,
+                    "run_id": "remote-run",
+                    "approval_id": "shared-id",
+                    "command": "remote",
+                },
+            ]
+        handler = _FakeHandler()
+        with patch("api.gateway_chat.webui_gateway_chat_enabled", return_value=False), \
+             patch("api.runner_client.HttpRunnerClient.respond_approval") as respond_approval, \
+             patch.object(routes, "_resolve_approval_legacy", return_value=True) as resolve_legacy:
+            routes._handle_approval_respond(
+                handler,
+                {"session_id": sid, "choice": "once", "approval_id": "shared-id"},
+            )
+        resp = handler.json()
+        assert handler.status == 200, f"expected 200, got {handler.status}: {resp}"
+        assert resp.get("ok") is True
+        assert resp.get("relayed") is not True
+        resolve_legacy.assert_called_once_with(sid, "shared-id", "once")
+        respond_approval.assert_not_called()
+    finally:
+        _STREAM_RUN_IDS.pop(stream_id, None)
+        _cleanup(sid)
+
+
+def test_local_plain_pending_exact_id_beats_remote_first_queue_order():
+    sid = f"local-plain-pending-remote-first-{uuid.uuid4().hex[:8]}"
+    session = _register_session(sid)
+    stream_id = f"remote-stream-{uuid.uuid4().hex[:8]}"
+    session.active_stream_id = stream_id
+    _STREAM_RUN_IDS[stream_id] = "remote-run"
+    try:
+        with ta._lock:
+            ta._pending[sid] = [
+                {
+                    ra._GATEWAY_MIRROR_FLAG: True,
+                    "run_id": "remote-run",
+                    "approval_id": "shared-id",
+                    "command": "remote",
+                },
+                {"approval_id": "shared-id", "command": "local"},
+            ]
+        handler = _FakeHandler()
+        with patch("api.gateway_chat.webui_gateway_chat_enabled", return_value=False), \
+             patch("api.runner_client.HttpRunnerClient.respond_approval") as respond_approval:
+            routes._handle_approval_respond(
+                handler,
+                {"session_id": sid, "choice": "once", "approval_id": "shared-id"},
+            )
+        resp = handler.json()
+        assert handler.status == 200, f"expected 200, got {handler.status}: {resp}"
+        assert resp.get("ok") is True
+        assert resp.get("relayed") is not True
+        respond_approval.assert_not_called()
+        with ta._lock:
+            queue = ta._pending.get(sid) or []
+            assert len(queue) == 1
+            assert queue[0].get("command") == "remote"
+            assert queue[0].get(ra._GATEWAY_MIRROR_FLAG) is True
+    finally:
+        _STREAM_RUN_IDS.pop(stream_id, None)
+        _cleanup(sid)
+
+
+def test_local_plain_pending_without_id_beats_active_remote_candidate_run():
+    sid = f"local-plain-pending-no-id-{uuid.uuid4().hex[:8]}"
+    session = _register_session(sid)
+    stream_id = f"remote-stream-{uuid.uuid4().hex[:8]}"
+    session.active_stream_id = stream_id
+    _STREAM_RUN_IDS[stream_id] = "remote-run"
+    try:
+        with ta._lock:
+            ta._pending[sid] = [{"command": "local"}]
+        handler = _FakeHandler()
+        with patch("api.gateway_chat.webui_gateway_chat_enabled", return_value=False), \
+             patch("api.runner_client.HttpRunnerClient.respond_approval") as respond_approval, \
+             patch.object(routes, "_resolve_approval_legacy", return_value=True) as resolve_legacy:
+            routes._handle_approval_respond(
+                handler,
+                {"session_id": sid, "choice": "once"},
+            )
+        resp = handler.json()
+        assert handler.status == 200, f"expected 200, got {handler.status}: {resp}"
+        assert resp.get("ok") is True
+        assert resp.get("relayed") is not True
+        resolve_legacy.assert_called_once_with(sid, "", "once")
+        respond_approval.assert_not_called()
+    finally:
+        _STREAM_RUN_IDS.pop(stream_id, None)
+        _cleanup(sid)
+
+
 def test_gateway_mirrored_approval_without_run_still_409s():
     """#4771 behaviour preserved: on the gateway backend, a mirrored approval
     whose run is gone must still surface the actionable 409 so the card stays
