@@ -2846,6 +2846,9 @@
   .workspace-prefs-item .workspace-prefs-copy{display:flex;flex-direction:column;gap:2px;min-width:0;}
   .workspace-prefs-item .workspace-prefs-name{font-weight:500;}
   .workspace-prefs-item .workspace-prefs-meta{font-size:11px;color:var(--muted);line-height:1.35;opacity:.85;}
+  .workspace-prefs-sep{height:1px;background:var(--border2);margin:4px 14px;}
+  .workspace-prefs-heading{font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;padding:6px 14px 2px;}
+  .workspace-prefs-sort-radio input[type="radio"]{-webkit-appearance:radio;appearance:radio;border-radius:50%;}
   .breadcrumb-seg{padding:1px 3px;border-radius:3px;}
   .breadcrumb-link{color:var(--muted);cursor:pointer;transition:color .12s;}
   .breadcrumb-link:hover{color:var(--text);background:var(--hover-bg);}

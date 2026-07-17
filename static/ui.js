@@ -18947,7 +18947,25 @@ function _workspaceShouldHideEntry(item){
 }
 function _visibleWorkspaceEntries(entries){
   const list=Array.isArray(entries)?entries:[];
-  return S.showHiddenWorkspaceFiles?list:list.filter(item=>!_workspaceShouldHideEntry(item));
+  const filtered=S.showHiddenWorkspaceFiles?list:list.filter(item=>!_workspaceShouldHideEntry(item));
+  const mode=S._wsSortMode||'name';
+  const sorted=[...filtered].sort((a,b)=>{
+    if(mode==='modified'){
+      const aTime=Number(a.mtime_ns)||0;
+      const bTime=Number(b.mtime_ns)||0;
+      // Directories always come first, then sort by modified time descending
+      const aDir=a.type==='dir'||(a.type==='symlink'&&a.is_dir)?0:1;
+      const bDir=b.type==='dir'||(b.type==='symlink'&&b.is_dir)?0:1;
+      if(aDir!==bDir) return aDir-bDir;
+      return bTime-aTime;
+    }
+    // 'name' (default): dirs first, then alphabetical case-insensitive
+    const aDir=a.type==='dir'||(a.type==='symlink'&&a.is_dir)?0:1;
+    const bDir=b.type==='dir'||(b.type==='symlink'&&b.is_dir)?0:1;
+    if(aDir!==bDir) return aDir-bDir;
+    return (a.name||'').localeCompare(b.name||'',void 0,{sensitivity:'base'});
+  });
+  return sorted;
 }
 function _syncWorkspaceHiddenToggle(){
   const el=$('workspaceShowHiddenFiles');
@@ -18973,6 +18991,14 @@ function toggleWorkspaceHiddenFiles(value){
   renderFileTree();
 }
 try{S.showHiddenWorkspaceFiles=localStorage.getItem('hermes-workspace-show-hidden-files')==='1';}catch(_){}
+// Workspace sort mode: 'name' (default) or 'modified' (by mtime_ns).
+try{S._wsSortMode=localStorage.getItem('hermes-workspace-sort-mode')||'name';}catch(_){S._wsSortMode='name';}
+function toggleWorkspaceSort(mode){
+  S._wsSortMode=mode||'name';
+  try{localStorage.setItem('hermes-workspace-sort-mode',S._wsSortMode);}catch(_){}
+  renderFileTree();
+}
+if(typeof window!=='undefined') window.toggleWorkspaceSort=toggleWorkspaceSort;
 
 // ── Workspace preferences kebab menu (#1793 UX refinement) ───────────────
 // The "Show hidden files" toggle used to live as a permanent inline row
@@ -18992,6 +19018,7 @@ function _closeWorkspacePrefsMenu(){
     _workspacePrefsAnchor=null;
   }
 }
+if(typeof window!=='undefined') window._closeWorkspacePrefsMenu=_closeWorkspacePrefsMenu;
 function _positionWorkspacePrefsMenu(anchorEl){
   if(!_workspacePrefsMenu||!anchorEl) return;
   const rect=anchorEl.getBoundingClientRect();
@@ -19028,6 +19055,37 @@ function _buildWorkspacePrefsMenu(){
   const cb=row.querySelector('input');
   if(cb) cb.checked=!!S.showHiddenWorkspaceFiles;
   menu.appendChild(row);
+
+  // Separator
+  const sep=document.createElement('div');
+  sep.className='workspace-prefs-sep';
+  menu.appendChild(sep);
+
+  // Sort mode heading
+  const sortHeading=document.createElement('div');
+  sortHeading.className='workspace-prefs-heading';
+  sortHeading.textContent=(typeof t==='function'?t('workspace_sort_by'):'Sort by');
+  menu.appendChild(sortHeading);
+
+  const currentSort=S._wsSortMode||'name';
+  const sortModes=[
+    {key:'name',label:(typeof t==='function'?t('workspace_sort_name'):'Name')},
+    {key:'modified',label:(typeof t==='function'?t('workspace_sort_modified'):'Date modified')},
+  ];
+  for(const sm of sortModes){
+    const sRow=document.createElement('label');
+    sRow.className='workspace-prefs-item workspace-prefs-sort-radio';
+    sRow.setAttribute('role','menuitemradio');
+    sRow.setAttribute('aria-checked',String(currentSort===sm.key));
+    sRow.innerHTML=
+      '<input type="radio" name="wsSortMode" value="'+sm.key+'" '+
+      (currentSort===sm.key?'checked':'')+
+      ' onchange="toggleWorkspaceSort(\''+sm.key+'\')">'+
+      '<span class="workspace-prefs-copy">'+
+        '<span class="workspace-prefs-name">'+esc(sm.label)+'</span>'+
+      '</span>';
+    menu.appendChild(sRow);
+  }
   return menu;
 }
 function toggleWorkspacePrefsMenu(e){
