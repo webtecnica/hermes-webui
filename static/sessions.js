@@ -9252,7 +9252,7 @@ function _persistActiveRunState() {
         sessionStorage.setItem('hermes-webui-active-run', JSON.stringify({
             busy: !!S.busy,
             activeStreamId: S.activeStreamId || null,
-            sessionId: S.sessionId || null,
+            sessionId: (S.session && S.session.session_id) || null,
             timestamp: Date.now()
         }));
     } catch(e) {}
@@ -9264,8 +9264,9 @@ function _restoreActiveRunState() {
         var state = JSON.parse(raw);
         if (state.busy && state.timestamp && (Date.now() - state.timestamp) < 30000) {
             S.busy = true;
+            _updateActiveRunDot();
             if (state.activeStreamId) S.activeStreamId = state.activeStreamId;
-            if (state.sessionId) S.sessionId = state.sessionId;
+            if (state.sessionId) S._restoredActiveSessionId = state.sessionId;
         }
         sessionStorage.removeItem('hermes-webui-active-run');
     } catch(e) {}
