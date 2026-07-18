@@ -2074,6 +2074,12 @@ async function loadSession(sid){
     }
     // Refresh todos from cold-load or persisted INFLIGHT before painting.
     if(typeof _hydrateTodosFromSession==='function') _hydrateTodosFromSession(S.session);
+    // Carry forward restored active-run state when the server snapshot does not
+    // report an active stream for a session we persisted as running (#6025).
+    if(!activeStreamId && S._restoredActiveSessionId === sid){
+      activeStreamId = S.activeStreamId || null;
+    }
+    delete S._restoredActiveSessionId;
     S.busy=!!activeStreamId;_updateActiveRunDot();_persistActiveRunState();  // #4354: Only assert busy if server confirms active stream.
     // appendLiveToolCard() is guarded by S.activeStreamId; restore it before
     // replaying persisted live tools so the compact Activity count survives
@@ -9252,7 +9258,7 @@ function _persistActiveRunState() {
         sessionStorage.setItem('hermes-webui-active-run', JSON.stringify({
             busy: !!S.busy,
             activeStreamId: S.activeStreamId || null,
-            sessionId: (S.session && S.session.session_id) || null,
+            activeSessionId: (S.session && S.session.session_id) || null,
             timestamp: Date.now()
         }));
     } catch(e) {}
@@ -9266,7 +9272,7 @@ function _restoreActiveRunState() {
             S.busy = true;
             _updateActiveRunDot();
             if (state.activeStreamId) S.activeStreamId = state.activeStreamId;
-            if (state.sessionId) S._restoredActiveSessionId = state.sessionId;
+            if (state.activeSessionId) S._restoredActiveSessionId = state.activeSessionId;
         }
         sessionStorage.removeItem('hermes-webui-active-run');
     } catch(e) {}
@@ -9274,7 +9280,11 @@ function _restoreActiveRunState() {
 function _updateActiveRunDot() {
     var dot = document.getElementById('activeRunDot');
     if (!dot) return;
-    if (S.busy) {
+    // Dot reflects *any* active run, not just the current session's busy state (#6025).
+    // A session switch to an idle tab must not hide the indicator while a background
+    // session is still streaming.
+    var anyActive = !!S.busy || (typeof INFLIGHT !== 'undefined' && INFLIGHT && Object.keys(INFLIGHT).length > 0);
+    if (anyActive) {
         dot.className = 'active-run-dot';
         dot.title = 'Agent is running';
     } else {
