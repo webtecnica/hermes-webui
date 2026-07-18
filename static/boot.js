@@ -3162,10 +3162,12 @@ window._mirrorSpeechSettingsFromServer=_mirrorSpeechSettingsFromServer;
     if(typeof applyConversationOutlinePreference==='function') applyConversationOutlinePreference();
     window._hideEmptyStateSuggestions=s.hide_empty_state_suggestions===true;
     applyEmptyStateSuggestionPref();
-    // #4343: transcript virtualization is EXPERIMENTAL/opt-IN (default OFF).
-    // It caused scroll-up flicker on long sessions, so it's off for everyone
-    // unless explicitly opted in; long transcripts render in full by default.
-    window._virtualizeTranscript=s.virtualize_transcript===true;
+    // #6151: DOM virtualization is now ON by default.
+    // #4343 defaulted it OFF due to scroll-up flicker on long sessions with
+    // tall tool-call rows. #4346 Phase B (footer-jitter suppression during
+    // virtual-scroll measurement re-renders) resolved the root cause, so we
+    // re-enable it as the default. Users can still opt out via Settings.
+    window._virtualizeTranscript=s.virtualize_transcript!==false;
     window._showTps=!!s.show_tps;
     window._fadeTextEffect=!!s.fade_text_effect;
     window._showCliSessions=s.show_cli_sessions!==false;
@@ -3316,7 +3318,7 @@ window._mirrorSpeechSettingsFromServer=_mirrorSpeechSettingsFromServer;
     if(typeof applyConversationOutlinePreference==='function') applyConversationOutlinePreference();
     window._hideEmptyStateSuggestions=false;
     applyEmptyStateSuggestionPref();
-    window._virtualizeTranscript=false;  // settings-load failed: default-OFF (experimental/opt-in) (#4343)
+    window._virtualizeTranscript=true;  // settings-load failed: default-ON (#6151, re-enables after #4346 fix)
     window._showTps=false;
     window._fadeTextEffect=false;
     window._showCliSessions=true;  // settings-load failed: mirror the True config default (#3988)
