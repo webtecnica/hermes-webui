@@ -121,6 +121,25 @@ def test_cross_provider_routes_through_openrouter():
     assert base_url is None  # openrouter uses its own endpoint
 
 
+def test_cross_provider_routes_through_openrouter_with_alias_prefix():
+    """A model whose prefix is a _PROVIDER_ALIASES entry (not itself a
+    _PROVIDER_MODELS key) but resolves to a canonical provider key still
+    routes through the cross-provider OpenRouter branch.
+
+    Regression test for #6131 — before the fix, ``z-ai/glm-5.2`` with
+    config provider ``anthropic`` would fall through and return the stale
+    config provider because ``z-ai`` was checked directly against
+    ``_PROVIDER_MODELS`` instead of being resolved through
+    ``_PROVIDER_ALIASES`` first.
+    """
+    model, provider, base_url = _resolve_with_config(
+        'z-ai/glm-5.2', provider='anthropic',
+    )
+    assert model == 'z-ai/glm-5.2'
+    assert provider == 'openrouter'
+    assert base_url is None  # openrouter uses its own endpoint
+
+
 # ── Bare model names ─────────────────────────────────────────────────────
 
 def test_bare_model_uses_config_provider():
