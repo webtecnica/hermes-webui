@@ -786,6 +786,26 @@ def test_readonly_parent_without_writable_target_still_raises(
 
 
 @_ROOT_SKIP
+def test_writable_parent_with_readonly_file_raises_and_keeps_bytes(tmp_path: Path) -> None:
+    """A deliberately locked config (0444) in a writable directory must keep
+    rejecting writes: without the target-writability probe, atomic replace
+    creates a fresh temp inode and renames over the read-only file."""
+    cfg_dir = tmp_path / "open-dir"
+    cfg_dir.mkdir()
+    target = cfg_dir / "config.yaml"
+    original = "model:\n  default: keep-me\n"
+    target.write_text(original, encoding="utf-8")
+    os.chmod(target, 0o444)
+    os.chmod(cfg_dir, 0o755)
+    try:
+        with pytest.raises(PermissionError):
+            _atomic_write_text(target, "model:\n  default: new\n")
+        assert target.read_text(encoding="utf-8") == original
+        assert stat.S_IMODE(os.stat(target).st_mode) == 0o444
+    finally:
+        os.chmod(target, 0o644)
+
+
 def test_readonly_parent_with_unwritable_file_still_raises(tmp_path: Path) -> None:
     cfg_dir = tmp_path / "locked"
     cfg_dir.mkdir()

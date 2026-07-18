@@ -83,6 +83,28 @@ def _has_extended_attributes(path: Path) -> bool:
         raise
 
 
+def _require_writable_target(write_path: Path) -> os.stat_result | None:
+    """Reject writes to a read-only target before any replacement work.
+
+    ``os.replace`` happily swaps a fresh inode over a ``0444`` file when the
+    directory is writable, which would silently defeat a deliberately locked
+    config. The old in-place ``Path.write_text`` raised ``PermissionError``
+    there; preserve that contract with a non-truncating ``O_WRONLY`` probe,
+    letting the failure propagate. Returns the ``fstat`` of the inode the
+    probe actually opened (so the caller's metadata describes the verified
+    file even if a concurrent writer replaced it since its own ``stat``), or
+    ``None`` if the target vanished concurrently.
+    """
+    try:
+        probe_fd = os.open(write_path, os.O_WRONLY)
+    except FileNotFoundError:
+        return None
+    try:
+        return os.fstat(probe_fd)
+    finally:
+        os.close(probe_fd)
+
+
 def _atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None:
     """Atomically replace *path* with *text*.
 
@@ -168,13 +190,19 @@ def _atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> Non
                 if owns_fallback_fd:
                     os.close(fallback_fd)
 
-    if (
-        existing_stat is not None
-        and stat.S_ISREG(existing_stat.st_mode)
-        and (existing_stat.st_nlink > 1 or _has_extended_attributes(write_path))
-    ):
-        _write_in_place()
-        return
+    if existing_stat is not None and stat.S_ISREG(existing_stat.st_mode):
+        probed_stat = _require_writable_target(write_path)
+        if probed_stat is not None and stat.S_ISREG(probed_stat.st_mode):
+            existing_stat = probed_stat
+            mode = stat.S_IMODE(existing_stat.st_mode)
+        else:
+            existing_stat = probed_stat
+            mode = None
+        if existing_stat is not None and (
+            existing_stat.st_nlink > 1 or _has_extended_attributes(write_path)
+        ):
+            _write_in_place()
+            return
 
     try:
         fd, tmp = _create_atomic_temp_file(write_path, existing=existing_stat is not None)
