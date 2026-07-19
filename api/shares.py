@@ -104,6 +104,9 @@ def _strip_media_references(text: str) -> str:
       - Bare file:// URLs (whitespace-delimited)
       - Markdown links: [label](file://...)
       - Markdown images: ![alt](file://...)
+      - file:path (no slashes), file:/path (single slash)
+      - file://localhost/path, file://127.0.0.1/path
+      - URL-encoded file:// variants (e.g. file://%2Ftmp%2Ffile)
     while preserving fenced and inline-code regions byte-for-byte (the
     renderer keeps file:// inert inside code/preformatted content).
     """
@@ -129,15 +132,17 @@ def _strip_media_references(text: str) -> str:
     # MEDIA:<path-or-url> tokens (may already have their path redacted)
     text = re.sub(r"MEDIA:\S+", placeholder, text)
 
-    # Markdown images: ![alt](file://...) → placeholder
-    text = re.sub(r"!\[[^\]]*\]\(file://[^\s)]+\)", placeholder, text)
+    # Markdown images: ![alt](file:(?://)?...) → placeholder
+    text = re.sub(r"!\[[^\]]*\]\(file:(?://)?[^\s)]+\)", placeholder, text)
 
-    # Markdown links: [label](file://...) → placeholder
-    text = re.sub(r"\[[^\]]+\]\(file://[^\s)]+\)", placeholder, text)
+    # Markdown links: [label](file:(?://)?...) → placeholder
+    text = re.sub(r"\[[^\]]+\]\(file:(?://)?[^\s)]+\)", placeholder, text)
 
-    # Bare file:// URLs – preserve the leading delimiter instead of consuming
-    # whitespace and unconditionally inserting a space (review feedback).
-    text = re.sub(r"(^|\s)file://[^\s<>\"')\]]+", r"\1" + placeholder, text)
+    # Bare file:(?://)? URLs – preserve the leading delimiter instead of
+    # consuming whitespace and unconditionally inserting a space (review
+    # feedback). The file:(?://)? pattern also catches file:path and
+    # file:/path forms in addition to standard file:// and file:/// variants.
+    text = re.sub(r"(^|\s)file:(?://)?[^\s<>\"')\]]+", r"\1" + placeholder, text)
 
     # Restore stashed code regions.
     for i, s in enumerate(_fenced):
