@@ -4608,6 +4608,26 @@ def _api_safe_message_positions(messages):
     return final_out
 
 
+def _context_message_dedup_key(msg):
+    """Return a dedup key that includes the stable message id when available.
+
+    Content-based identity (``_message_identity``) conflates distinct turns that
+    share the same role and normalized text (#6310). When a stable per-message
+    ``id`` is present, prepend it so that separate turns are never dropped.
+    Without an id the key falls back to content-only identity — this is
+    appropriate for pre-id stages where genuine duplication is the only concern.
+    """
+    msg_id = msg.get('id') if isinstance(msg, dict) else None
+    if isinstance(msg_id, bool):
+        msg_id = None
+    if not isinstance(msg_id, int) or msg_id < 0:
+        msg_id = None
+    content_key = _message_identity(msg)
+    if content_key is None:
+        return None
+    return (msg_id,) + content_key
+
+
 def _deduplicate_context_messages(messages):
     """Remove duplicate messages from context by identity, keeping first occurrence.
 
@@ -4616,10 +4636,18 @@ def _deduplicate_context_messages(messages):
     Compression/reference markers are internal recovery material: keep at most
     one canonical assistant reference so a mis-role ``user`` marker cannot become
     the next active user instruction.
+
+    When messages carry stable per-message ``id`` values, dedup is id-aware:
+    distinct turns with identical content are preserved (#6310).
+
+    Two self-healing backstops run alongside the id-aware key so that accidental
+    duplicates (adjacent identical rows, id-bearing row followed by an id-less
+    duplicate) are still collapsed regardless of whether ids were minted.
     """
     if not messages:
         return messages
     seen = set()
+    seen_content = set()
     deduped = []
     for msg in messages:
         if _is_context_compression_marker(msg):
@@ -4638,11 +4666,35 @@ def _deduplicate_context_messages(messages):
         if _is_compressed_context_tool_result_summary_message(msg) and not msg.get('tool_call_id'):
             deduped.append(msg)
             continue
-        key = _message_identity(msg)
+        content_key = _message_identity(msg)
+
+        # Backstop 1: collapse adjacent duplicates regardless of id.
+        # Legitimate #6310 repeats (same text, distinct turns) are always
+        # separated by interleaved turns, never adjacent.
+        if deduped and content_key is not None and content_key == _message_identity(deduped[-1]):
+            continue
+
+        # Backstop 2: drop id-less rows whose content identity is already seen.
+        # The merge at L8803 joins context_messages + state.db without stable
+        # ids, so an id-bearing row followed by the same row without an id
+        # would otherwise survive against the id-aware key.
+        msg_id = msg.get('id') if isinstance(msg, dict) else None
+        if isinstance(msg_id, bool):
+            msg_id = None
+        if not isinstance(msg_id, int) or msg_id < 0:
+            msg_id = None
+        if msg_id is None and content_key is not None and content_key in seen_content:
+            continue
+
+        # Primary dedup: id-aware key (preserves distinct turns with same content).
+        key = _context_message_dedup_key(msg)
         if key is not None and key in seen:
             continue
+
         if key is not None:
             seen.add(key)
+        if content_key is not None:
+            seen_content.add(content_key)
         deduped.append(msg)
     return deduped
 
