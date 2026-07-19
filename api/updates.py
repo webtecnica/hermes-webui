@@ -519,10 +519,17 @@ def _read_agent_source_version(agent_dir: Path) -> str | None:
 
 
 def _gateway_health_base_url() -> str:
-    """Return the configured/default Hermes Agent gateway base URL."""
+    """Return the configured/default Hermes Agent gateway base URL.
+
+    Falls back through the same env-var chain used by agent_health.py
+    (#6150): GATEWAY_HEALTH_URL → HERMES_GATEWAY_HEALTH_URL →
+    HERMES_API_URL → HERMES_WEBUI_GATEWAY_BASE_URL → default.
+    """
     raw = (
         os.environ.get('GATEWAY_HEALTH_URL')
         or os.environ.get('HERMES_GATEWAY_HEALTH_URL')
+        or os.environ.get('HERMES_API_URL')
+        or os.environ.get('HERMES_WEBUI_GATEWAY_BASE_URL')
         or 'http://hermes-agent:8642'
     ).strip()
     if raw.endswith('/health/detailed'):
