@@ -915,7 +915,16 @@ def test_server():
     real_skills  = HERMES_HOME / 'skills'
     test_skills  = TEST_STATE_DIR / 'skills'
     if real_skills.exists() and not test_skills.exists():
-        test_skills.symlink_to(real_skills)
+        try:
+            test_skills.symlink_to(real_skills)
+        except OSError:
+            # Native Windows without SeCreateSymbolicLinkPrivilege (Developer Mode
+            # off / non-admin) raises WinError 1314. Fall back to a copy so the
+            # test_server fixture — and the whole suite — still works.
+            if sys.platform == "win32":
+                shutil.copytree(real_skills, test_skills)
+            else:
+                raise
 
     # Isolated cron state
     (TEST_STATE_DIR / 'cron').mkdir(parents=True, exist_ok=True)
