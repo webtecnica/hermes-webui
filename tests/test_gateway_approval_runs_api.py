@@ -421,6 +421,88 @@ def test_gateway_runs_api_streaming_parses_real_run_events():
     assert approvals.gateway_pending_mirror("sess1", run_id="run-abc") is None
 
 
+def test_gateway_runs_api_streaming_same_run_fifo_emits_head_and_promotes_successor():
+    """Runs API approval events publish the reconciled FIFO head and count."""
+    from api.config import STREAM_PARTIAL_TEXT, STREAM_REASONING_TEXT
+    from api.gateway_chat import _STREAM_RUN_IDS, _run_gateway_runs_api_streaming
+    from api import routes
+    import api.route_approvals as approvals
+
+    sid = "sess-same-run-producer"
+    stream_id = "stream-same-run-producer"
+    events = []
+    STREAM_PARTIAL_TEXT[stream_id] = ""
+    STREAM_REASONING_TEXT[stream_id] = ""
+
+    class _JsonResponse:
+        def read(self, _limit=None):
+            return b'{"run_id":"run-fifo"}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+    class _SseResponse:
+        def __iter__(self):
+            return iter([
+                b'data: {"event":"approval.request","command":"first","description":"First","run_id":"run-fifo","approval_id":"approval-first"}\n',
+                b'\n',
+                b'data: {"event":"approval.request","command":"second","description":"Second","run_id":"run-fifo","approval_id":"approval-second"}\n',
+                b'\n',
+                b'data: [DONE]\n',
+                b'\n',
+            ])
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+    def fake_urlopen(req, *, timeout=None):
+        return _JsonResponse() if req.full_url.endswith("/v1/runs") else _SseResponse()
+
+    try:
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            _run_gateway_runs_api_streaming(
+                sid, "hi", "test", "/tmp", stream_id, "http://gw:8642", "", [], {},
+                put_gateway_event=lambda event, data: events.append((event, data)),
+                cancel_event=threading.Event(),
+            )
+
+        approval_events = [data for event, data in events if event == "approval"]
+        assert [(data["approval_id"], data["pending_count"]) for data in approval_events] == [
+            ("approval-first", 1),
+            ("approval-first", 2),
+        ]
+
+        handler = MagicMock()
+        handler.wfile = io.BytesIO()
+        with patch("api.routes.get_session", return_value=SimpleNamespace(active_stream_id=stream_id)), \
+             patch("api.runner_client.HttpRunnerClient.respond_approval") as respond_approval:
+            routes._handle_approval_respond(handler, {
+                "session_id": sid,
+                "choice": "deny",
+                "approval_id": "approval-first",
+            })
+
+        handler.send_response.assert_called_with(200)
+        respond_approval.assert_called_once_with("run-fifo", "approval-first", "deny")
+        promoted = approvals.gateway_pending_mirror(sid, run_id="run-fifo")
+        assert promoted is not None
+        assert promoted["approval_id"] == "approval-second"
+        with approvals._lock:
+            assert len(approvals._pending[sid]) == 1
+    finally:
+        STREAM_PARTIAL_TEXT.pop(stream_id, None)
+        STREAM_REASONING_TEXT.pop(stream_id, None)
+        _STREAM_RUN_IDS.pop(stream_id, None)
+        approvals._pending.pop(sid, None)
+        approvals._gateway_queues.pop(sid, None)
+
+
 def test_empty_id_runs_approval_reaches_real_response_lifecycle():
     """Runs API empty IDs are carried and resolved through the live mirror."""
     from api.gateway_chat import _run_gateway_runs_api_streaming

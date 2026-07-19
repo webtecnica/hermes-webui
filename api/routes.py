@@ -9747,40 +9747,12 @@ except ImportError:
 
 def _session_attention_summary(session_id: str) -> dict | None:
     """Return sidebar attention metadata for pending approval/clarify work."""
-    active_run_id = ""
-    try:
-        from api.gateway_chat import _STREAM_RUN_IDS
-
-        session = get_session(session_id)
-        active_stream_id = getattr(session, "active_stream_id", None) if session is not None else None
-        if active_stream_id:
-            active_run_id = str(_STREAM_RUN_IDS.get(active_stream_id) or "").strip()
-    except Exception:
-        active_run_id = ""
-
     approval_count = 0
     with _lock:
         reconcile_gateway_pending_mirror_locked(session_id)
         queue_list = _pending.get(session_id)
         if isinstance(queue_list, list):
-            gateway_queue = _gateway_queues.get(session_id) or []
-            live_gateway_run_ids = {
-                str((getattr(entry, "data", None) or {}).get("run_id") or "").strip()
-                for entry in gateway_queue
-                if str((getattr(entry, "data", None) or {}).get("run_id") or "").strip()
-            }
-            approval_count = sum(
-                1
-                for entry in queue_list
-                if not (
-                    isinstance(entry, dict)
-                    and entry.get(_GATEWAY_MIRROR_FLAG)
-                    and str(entry.get("run_id") or "").strip()
-                    and not str(entry.get(_GATEWAY_MIRROR_TOKEN) or "").strip()
-                    and str(entry.get("run_id") or "").strip() not in live_gateway_run_ids
-                    and str(entry.get("run_id") or "").strip() != active_run_id
-                )
-            )
+            approval_count = len(queue_list)
         elif queue_list:
             approval_count = 1
     if approval_count > 0:
