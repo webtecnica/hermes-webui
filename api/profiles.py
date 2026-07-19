@@ -1486,8 +1486,9 @@ def profile_scope_for_detached_worker(
     Pass the profile name CAPTURED on the spawning thread (where the TLS is
     valid) into the worker, then enter this scope at the top of the worker body.
     It sets the request-profile TLS for this (worker) thread and applies the
-    profile env via ``profile_env_for_background_worker``, restoring both on exit.
-    No-op for the default/root profile.
+    profile env via ``profile_env_for_background_worker`` (skipped for the
+    root/default profile since its env is already the process env),
+    restoring both on exit.
 
     Unlike ``profile_env_for_active_request`` (which reads the *current* thread's
     TLS and must NOT clear it — the request thread keeps using it after the call),
@@ -1495,15 +1496,18 @@ def profile_scope_for_detached_worker(
     thread that has no other use for it.
     """
     name = (profile_name or "").strip()
-    if not name or _is_root_profile(name):
+    if not name:
         yield
         return
     set_request_profile(name)
     try:
-        with profile_env_for_background_worker(
-            name, purpose, logger_override=logger_override
-        ):
-            yield
+        if _is_root_profile(name):
+            yield                       # TLS bound; skip env mirroring for root
+        else:
+            with profile_env_for_background_worker(
+                name, purpose, logger_override=logger_override
+            ):
+                yield
     finally:
         clear_request_profile()
 
