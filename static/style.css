@@ -2148,7 +2148,7 @@
   .nav-tab.active{color:var(--accent-text);}
   .nav-tab.active::before{content:'';position:absolute;bottom:0;left:50%;transform:translateX(-50%);width:20px;height:2px;background:var(--accent);border-radius:2px 2px 0 0;}
   /* Panel content areas (swapped by tab) */
-  .panel-view{display:none;flex:1;overflow:hidden;flex-direction:column;}
+  .panel-view{display:none;flex:1;overflow:hidden;flex-direction:column;min-height:0;}
   .panel-view.active{display:flex;}
   /* Cron panel */
   .cron-list{flex:1;overflow-y:auto;padding:8px;}
