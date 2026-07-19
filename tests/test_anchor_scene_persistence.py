@@ -2368,3 +2368,182 @@ def test_runtime_journal_snapshot_has_running_anchor_row_before_first_token(monk
     assert rows
     assert rows[0]["role"] == "lifecycle"
     assert rows[0]["status"] == "running"
+
+
+def test_runtime_journal_snapshot_preserves_stable_run_id_distinct_from_stream_id(monkeypatch):
+    """When the journal summary carries a stable run_id distinct from stream_id,
+    every projected scene row and the scene identity must use the stable run_id,
+    not the transport stream_id."""
+    from api import routes
+
+    stream_id = "stream-transport-99"
+    stable_run_id = "run-stable-42"
+    events = [
+        {
+            "event": "token",
+            "seq": 1,
+            "event_id": f"{stable_run_id}:1",
+            "run_id": stable_run_id,
+            "created_at": 1.0,
+            "payload": {"text": "first progress"},
+        },
+        {
+            "event": "reasoning",
+            "seq": 2,
+            "event_id": f"{stable_run_id}:2",
+            "run_id": stable_run_id,
+            "created_at": 2.0,
+            "payload": {"text": "thinking through plan"},
+        },
+        {
+            "event": "tool",
+            "seq": 3,
+            "event_id": f"{stable_run_id}:3",
+            "run_id": stable_run_id,
+            "created_at": 3.0,
+            "payload": {"name": "terminal", "tid": "call-1", "args": {"command": "pytest"}},
+        },
+        {
+            "event": "tool_complete",
+            "seq": 4,
+            "event_id": f"{stable_run_id}:4",
+            "run_id": stable_run_id,
+            "created_at": 4.0,
+            "payload": {"name": "terminal", "tid": "call-1", "preview": "ok"},
+        },
+    ]
+    monkeypatch.setattr(
+        routes,
+        "find_run_summary",
+        lambda sid: {
+            "session_id": "session-stable-id",
+            "run_id": stable_run_id,
+            "stream_id": stream_id,
+            "last_seq": 4,
+            "last_event_id": f"{stable_run_id}:4",
+        },
+    )
+    monkeypatch.setattr(
+        routes,
+        "read_run_events",
+        lambda session_id, run_id: {"events": events},
+    )
+
+    snapshot = routes._run_journal_live_snapshot(stream_id)
+    scene = snapshot["anchor_activity_scene"]
+
+    # Scene identity must carry the stable run_id
+    assert scene["identity"]["run_id"] == stable_run_id
+    assert scene["identity"]["stream_id"] == stream_id
+
+    rows = scene["activity_rows"]
+    assert len(rows) == 3  # prose, thinking, tool
+
+    # Prose row
+    assert rows[0]["role"] == "prose"
+    assert rows[0]["run_id"] == stable_run_id
+    assert rows[0]["stream_id"] == stream_id
+    assert rows[0]["identity"]["run_id"] == stable_run_id
+    assert rows[0]["identity"]["stream_id"] == stream_id
+
+    # Thinking row
+    assert rows[1]["role"] == "thinking"
+    assert rows[1]["run_id"] == stable_run_id
+    assert rows[1]["stream_id"] == stream_id
+    assert rows[1]["identity"]["run_id"] == stable_run_id
+    assert rows[1]["identity"]["stream_id"] == stream_id
+
+    # Tool row
+    assert rows[2]["role"] == "tool"
+    assert rows[2]["run_id"] == stable_run_id
+    assert rows[2]["stream_id"] == stream_id
+    assert rows[2]["identity"]["run_id"] == stable_run_id
+    assert rows[2]["identity"]["stream_id"] == stream_id
+
+
+def test_runtime_journal_snapshot_lifecycle_preserves_stable_run_id(monkeypatch):
+    """The lifecycle shell row emitted before the first token must also
+    use the stable run_id when distinct from stream_id."""
+    from api import routes
+
+    stream_id = "stream-lifecycle-transport"
+    stable_run_id = "run-lifecycle-stable"
+    monkeypatch.setattr(
+        routes,
+        "find_run_summary",
+        lambda sid: {
+            "session_id": "session-lifecycle-stable",
+            "run_id": stable_run_id,
+            "stream_id": stream_id,
+            "last_seq": 1,
+            "last_event_id": f"{stable_run_id}:1",
+        },
+    )
+    monkeypatch.setattr(
+        routes,
+        "read_run_events",
+        lambda session_id, run_id: {
+            "events": [
+                {
+                    "event": "context_status",
+                    "seq": 1,
+                    "event_id": f"{stable_run_id}:1",
+                    "run_id": stable_run_id,
+                    "created_at": 1.0,
+                    "payload": {"session_id": "session-lifecycle-stable"},
+                }
+            ]
+        },
+    )
+
+    snapshot = routes._run_journal_live_snapshot(stream_id)
+    rows = snapshot["anchor_activity_scene"]["activity_rows"]
+
+    assert rows
+    assert rows[0]["role"] == "lifecycle"
+    assert rows[0]["run_id"] == stable_run_id
+    assert rows[0]["stream_id"] == stream_id
+    assert rows[0]["identity"]["run_id"] == stable_run_id
+    assert rows[0]["identity"]["stream_id"] == stream_id
+
+
+def test_runtime_journal_snapshot_falls_back_to_stream_id_when_summary_lacks_run_id(monkeypatch):
+    """Historical journal summaries without a run_id field must fall back
+    to stream_id for backward compatibility."""
+    from api import routes
+
+    stream_id = "stream-legacy-no-run-id"
+    events = [
+        {
+            "event": "token",
+            "seq": 1,
+            "event_id": f"{stream_id}:1",
+            "created_at": 1.0,
+            "payload": {"text": "hello"},
+        },
+    ]
+    monkeypatch.setattr(
+        routes,
+        "find_run_summary",
+        lambda sid: {
+            "session_id": "session-legacy",
+            "last_seq": 1,
+            "last_event_id": f"{stream_id}:1",
+        },
+    )
+    monkeypatch.setattr(
+        routes,
+        "read_run_events",
+        lambda session_id, run_id: {"events": events},
+    )
+
+    snapshot = routes._run_journal_live_snapshot(stream_id)
+    scene = snapshot["anchor_activity_scene"]
+
+    # Legacy summary without run_id: fall back to stream_id
+    assert scene["identity"]["run_id"] == stream_id
+    assert scene["identity"]["stream_id"] == stream_id
+
+    rows = scene["activity_rows"]
+    assert rows[0]["run_id"] == stream_id
+    assert rows[0]["identity"]["run_id"] == stream_id

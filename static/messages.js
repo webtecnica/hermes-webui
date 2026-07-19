@@ -4037,7 +4037,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         created_at:payload.created_at??row.created_at??undefined,
       };
       try{
-        _anchorApi.applyAssistantTurnAnchorSourceEvent(_anchorRegistry,sourceEvent,{session_id:activeSid,stream_id:streamId,run_id:streamId});
+        _anchorApi.applyAssistantTurnAnchorSourceEvent(_anchorRegistry,sourceEvent,{session_id:activeSid,stream_id:streamId,run_id:sourceEvent.run_id||streamId});
       }catch(err){
         if(!_anchorShadowWarned&&typeof console!=='undefined'&&console.warn){
           _anchorShadowWarned=true;

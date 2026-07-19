@@ -3148,6 +3148,7 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
     session_id = str(summary.get("session_id") or "")
     if not session_id:
         return None
+    stable_run_id = str(summary.get("run_id") or stream_id)
     journal = read_run_events(session_id, stream_id)
     events = [event for event in (journal.get("events") or []) if isinstance(event, dict)]
     if not events:
@@ -3346,7 +3347,7 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
             "source_event_type": "token",
             "event_id": None,
             "local_id": local_id,
-            "run_id": stream_id,
+            "run_id": stable_run_id,
             "stream_id": stream_id,
             "seq": None,
             "status": status,
@@ -3354,7 +3355,7 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
             "identity": {
                 "event_id": None,
                 "local_id": local_id,
-                "run_id": stream_id,
+                "run_id": stable_run_id,
                 "stream_id": stream_id,
                 "seq": None,
             },
@@ -3389,7 +3390,7 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
             "source_event_type": "reasoning",
             "event_id": None,
             "local_id": local_id,
-            "run_id": stream_id,
+            "run_id": stable_run_id,
             "stream_id": stream_id,
             "seq": None,
             "status": status,
@@ -3397,7 +3398,7 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
             "identity": {
                 "event_id": None,
                 "local_id": local_id,
-                "run_id": stream_id,
+                "run_id": stable_run_id,
                 "stream_id": stream_id,
                 "seq": None,
             },
@@ -3466,7 +3467,7 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
             "source_event_type": "tool_complete" if call.get("done") else "tool",
             "event_id": None,
             "local_id": tool_id or row_id,
-            "run_id": stream_id,
+            "run_id": stable_run_id,
             "stream_id": stream_id,
             "seq": None,
             "status": status,
@@ -3474,7 +3475,7 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
             "identity": {
                 "event_id": None,
                 "local_id": tool_id or row_id,
-                "run_id": stream_id,
+                "run_id": stable_run_id,
                 "stream_id": stream_id,
                 "seq": None,
             },
@@ -3588,7 +3589,7 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
                 "source_event_type": "runtime_journal_snapshot",
                 "event_id": None,
                 "local_id": f"lifecycle:{stream_id}:running",
-                "run_id": stream_id,
+                "run_id": stable_run_id,
                 "stream_id": stream_id,
                 "seq": None,
                 "status": "running",
@@ -3596,7 +3597,7 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
                 "identity": {
                     "event_id": None,
                     "local_id": f"lifecycle:{stream_id}:running",
-                    "run_id": stream_id,
+                    "run_id": stable_run_id,
                     "stream_id": stream_id,
                     "seq": None,
                 },
@@ -3656,7 +3657,7 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
             "identity": {
                 "session_id": session_id,
                 "stream_id": stream_id,
-                "run_id": stream_id,
+                "run_id": stable_run_id,
                 "source_message_refs": [],
             },
             "lifecycle": {

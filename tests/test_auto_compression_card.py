@@ -1258,3 +1258,33 @@ def test_preserved_task_list_rendering_does_not_mutate_history():
     assert "S.messages" not in preserved_helpers
     assert ".splice(" not in preserved_helpers
     assert "delete " not in preserved_helpers
+
+
+def test_anchor_hydration_preserves_stable_run_id_from_scene_source_event():
+    """_hydrateAnchorRegistryFromActivityScene must seed the Anchor registry
+    context with sourceEvent.run_id (not hardcoded streamId), falling back to
+    streamId only when the source event lacks a run_id."""
+    src = _read("static/messages.js")
+    start = src.find("function _hydrateAnchorRegistryFromActivityScene")
+    assert start != -1, "hydrate helper not found"
+    # Find the end of the function (next top-level function or EOF)
+    end = src.find("\nfunction ", start + 1)
+    if end == -1:
+        end = len(src)
+    block = src[start:end]
+
+    # Source event construction must carry row.run_id with streamId fallback
+    assert "run_id:row.run_id||streamId" in block, (
+        "sourceEvent.run_id must be seeded from row.run_id with streamId fallback"
+    )
+
+    # Context passed to applyAssistantTurnAnchorSourceEvent must use
+    # sourceEvent.run_id, not hardcoded streamId
+    assert "run_id:sourceEvent.run_id||streamId" in block, (
+        "Registry context run_id must use sourceEvent.run_id with streamId fallback"
+    )
+
+    # The old hardcoded form must be gone
+    assert "run_id:streamId}" not in block, (
+        "Hardcoded run_id:streamId in registry context must be removed"
+    )
