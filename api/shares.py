@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import secrets
 import tempfile
 import threading
@@ -91,6 +92,62 @@ def _share_message_text(message: dict) -> str:
     return ""
 
 
+def _strip_media_references(text: str) -> str:
+    """Replace local MEDIA: tokens and file:// URLs with inert placeholders.
+
+    Public shares must not emit links to the authenticated /api/media endpoint.
+    MEDIA:<path> sentinel values and file:// URLs that renderMd() would
+    convert into /api/media?path=... URLs are replaced with a non-clickable
+    placeholder so anonymous recipients never see broken auth-gated media links.
+
+    Covers every renderer-recognized file:// form (issue #6285 review):
+      - Bare file:// URLs (whitespace-delimited)
+      - Markdown links: [label](file://...)
+      - Markdown images: ![alt](file://...)
+    while preserving fenced and inline-code regions byte-for-byte (the
+    renderer keeps file:// inert inside code/preformatted content).
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    placeholder = "[Local attachment omitted from public share]"
+
+    # Stash fenced code blocks (```...```) so file:// inside them is preserved.
+    _fenced: list[str] = []
+    text = re.sub(
+        r"```[\s\S]*?```",
+        lambda m: _fenced.append(m.group(0)) or f"\x00F{len(_fenced) - 1}\x00",
+        text,
+    )
+    # Stash inline code spans (`...`) so file:// inside them is preserved.
+    _inline: list[str] = []
+    text = re.sub(
+        r"`[^`\n]+`",
+        lambda m: _inline.append(m.group(0)) or f"\x00I{len(_inline) - 1}\x00",
+        text,
+    )
+
+    # MEDIA:<path-or-url> tokens (may already have their path redacted)
+    text = re.sub(r"MEDIA:\S+", placeholder, text)
+
+    # Markdown images: ![alt](file://...) → placeholder
+    text = re.sub(r"!\[[^\]]*\]\(file://[^\s)]+\)", placeholder, text)
+
+    # Markdown links: [label](file://...) → placeholder
+    text = re.sub(r"\[[^\]]+\]\(file://[^\s)]+\)", placeholder, text)
+
+    # Bare file:// URLs – preserve the leading delimiter instead of consuming
+    # whitespace and unconditionally inserting a space (review feedback).
+    text = re.sub(r"(^|\s)file://[^\s<>\"')\]]+", r"\1" + placeholder, text)
+
+    # Restore stashed code regions.
+    for i, s in enumerate(_fenced):
+        text = text.replace(f"\x00F{i}\x00", s)
+    for i, s in enumerate(_inline):
+        text = text.replace(f"\x00I{i}\x00", s)
+
+    return text
+
+
 def _redact_share_paths(text: str, extra_paths) -> str:
     """Strip known local session/workspace/home paths out of public-share text.
 
@@ -122,6 +179,9 @@ def _sanitize_message(message: dict, *, redact_paths=()) -> dict | None:
     # (1) force credential redaction, (2) strip known local paths.
     text = _force_redact_credentials(text)
     text = _redact_share_paths(text, redact_paths)
+    # Strip MEDIA: / file:// references so the public share never renders
+    # links to the authenticated /api/media endpoint (issue #6126).
+    text = _strip_media_references(text)
     if not text.strip():
         return None
     sanitized = {
@@ -138,10 +198,24 @@ def _public_share_payload(payload: dict) -> dict:
     messages = payload.get("messages")
     if not isinstance(messages, list):
         messages = []
+    # Sanitize each message on read so legacy snapshots stored before the
+    # write-time sanitizer was introduced also have MEDIA:/file:// stripped
+    # (issue #6285 review – "close the legacy-snapshot path").
+    safe_messages = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if isinstance(content, str) and content.strip():
+            content = _strip_media_references(content)
+            if content.strip():
+                safe_messages.append({**msg, "content": content})
+        else:
+            safe_messages.append(msg)
     public = {
         "title": str(payload.get("title") or "Untitled"),
-        "messages": messages,
-        "message_count": int(payload.get("message_count") or len(messages)),
+        "messages": safe_messages,
+        "message_count": int(payload.get("message_count") or len(safe_messages)),
     }
     created_at = payload.get("created_at")
     updated_at = payload.get("updated_at")
