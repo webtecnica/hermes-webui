@@ -10892,6 +10892,9 @@ def _run_agent_streaming(
                         _turn_pending_source,
                         _active_turn_identity,
                     )
+                    _compact_session_image_parts_for_persistence(s)
+                    _advance_truncation_watermark_after_commit(s)  # #3831
+                    _compact_session_image_parts_for_persistence(s)
                 # Strip XML tool-call blocks from assistant message content.
                 # DeepSeek and some other providers emit <function_calls>...</function_calls>
                 # in the raw response text; this must be removed before the content is
@@ -11280,6 +11283,9 @@ def _run_agent_streaming(
                                     _turn_pending_source,
                                     _active_turn_identity,
                                 )
+                                _compact_session_image_parts_for_persistence(s)
+                                _advance_truncation_watermark_after_commit(s)  # #3831
+                                # Skip the error block — jump directly to the
                                 # normal post-result persistence path by
                                 # leaving _assistant_added truthy (set below).
                                 _assistant_added = True  # prevent re-entering guard
@@ -12584,6 +12590,8 @@ def _run_agent_streaming(
                                         s.messages,
                                         live_tool_calls=_live_tool_calls,
                                     )
+                                    _compact_session_image_parts_for_persistence(s)
+                                    _advance_truncation_watermark_after_commit(s)  # #3831
                                     s.active_stream_id = None
                                     s.pending_user_message = None
                                     s.pending_attachments = []
