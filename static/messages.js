@@ -3460,7 +3460,12 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       const tool=row.tool&&typeof row.tool==='object'?row.tool:{};
       return `tool:${row.tool_call_id||tool.id||tool.tid||tool.tool_call_id||tool.tool_use_id||tool.call_id||row.row_id||''}`;
     }
-    if(row.role==='prose'||row.role==='thinking') return `${row.role}:${_anchorSceneTextKey(row.text)}`;
+    if(row.role==='prose'||row.role==='thinking'){
+      const identity=row.identity&&typeof row.identity==='object'?row.identity:{};
+      const durableId=row.local_id||row.row_id||row.event_id||identity.local_id||identity.row_id||identity.event_id;
+      if(durableId) return `${row.role}:id:${durableId}`;
+      return `${row.role}:${_anchorSceneTextKey(row.text)}`;
+    }
     return `${row.role||row.kind}:${row.source_event_type||''}:${row.status||''}:${row.row_id||''}`;
   }
   function _anchorSceneRowHasLiveIdentity(row){
@@ -3471,9 +3476,6 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     // Provider tool-call IDs do not use the live prefix. A stream owner without
     // a settled assistant index still identifies a projected live row.
     const group=row.group&&typeof row.group==='object'?row.group:{};
-    const hasStreamOwner=!!(row.stream_id||row.run_id||identity.stream_id||identity.run_id);
-    const hasAssistantMessageIndex=group.assistant_msg_idx!==undefined&&group.assistant_msg_idx!==null;
-    return hasStreamOwner&&!hasAssistantMessageIndex;
   }
   function _anchorSceneMessageRowsHaveThinking(messageRows){
     if(!(messageRows instanceof Map)) return false;
@@ -3609,11 +3611,15 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(rowIsLiveTokenFinalPrefix(row,textKey,finalSegmentEligible)) return;
       const isTextual=row.role==='prose'||row.role==='thinking';
       if(isTextual&&_anchorSceneRowLooksLikeFinalAnswer(textKey,finalKey)) return;
-      if(isTextual&&_anchorSceneRowTextOverlapsExisting(textKey,seenTextKeys)) return;
       const key=_anchorSceneExistingRowKey(row);
+      // Identity-based dedup: same durable identity → mirror/echo consumed
       if(key&&seen.has(key)) return;
       if(key) seen.add(key);
-      if(isTextual&&textKey) seenTextKeys.push(textKey);
+      // Legacy text-only near-overlap protection for rows without durable ID
+      if(isTextual&&textKey&&!row.local_id&&!row.row_id&&!row.event_id&&!(row.identity&&(row.identity.local_id||row.identity.row_id||row.identity.event_id))){
+        if(_anchorSceneRowTextOverlapsExisting(textKey,seenTextKeys)) return;
+        seenTextKeys.push(textKey);
+      }
       rows.push({
         ...row,
         display_hint:_anchorSceneRowDisplayHintForMode(row,sceneMode),
