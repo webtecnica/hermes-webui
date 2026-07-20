@@ -575,6 +575,36 @@ def _detect_agent_version_from_gateway_health(timeout: float = 0.75) -> str | No
     return None
 
 
+# Cache wrapper so /api/settings doesn't block on every page load when
+# the gateway is unreachable (#6150, #6289).  Negative results (None)
+# are cached with a shorter TTL so a recovering gateway is picked up
+# promptly.
+_GATEWAY_AGENT_VERSION_CACHE: dict[str, object] = {
+    "value": None,
+    "at": 0.0,
+}
+_GATEWAY_AGENT_VERSION_TTL = 30.0
+_GATEWAY_AGENT_VERSION_NEGATIVE_TTL = 5.0
+
+
+def _cached_agent_version_from_gateway() -> str | None:
+    """Return a cached gateway agent version, refreshing at most once per TTL."""
+    now = time.monotonic()
+    cached = _GATEWAY_AGENT_VERSION_CACHE["value"]
+    cached_at = _GATEWAY_AGENT_VERSION_CACHE["at"]
+    ttl = (
+        _GATEWAY_AGENT_VERSION_NEGATIVE_TTL
+        if cached is None
+        else _GATEWAY_AGENT_VERSION_TTL
+    )
+    if cached_at and (now - cached_at) < ttl:
+        return cached
+    result = _detect_agent_version_from_gateway_health(timeout=0.75)
+    _GATEWAY_AGENT_VERSION_CACHE["value"] = result
+    _GATEWAY_AGENT_VERSION_CACHE["at"] = now
+    return result
+
+
 def _detect_agent_version() -> str:
     """Detect the running Hermes Agent version for UI display."""
     agent_dir = Path(_AGENT_DIR) if _AGENT_DIR is not None else None
