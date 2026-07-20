@@ -41,9 +41,73 @@ MESSAGES_JS = (ROOT / "static" / "messages.js").read_text(encoding="utf-8")
 BOOT_JS = (ROOT / "static" / "boot.js").read_text(encoding="utf-8")
 
 
-# ---------------------------------------------------------------------------
-# Static wiring
-# ---------------------------------------------------------------------------
+
+def test_single_line_growth_does_not_write_height_in_node_fixture():
+    node = shutil.which("node")
+    if not node:  # pragma: no cover
+        pytest.skip("node not available")
+    body = _autoresize_body()
+    harness = textwrap.dedent(
+        """
+        let _composerAutoResizeRaf = 0;
+        let _composerLastResizeValueLength = 0;
+        let writes = 0;
+        const msg = {
+          value: 'a',
+          offsetHeight: 44,
+          scrollHeight: 44,
+          style: {
+            set height(_value) { writes += 1; },
+            get height() { return '44px'; },
+          },
+        };
+        const messages = { scrollTop: 0 };
+        const $ = (id) => id === 'msg' ? msg : id === 'messages' ? messages : null;
+        function updateSendBtn() { throw new Error('one-line append must not refresh again from autoResize'); }
+        function _repinMessagesAfterComposerResize() { throw new Error('one-line append must not repin transcript'); }
+        %(autoresize)s
+        autoResize();
+        console.log(JSON.stringify({ writes, lastLength: _composerLastResizeValueLength }));
+        """
+    ) % {"autoresize": body}
+    proc = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == {"writes": 0, "lastLength": 1}
+
+
+def test_single_line_delete_still_runs_the_height_round_trip_in_node_fixture():
+    node = shutil.which("node")
+    if not node:  # pragma: no cover
+        pytest.skip("node not available")
+    body = _autoresize_body()
+    harness = textwrap.dedent(
+        """
+        let _composerAutoResizeRaf = 0;
+        let _composerLastResizeValueLength = 5;
+        let writes = 0, height = 100;
+        const msg = {
+          value: 'a',
+          get offsetHeight() { return height; },
+          scrollHeight: 44,
+          style: {
+            set height(value) { writes += 1; height = value === 'auto' ? 44 : parseInt(value, 10); },
+            get height() { return height + 'px'; },
+          },
+        };
+        const messages = { scrollTop: 0 };
+        const $ = (id) => id === 'msg' ? msg : id === 'messages' ? messages : null;
+        let sendUpdates = 0;
+        function updateSendBtn() { sendUpdates += 1; }
+        function _repinMessagesAfterComposerResize() {}
+        %(autoresize)s
+        autoResize();
+        console.log(JSON.stringify({ writes, height, lastLength: _composerLastResizeValueLength, sendUpdates }));
+        """
+    ) % {"autoresize": body}
+    proc = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == {"writes": 2, "height": 44, "lastLength": 1, "sendUpdates": 1}
+
 
 def _helper_body() -> str:
     start = UI_JS.find("function _repinMessagesAfterComposerResize(")
@@ -118,8 +182,13 @@ def test_resize_observer_installed_on_composer():
     assert "can't strand" in BOOT_JS
 
 
-# ---------------------------------------------------------------------------
-# Behavioral (node vm) — the pin guard under a viewport shrink
+def test_single_line_growth_skips_the_height_round_trip():
+    body = _autoresize_body()
+    assert "let _composerLastResizeValueLength=0;" in MESSAGES_JS
+    assert "const _isGrowing=_nextValueLength>_composerLastResizeValueLength;" in body
+    assert "const _fitsCurrentHeight=el.scrollHeight<=el.offsetHeight;" in body
+    assert "if(_isGrowing&&_fitsCurrentHeight){" in body
+    assert "el.style.height='auto'" in body
 # ---------------------------------------------------------------------------
 
 def _run(scenario):
@@ -232,6 +301,7 @@ def _run_autoresize(scenario):
         const $ = (id) => (id === 'msg' ? msgEl : id === 'messages' ? msgsEl : null);
         let _messageUserUnpinned = %(unpinned)s, _scrollPinned = %(pinned)s;
         let _composerAutoResizeRaf = 0;
+        let _composerLastResizeValueLength = 0;
         let _repinCalls = 0;
         function updateSendBtn(){}
         function _messageBottomDistance(){ return msgsEl.scrollHeight - msgsEl.scrollTop - msgsEl.clientHeight; }

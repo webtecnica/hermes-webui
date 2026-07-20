@@ -6733,12 +6733,23 @@ function transcript(){
 }
 
 let _composerAutoResizeRaf=0;
+let _composerLastResizeValueLength=0;
 function autoResize(){
   if(_composerAutoResizeRaf && typeof cancelAnimationFrame==='function'){
     cancelAnimationFrame(_composerAutoResizeRaf);
     _composerAutoResizeRaf=0;
   }
   const el=$('msg');
+  const _nextValueLength=String(el.value||'').length;
+  const _isGrowing=_nextValueLength>_composerLastResizeValueLength;
+  const _fitsCurrentHeight=el.scrollHeight<=el.offsetHeight;
+  // A one-line append does not need a height round trip. Avoiding the
+  // `auto` → measured-height mutation keeps textarea caret geometry stable for
+  // assistive technology while deletes and genuine multi-line growth still resize.
+  if(_isGrowing&&_fitsCurrentHeight){
+    _composerLastResizeValueLength=_nextValueLength;
+    return;
+  }
   const _prevComposerH=el.offsetHeight;
   // #5514: autoResize() momentarily sets the textarea to height:'auto' (collapses
   // a multi-row composer toward its 1-row min) before reading scrollHeight and
@@ -6763,6 +6774,7 @@ function autoResize(){
   const _prevScrollTop=_msgs?_msgs.scrollTop:0;
   el.style.height='auto';
   el.style.height=Math.min(el.scrollHeight,200)+'px';
+  _composerLastResizeValueLength=_nextValueLength;
   if(_msgs&&_msgs.scrollTop!==_prevScrollTop) _msgs.scrollTop=_prevScrollTop;
   updateSendBtn();
   // Genuine NET growth (a new row that keeps the composer taller than before)
