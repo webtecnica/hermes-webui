@@ -3465,6 +3465,13 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   }
   function _anchorSceneRowHasLiveIdentity(row){
     if(!row||typeof row!=='object') return false;
+    // #6309: Provider-owned tool IDs (tool_call_id like "call_xxxxx") identify
+    // live-projected tool rows just as clearly as a synthetic live- prefix. When
+    // a terminal error settles the turn, _anchorSceneSettleLiveRunningRow must
+    // seal these rows to completed; without this check they remain `status:
+    // running` in the persisted activity_scene_v1 even though the settled
+    // renderer paints them as finished.
+    if(row.tool_call_id) return true;
     const identity=row.identity&&typeof row.identity==='object'?row.identity:{};
     const values=[row.row_id,row.local_id,row.event_id,identity.local_id,identity.event_id];
     return values.some(value=>String(value||'').startsWith('live-'));
