@@ -15840,9 +15840,65 @@ function renderMessages(options){
       let row=_msgNodeRecycleEnabled?_recycleStash.get(rawIdx):null;
       if(row&&(!row.classList.contains('msg-row')||row.classList.contains('assistant-turn'))) row=null;
       const processText=String(rowDisplayContent||'').trim();
-      const processFootHtml=`<div class="msg-foot">${timeHtml}<span class="msg-actions">${copyBtn}</span></div>`;
-      const processTextHtml=processText?`<pre class="process-wakeup-text">${esc(processText)}</pre>`:'';
-      const nextRowHtml=`<div class="process-wakeup-notice"><div class="process-wakeup-label">${li('terminal',13)}<span>${esc(t('process_wakeup_label'))}</span></div>${filesHtml}<div class="msg-body process-wakeup-body">${processTextHtml}</div>${processFootHtml}</div>`;
+      const copyBtnHtml=`<button class="msg-copy-btn msg-action-btn" onclick="copyMsg(this)" title="${t('copy')}">${li('copy',13)}</button>`;
+      // Try to parse structured wakeup data for collapsed card rendering
+      const cmdMatch=processText.match(/^\[IMPORTANT: Background process \S+ completed \(exit_code=([^)]+)\)\.\nCommand: (.+)\nOutput:\n([\s\S]*)\]$/);
+      const watchMatch=processText.match(/^\[IMPORTANT: Background process \S+ matched watch pattern "([^"]+)".\nCommand: (.+)\nMatched output:\n([\s\S]*?)(?:\n\(\d+ earlier matches were suppressed by rate limit\))?\]$/);
+      let nextRowHtml;
+      if(cmdMatch){
+        const exitCode=cmdMatch[1];
+        const command=cmdMatch[2];
+        const output=cmdMatch[3].trim();
+        const isError=String(exitCode)!=='0';
+        nextRowHtml=`<div class="process-wakeup-notice wakeup-card${isError?' wakeup-card-error':''}">
+          <div class="tool-card-header wakeup-card-header" onclick="this.closest('.wakeup-card').classList.toggle('open')" role="button" tabindex="0">
+            <span class="tool-card-toggle">${li('chevron-right',11)}</span>
+            ${li('terminal',14)}
+            <span>${esc(t('process_wakeup_label'))}</span>
+            <code class="wakeup-command">${esc(command)}</code>
+            <span class="wakeup-exit-chip${isError?' wakeup-exit-chip-error':' wakeup-exit-chip-ok'}">exit ${esc(exitCode)}</span>
+            ${tsTime?`<span class="msg-time" title="${esc(tsTitle)}">${tsTime}</span>`:''}
+          </div>
+          <div class="tool-card-detail wakeup-card-detail">
+            <div class="wakeup-card-detail-inner">
+              ${filesHtml}
+              <div class="wakeup-card-command-row"><span class="wakeup-detail-label">${esc(t('command_label'))}</span><code>${esc(command)}</code></div>
+              <pre class="wakeup-card-output">${esc(output)}</pre>
+            </div>
+          </div>
+          <div class="msg-foot">${copyBtnHtml}</div>
+        </div>`;
+      }else if(watchMatch){
+        const pattern=watchMatch[1];
+        const command=watchMatch[2];
+        const output=watchMatch[3].trim();
+        const suppressed=watchMatch[4]!==undefined;
+        const shortPat=pattern.length>50?pattern.slice(0,50)+'…':pattern;
+        nextRowHtml=`<div class="process-wakeup-notice wakeup-card">
+          <div class="tool-card-header wakeup-card-header" onclick="this.closest('.wakeup-card').classList.toggle('open')" role="button" tabindex="0">
+            <span class="tool-card-toggle">${li('chevron-right',11)}</span>
+            ${li('terminal',14)}
+            <span>${esc(t('process_wakeup_label'))}</span>
+            <code class="wakeup-command">${esc(command)}</code>
+            <span class="wakeup-exit-chip wakeup-exit-chip-watch" title="${esc(pattern)}">${li('eye',11)} ${esc(shortPat)}</span>
+            ${tsTime?`<span class="msg-time" title="${esc(tsTitle)}">${tsTime}</span>`:''}
+          </div>
+          <div class="tool-card-detail wakeup-card-detail">
+            <div class="wakeup-card-detail-inner">
+              ${filesHtml}
+              <div class="wakeup-card-command-row"><span class="wakeup-detail-label">${esc(t('command_label'))}</span><code>${esc(command)}</code></div>
+              <div class="wakeup-card-command-row"><span class="wakeup-detail-label">Pattern</span><code>${esc(pattern)}</code>${suppressed?`<span class="wakeup-exit-chip wakeup-exit-chip-watch">suppressed</span>`:''}</div>
+              <pre class="wakeup-card-output">${esc(output)}</pre>
+            </div>
+          </div>
+          <div class="msg-foot">${copyBtnHtml}</div>
+        </div>`;
+      }else{
+        // Fallback to raw rendering for unparseable formats (async_delegation, watch overflow free-text)
+        const processFootHtml=`<div class="msg-foot">${timeHtml}<span class="msg-actions">${copyBtnHtml}</span></div>`;
+        const processTextHtml=processText?`<pre class="process-wakeup-text">${esc(processText)}</pre>`:'';
+        nextRowHtml=`<div class="process-wakeup-notice"><div class="process-wakeup-label">${li('terminal',13)}<span>${esc(t('process_wakeup_label'))}</span></div>${filesHtml}<div class="msg-body process-wakeup-body">${processTextHtml}</div>${processFootHtml}</div>`;
+      }
       if(row){
         row.className='msg-row process-wakeup-row';
         row.id=_userMessageDomId(rawIdx);

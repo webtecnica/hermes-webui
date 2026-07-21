@@ -2333,6 +2333,29 @@
   .process-wakeup-row .msg-body pre.process-wakeup-text{margin:0;padding:0;border:0;border-radius:0;background:transparent;color:var(--muted);font-family:var(--font-mono);font-size:12px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;}
   .process-wakeup-row .msg-foot{padding-left:0;margin-top:5px;}
   @media(max-width:700px){.process-wakeup-notice{margin-left:0;}}
+  /* ── Wakeup collapsed card ── */
+  .wakeup-card{padding:0;overflow:hidden;border-left:2px solid var(--accent-bg-strong);border-radius:9px;background:var(--surface-subtle,var(--hover-bg));color:var(--muted);}
+  .wakeup-card.wakeup-card-error{border-left-color:var(--error);}
+  .wakeup-card-header{display:flex;align-items:center;gap:6px;padding:8px 10px;cursor:pointer;user-select:none;font-size:12px;line-height:1.3;color:var(--muted);min-width:0;}
+  .wakeup-card-header:hover{background:var(--hover-bg);color:var(--text);}
+  .wakeup-card-header .tool-card-toggle{font-size:10px;color:var(--muted);opacity:.4;flex-shrink:0;display:inline-flex;align-items:center;justify-content:center;transform-origin:center;transition:transform .18s ease;will-change:transform;}
+  .wakeup-card.open .tool-card-toggle{transform:rotate(90deg);}
+  .wakeup-card-header .msg-time{margin-left:auto;flex-shrink:0;font-size:10px;opacity:.7;}
+  .wakeup-command{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--font-mono);font-size:12px;color:var(--text);opacity:.6;flex:1 1 auto;}
+  .wakeup-exit-chip{display:inline-flex;align-items:center;gap:3px;padding:1px 6px;border-radius:4px;font-family:var(--font-mono);font-size:10px;font-weight:600;flex-shrink:0;white-space:nowrap;}
+  .wakeup-exit-chip-ok{background:color-mix(in srgb,var(--success) 15%,transparent);color:var(--success);}
+  .wakeup-exit-chip-error{background:color-mix(in srgb,var(--error) 15%,transparent);color:var(--error);}
+  .wakeup-exit-chip-watch{background:color-mix(in srgb,var(--accent) 12%,transparent);color:var(--accent-text);max-width:200px;overflow:hidden;text-overflow:ellipsis;}
+  .wakeup-card-detail{display:block;max-height:0;opacity:0;overflow:hidden;transition:max-height .26s ease,opacity .2s ease;background:var(--code-bg);border-radius:0 0 8px 8px;}
+  .wakeup-card.open .wakeup-card-detail{max-height:320px;opacity:1;overflow:auto;}
+  .wakeup-card-detail-inner{padding:9px 12px 11px;}
+  .wakeup-card-command-row{display:flex;align-items:baseline;gap:8px;margin-bottom:4px;font-size:12px;line-height:1.5;}
+  .wakeup-card-command-row code{font-family:var(--font-mono);font-size:12px;color:var(--text);white-space:pre-wrap;word-break:break-word;}
+  .wakeup-detail-label{color:var(--muted);font-size:11px;opacity:.65;flex-shrink:0;font-weight:500;}
+  .wakeup-card-output{font-size:12px;color:var(--muted);font-family:var(--font-mono);white-space:pre-wrap;word-break:break-word;max-height:220px;overflow-y:auto;margin:6px 0 0;padding:0;border:0;background:transparent;line-height:1.5;}
+  .wakeup-card .msg-foot{padding:4px 10px 6px;}
+  .wakeup-card .msg-foot .msg-copy-btn{opacity:.5;}
+  .wakeup-card .msg-foot .msg-copy-btn:hover{opacity:1;}
   /* Keep original theme background — prevent prism-tomorrow from overriding --code-bg */
   .msg-body pre[class*="language-"],.msg-body pre code[class*="language-"]{background:var(--code-bg) !important;}
   /* Fix #1463: Prism YAML grammar collapses newlines inside token spans — force pre */
