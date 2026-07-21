@@ -1529,10 +1529,13 @@
      a repaint after visualViewport/keyboard geometry changes on tablets too.
      overflow-x:clip (NOT hidden) suppresses any horizontal offset WebKit can
      leave after keyboard dismiss without coercing overflow-y into a scroll
-     container — same #4856 lesson applied to .layout.  body.keyboard-visible
+     container — same #4856 lesson applied to .layout, scoped to touch/mobile
+     (pointer:coarse) so desktop is unaffected (#6377).  body.keyboard-visible
      prevents iPad horizontal shift when the keyboard is shown. */
   html.viewport-reflow .layout{transform:translateZ(0);}
-  .layout{overflow-x:clip;}
+  @media (pointer:coarse){
+    .layout{overflow-x:clip;}
+  }
   body.keyboard-visible{overflow-x:hidden;position:relative;}
   .app-titlebar{display:flex;align-items:center;justify-content:center;height:38px;flex-shrink:0;background:var(--sidebar);border-bottom:1px solid var(--border);padding:0 12px;padding-top:var(--app-titlebar-safe-top);padding-left:max(12px,env(safe-area-inset-left,0));padding-right:max(12px,env(safe-area-inset-right,0));box-sizing:content-box;font-size:12px;color:var(--muted);user-select:none;-webkit-app-region:drag;position:relative;z-index:20;}
   .app-titlebar-left{display:flex;align-items:center;gap:4px;}

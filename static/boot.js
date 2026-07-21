@@ -157,11 +157,18 @@ function _isTouchKeyboardViewport(){
   try{return matchMedia('(hover:none) and (pointer:coarse)').matches&&!_hasFinePointerCoexisting();}catch(_){return false;}
 }
 
+// Tracks whether the software keyboard was visible in the last
+// _syncKeyboardBottomInset() call, used by _forceMobileViewportReflow
+// to detect the keyboard-dismissed transition for scroll reset (#6377).
+let _keyboardWasVisible = false;
+
 function _syncKeyboardBottomInset(){
   const root=document.documentElement;
   if(!root) return;
   if(!window.visualViewport||!_isTouchKeyboardViewport()){
     root.style.removeProperty('--keyboard-bottom-inset');
+    document.body.classList.remove('keyboard-visible');
+    _keyboardWasVisible = false;
     return;
   }
   const vv=window.visualViewport;
@@ -171,13 +178,19 @@ function _syncKeyboardBottomInset(){
   // jitters on pan. Treat only the unzoomed state as keyboard occlusion.
   if(Math.abs((vv.scale||1)-1)>0.05){
     root.style.removeProperty('--keyboard-bottom-inset');
+    document.body.classList.remove('keyboard-visible');
+    _keyboardWasVisible = false;
     return;
   }
   const inset=Math.max(0,Math.ceil(window.innerHeight-(vv.height+vv.offsetTop)));
   if(inset>0){
     root.style.setProperty('--keyboard-bottom-inset',`${inset}px`);
+    document.body.classList.add('keyboard-visible');
+    _keyboardWasVisible = true;
   }else{
     root.style.removeProperty('--keyboard-bottom-inset');
+    document.body.classList.remove('keyboard-visible');
+    _keyboardWasVisible = false;
   }
 }
 
@@ -190,13 +203,18 @@ function _syncKeyboardBottomInset(){
 // GPU-promotion transform under the global .layout rule) forces a repaint,
 // then we resync the workspace panel + sidebar aria.
 function _forceMobileViewportReflow(){
+  const prevKeyboardVisible = _keyboardWasVisible;
   _syncKeyboardBottomInset();
   if(!_isPhoneWidthViewport() && !_isTouchKeyboardViewport()) return;
   const layout=document.querySelector('.layout');
   if(!layout) return;
   document.documentElement.classList.add('viewport-reflow');
   void layout.offsetWidth;
-  window.scrollTo(0, window.scrollY);
+  // Reset horizontal scroll offset only when the software keyboard was just
+  // dismissed (visible → hidden) to avoid jitter during pinch zoom/pan (#6377).
+  if(prevKeyboardVisible && !_keyboardWasVisible){
+    window.scrollTo(0, window.scrollY);
+  }
   requestAnimationFrame(()=>{
     document.documentElement.classList.remove('viewport-reflow');
     try{ syncWorkspacePanelState(); }catch(_){ }
