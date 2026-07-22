@@ -4478,7 +4478,7 @@ def get_session_for_scan(sid):
         return None
 
 
-def _resolve_session(sid, metadata_only=False, *, promote_cache=True, cache_on_miss=True):
+def _resolve_session(sid, metadata_only=False, *, promote_cache=True, cache_on_miss=True, _skip_bounded_fast_path=False):
     """Resolve a session through the canonical freshness/recovery path.
 
     ``get_session_for_scan`` shares this resolver with normal reads so that
@@ -4559,7 +4559,10 @@ def _resolve_session(sid, metadata_only=False, *, promote_cache=True, cache_on_m
         # responsible for populating a bounded message window when the
         # request carries ``msg_limit``, or falling back to the full
         # authoritative load when the full transcript is needed.
-        if Session._can_serve_bounded_session_metadata_fast(sid):
+        # ``_skip_bounded_fast_path`` lets the route handler force a
+        # genuine full load when the fast-path stub cannot satisfy the
+        # request (e.g. scanner failure, msg_before paging, unbounded).
+        if not _skip_bounded_fast_path and Session._can_serve_bounded_session_metadata_fast(sid):
             s = Session.load_metadata_only(sid)
             if s:
                 s._bounded_fast_path = True
@@ -4604,9 +4607,9 @@ def _resolve_session(sid, metadata_only=False, *, promote_cache=True, cache_on_m
     raise KeyError(sid)
 
 
-def get_session(sid, metadata_only=False):
+def get_session(sid, metadata_only=False, _skip_bounded_fast_path=False):
     """Load a session, optionally with metadata only (skipping messages)."""
-    return _resolve_session(sid, metadata_only=metadata_only)
+    return _resolve_session(sid, metadata_only=metadata_only, _skip_bounded_fast_path=_skip_bounded_fast_path)
 
 
 _COMPRESSION_RECOVERY_PROFILE_UNSET = object()

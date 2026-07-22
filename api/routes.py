@@ -8846,7 +8846,7 @@ def _read_bounded_fast_path_messages(session_id, msg_limit, _metadata_total=0):
             i += 1
 
     if not messages:
-        return None, 0
+        return None, 0, {}
 
     # Prefer the caller-supplied metadata total; fall back to
     # the count we computed during the scan.
@@ -8860,7 +8860,27 @@ def _read_bounded_fast_path_messages(session_id, msg_limit, _metadata_total=0):
     else:
         messages_list = list(messages)
 
-    return messages_list, int(total)
+    # ── extract post-messages top-level fields (#6317 gate RED) ────────
+    # After the messages array closes (i points past ']'), the remaining
+    # text contains trailing top-level fields such as tool_calls,
+    # anchor_activity_scenes, and todo state that must be preserved on
+    # the session object.  Parse them from the tail of the JSON file.
+    post_fields = {}
+    remaining = text[i:].strip()
+    if remaining:
+        try:
+            # Prefix with { and a dummy key to form valid JSON.
+            wrapped = '{"_dummy": null' + remaining
+            parsed = json.loads(wrapped)
+            parsed.pop('_dummy', None)
+            post_fields = parsed
+        except (json.JSONDecodeError, Exception):
+            # Corrupt tail — safest to return no post-fields rather
+            # than fail the whole fast-path; the caller still has
+            # the metadata prefix fields from load_metadata_only.
+            pass
+
+    return messages_list, int(total), post_fields
 
 
 def _state_db_since_timestamp_for_limited_display(session, msg_limit, msg_before=None):
@@ -12760,11 +12780,17 @@ def handle_get(handler, parsed) -> bool:
             # through to the authoritative full-load path.
             _bounded_fast_path = getattr(s, '_bounded_fast_path', False)
             if _bounded_fast_path and load_messages and msg_limit is not None and msg_before is None:
-                _fast_msgs, _fast_total = _read_bounded_fast_path_messages(sid, msg_limit, _metadata_total=getattr(s, '_metadata_message_count', 0))
+                _fast_msgs, _fast_total, _fast_post_fields = _read_bounded_fast_path_messages(sid, msg_limit, _metadata_total=getattr(s, '_metadata_message_count', 0))
                 if _fast_msgs is not None:
                     s.messages = _fast_msgs
                     s._metadata_message_count = _fast_total
                     limited_sidecar_messages = list(_fast_msgs)
+                    # Apply post-messages top-level fields (tool_calls,
+                    # anchor_activity_scenes, todo state, etc.) that were
+                    # serialised after the messages array in the sidecar
+                    # JSON and are missing from the metadata-only stub.
+                    for _k, _v in _fast_post_fields.items():
+                        setattr(s, _k, _v)
                     # Disable the normal windowing — the tail is already
                     # bounded; the caller only needs a lightweight state.db
                     # merge for any rows newer than the sidecar.
@@ -12772,19 +12798,34 @@ def handle_get(handler, parsed) -> bool:
                 else:
                     # Extraction failed — reload s authoritatively so the
                     # normal path doesn't operate on the metadata-only stub
-                    # with an empty messages list (#6317 gate RED).
+                    # with an empty messages list.  Use _skip_bounded_fast_path
+                    # to prevent re-entering the same large-sidecar gate.
                     try:
-                        s = get_session(sid, metadata_only=False)
+                        s = get_session(sid, metadata_only=False, _skip_bounded_fast_path=True)
                     except KeyError:
                         if _diag: _diag.finish()
                         return bad(handler, "Session not found", 404)
                     _bounded_fast_path = False
                     _bounded_fast_path_active = False
+            elif _bounded_fast_path and load_messages and msg_limit is not None and msg_before is not None:
+                # msg_before paging on a fast-path stub (#6317 gate RED
+                # blocker 1).  The older-page request cannot be served
+                # from the tail window because it needs the full message
+                # coordinate space for correct cursor continuity.  Reload
+                # authoritatively so the normal merge + window path
+                # operates on the full transcript.
+                try:
+                    s = get_session(sid, metadata_only=False, _skip_bounded_fast_path=True)
+                except KeyError:
+                    if _diag: _diag.finish()
+                    return bad(handler, "Session not found", 404)
+                _bounded_fast_path = False
+                _bounded_fast_path_active = False
             elif _bounded_fast_path and load_messages and not msg_limit:
                 # Full transcript requested on a fast-path stub — reload
                 # authoritatively so the merge path has every message.
                 try:
-                    s = get_session(sid, metadata_only=False)
+                    s = get_session(sid, metadata_only=False, _skip_bounded_fast_path=True)
                 except KeyError:
                     if _diag: _diag.finish()
                     return bad(handler, "Session not found", 404)
@@ -12795,13 +12836,13 @@ def handle_get(handler, parsed) -> bool:
             # ── end #6241 fast-path ──────────────────────────────────────
             if _bounded_fast_path_active:
                 # Fast-path: we already have a bounded message tail from
-                # the sidecar. Skip the expensive CLI metadata lookup
-                # (WebUI-native sessions never need it) and the full
-                # sidecar lineage scan. Only merge any state.db rows
-                # newer than the sidecar tail to keep the transcript
-                # current.
-                is_messaging_session = False
-                cli_meta = {}
+                # the sidecar.  Perform proper cli_meta lookup and session
+                # classification so lineage, messaging state, and
+                # post-messages fields (tool_calls, anchor_activity_scenes,
+                # todo) are preserved (#6317 gate RED blocker 3 — no
+                # longer hardcodes is_messaging_session=False, cli_meta={}).
+                cli_meta = _lookup_cli_session_metadata(sid) if _session_requires_cli_metadata_lookup(s) else {}
+                is_messaging_session = _is_messaging_session_record(s) or _is_messaging_session_record(cli_meta)
                 # Load only very recent state.db rows for the merge.
                 _db_kwargs = {"profile": _session_profile}
                 _backstop = _state_db_backstop_limit_for_display(s, msg_before)
