@@ -7914,12 +7914,6 @@ def _run_agent_streaming(
             _metering_output_deltas = [0]
             _metering_reasoning_deltas = [0]
 
-            # Non-shrinking 2048-char rolling window of recently emitted visible
-            # tokens.  Used by _is_visible_output_echo to catch token-tail cache
-            # misses when the echoed text falls outside the 512-char STREAM_PARTIAL_TEXT
-            # suffix window (#6188 Blocker 2).
-            _token_tail_cache = ['']
-
             def _flush_reasoning_buffer():
                 # #4729: emit any coalesced-but-not-yet-flushed reasoning text immediately.
                 # The ~10 Hz throttle in on_reasoning leaves a sub-100ms tail in the buffer;
@@ -7962,15 +7956,6 @@ def _run_agent_streaming(
                 # reasoning that happens to reuse an answer phrase.
                 if len(candidate) < 80:
                     return False
-                # Check the non-shrinking 2048-char token-tail cache for
-                # containment — catches echoes that fall outside the 512-char
-                # STREAM_PARTIAL_TEXT suffix window (#6188 Blocker 2).
-                # Only reached for candidates >= 80 chars, so short legitimate
-                # reasoning deltas (e.g. 'the', 'check') are never misclassified
-                # by the broad cache-containment check.
-                tail_cache_compact = _compact_for_echo_compare(_token_tail_cache[0])
-                if tail_cache_compact and candidate in tail_cache_compact:
-                    return True
                 visible_compact = _compact_for_echo_compare(visible_output)
                 return bool(visible_compact and candidate in visible_compact)
 
@@ -8007,7 +7992,7 @@ def _run_agent_streaming(
                 return removed
 
             def on_token(text):
-                nonlocal _token_sent, _token_tail_cache
+                nonlocal _token_sent
                 if text is None:
                     return  # end-of-stream sentinel
                 # #4729: visible output is starting — flush any buffered reasoning tail
@@ -8038,10 +8023,6 @@ def _run_agent_streaming(
                 # worth it for a recoverable staleness window.
                 if stream_id in STREAM_PARTIAL_TEXT:
                     STREAM_PARTIAL_TEXT[stream_id] += str(text)
-                # Update the non-shrinking 2048-char token-tail cache so
-                # _is_visible_output_echo can catch echoes that fall outside the
-                # 512-char STREAM_PARTIAL_TEXT suffix window (#6188 Blocker 2).
-                _token_tail_cache[0] = (_token_tail_cache[0] + str(text))[-2048:]
                 put('token', {'text': text})
                 # Update live throughput from stream delta callbacks, not from
                 # byte/character length. If a backend cannot provide live deltas,
