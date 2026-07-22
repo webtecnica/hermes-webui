@@ -585,10 +585,16 @@ _GATEWAY_AGENT_VERSION_CACHE: dict[str, object] = {
 }
 _GATEWAY_AGENT_VERSION_TTL = 30.0
 _GATEWAY_AGENT_VERSION_NEGATIVE_TTL = 5.0
+_gateway_version_lock = threading.Lock()
 
 
 def _cached_agent_version_from_gateway() -> str | None:
-    """Return a cached gateway agent version, refreshing at most once per TTL."""
+    """Return a cached gateway agent version, refreshing at most once per TTL.
+
+    Uses double-checked locking under ``_gateway_version_lock`` to guarantee
+    that at most one thread performs the gateway probe per TTL window, even
+    under the ``ThreadingHTTPServer`` (128 workers) request model (#6289).
+    """
     now = time.monotonic()
     cached = _GATEWAY_AGENT_VERSION_CACHE["value"]
     cached_at = _GATEWAY_AGENT_VERSION_CACHE["at"]
@@ -599,9 +605,23 @@ def _cached_agent_version_from_gateway() -> str | None:
     )
     if cached_at and (now - cached_at) < ttl:
         return cached
-    result = _detect_agent_version_from_gateway_health(timeout=0.75)
-    _GATEWAY_AGENT_VERSION_CACHE["value"] = result
-    _GATEWAY_AGENT_VERSION_CACHE["at"] = now
+
+    with _gateway_version_lock:
+        # Double-check: another thread may have refreshed while we waited
+        now = time.monotonic()
+        cached = _GATEWAY_AGENT_VERSION_CACHE["value"]
+        cached_at = _GATEWAY_AGENT_VERSION_CACHE["at"]
+        ttl = (
+            _GATEWAY_AGENT_VERSION_NEGATIVE_TTL
+            if cached is None
+            else _GATEWAY_AGENT_VERSION_TTL
+        )
+        if cached_at and (now - cached_at) < ttl:
+            return cached
+
+        result = _detect_agent_version_from_gateway_health(timeout=0.75)
+        _GATEWAY_AGENT_VERSION_CACHE["value"] = result
+        _GATEWAY_AGENT_VERSION_CACHE["at"] = time.monotonic()
     return result
 
 
