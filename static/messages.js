@@ -1396,7 +1396,7 @@ async function send(){
         S.pendingFiles=[];renderTray();
         if(S.activeStreamId&&typeof cancelStream==='function'){
           if(await cancelStream('busy-interrupt')) showToast(t('busy_interrupt_confirm'),2000);
-          else showToast(t('cancel_failed'));
+          else showToast(t('cancel_failed'),null,'error');
         } else {
           showToast(`Queued: "${text.slice(0,40)}${text.length>40?'…':''}"`,2000);
         }

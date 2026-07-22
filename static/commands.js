@@ -1215,7 +1215,7 @@ async function cmdStop(){
   if(!S.activeStreamId){showToast(t('no_active_task'));return;}
   if(typeof cancelStream==='function'){
     if(await cancelStream('slash-stop')) showToast(t('stream_stopped'));
-    else showToast(t('cancel_failed'));
+    else showToast(t('cancel_failed'),null,'error');
   }
   else showToast(t('cancel_unavailable'));
 }
@@ -1324,7 +1324,7 @@ async function cmdInterrupt(args){
   // Cancel the active stream; setBusy(false) will drain the queue
   if(typeof cancelStream==='function'){
     if(await cancelStream('slash-interrupt')) showToast(t('cmd_interrupt_confirm'),2000);
-    else showToast(t('cancel_failed'));
+    else showToast(t('cancel_failed'),null,'error');
   }
 }
 

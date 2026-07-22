@@ -4907,7 +4907,7 @@ function _openSessionActionMenu(session, anchorEl){
       async()=>{
         closeSessionActionMenu();
         if(await cancelSessionStream(session)) showToast(t('stream_stopped'));
-        else showToast(t('cancel_failed'));
+        else showToast(t('cancel_failed'),null,'error');
       }
     ));
   }
