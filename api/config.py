@@ -1052,6 +1052,10 @@ MIME_MAP = {
     ".m4v": "video/mp4",
     ".webm": "video/webm",
     ".ogv": "video/ogg",
+    # TypeScript source files — served as text/plain to avoid XSS from
+    # same-origin inline execution in _handle_file_raw.
+    ".ts": "text/plain",
+    ".tsx": "text/plain",
 }
 
 # ── Toolsets (from config.yaml or hardcoded default) ─────────────────────────
