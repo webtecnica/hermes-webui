@@ -128,14 +128,17 @@ _SHARE_MEDIA_RE = re.compile(
 _SHARE_EMBED_MAX_BYTES = 512 * 1024  # 512 KiB
 
 # Only these image MIME types may be embedded in public shares.
-# Non-image files are NEVER embedded — embedding arbitrary file bytes
-# circumvents the credential-redaction boundary that protects message
-# prose, and a public share is not a file-transfer service.
+# Non-image files and SVG are NEVER embedded — embedding arbitrary file
+# bytes circumvents the credential-redaction boundary that protects
+# message prose, and a public share is not a file-transfer service.
+# SVG is excluded because it is the only text-bearing type in this set;
+# agent-authored SVGs can carry credentials in their text content which
+# _redact_share_paths (which only touches message prose, not embedded
+# bytes) cannot reach.
 _SHARE_ALLOWED_MIME_TYPES: frozenset[str] = frozenset({
     "image/png",
     "image/jpeg",
     "image/gif",
-    "image/svg+xml",
     "image/webp",
 })
 
@@ -147,6 +150,44 @@ _ON_ATTR_RE = re.compile(r"^on\w+$", re.IGNORECASE)
 
 # Dangerous href/xlink:href schemes.
 _DANGEROUS_HREF_RE = re.compile(r"^\s*javascript\s*:", re.IGNORECASE)
+
+# Static placeholder emitted when a media reference cannot be embedded.
+_PLACEHOLDER = "[*Local attachment omitted from public share*]"
+
+# Magic byte signatures for allowed image formats — content-based validation
+# that catches mismatched extensions (e.g. a .png that is actually a script).
+# SVG is excluded here because it is validated by XML parsing in
+# _sanitize_svg_bytes.
+_IMAGE_MAGIC: dict[str, bytes] = {
+    "image/png": b"\x89PNG\r\n\x1a\n",
+    "image/jpeg": b"\xff\xd8\xff",
+    "image/gif": b"GIF8",
+    "image/webp": b"RIFF",
+}
+# Offset for WebP magic: "RIFF" at 0, file size at 4, "WEBP" at 8.
+_WEBP_MAGIC_OFFSET = 8
+_WEBP_MAGIC = b"WEBP"
+
+
+def _check_image_magic(data: bytes, mime_type: str) -> bool:
+    """Verify *data* header bytes match the expected magic for *mime_type*.
+
+    Returns ``True`` if the content is consistent with the claimed type.
+    SVG is exempt because it is validated structurally by
+    :func:`_sanitize_svg_bytes`.
+    """
+    if mime_type == "image/svg+xml":
+        return True
+    magic = _IMAGE_MAGIC.get(mime_type)
+    if magic is None:
+        return False
+    if not data.startswith(magic):
+        return False
+    # Extra check for WebP: "WEBP" at offset 8.
+    if mime_type == "image/webp":
+        if len(data) < 12 or data[_WEBP_MAGIC_OFFSET:_WEBP_MAGIC_OFFSET + 4] != _WEBP_MAGIC:
+            return False
+    return True
 
 
 def _sanitize_svg_bytes(data: bytes) -> bytes:
@@ -165,8 +206,9 @@ def _sanitize_svg_bytes(data: bytes) -> bytes:
         ET.register_namespace("", _SVG_NS)
         root = ET.fromstring(data.decode("utf-8", errors="replace"))
     except ET.ParseError:
-        # Not valid XML — return the original data unchanged.
-        return data
+        # Not valid XML — cannot sanitise safely.  Return a minimal empty SVG
+        # so the <img> renders nothing rather than embedding un-sanitised bytes.
+        return b'<svg xmlns="http://www.w3.org/2000/svg"/>'
 
     # Walk the tree depth-first, stripping on* attrs, dangerous hrefs,
     # and removing <script> children.
@@ -211,30 +253,50 @@ def _embed_share_media(text: str, *, allowed_roots: tuple[Path, ...] = ()) -> st
 
     allowed = tuple(Path(r).resolve() for r in allowed_roots if r)
 
+    def _resolve_against_roots(raw: str) -> Path | None:
+        """Resolve *raw* against each allowed root, returning the first valid
+        absolute Path that lives inside one of them, or ``None``.
+
+        - ``file://`` is always rejected (absolute, un-scoped).
+        - Absolute paths (``/…``, ``~…``) are resolved as-is and checked
+          against the allowed-roots allow-list via ``is_relative_to()``.
+        - Relative paths are joined with each allowed root in turn so they
+          don't silently anchor to the server's process CWD.
+        """
+        if raw.startswith("file://"):
+            return None
+
+        # --- Absolute paths: resolve as-is, then allow-list check ------------
+        if raw.startswith("/") or raw.startswith("~"):
+            try:
+                p = Path(raw).expanduser().resolve(strict=False)
+            except (OSError, ValueError, RuntimeError):
+                return None
+            if not allowed or not any(p.is_relative_to(r) for r in allowed):
+                return None
+            return p if p.is_file() else None
+
+        # --- Relative paths: try each allowed root as the anchor -------------
+        for root in allowed:
+            try:
+                candidate = (root / raw).resolve(strict=False)
+            except (OSError, ValueError, RuntimeError):
+                continue
+            # Path traversal guard: resolved path must still be under the root.
+            if not candidate.is_relative_to(root):
+                continue
+            if candidate.is_file():
+                return candidate
+        return None
+
     def _replace_ref(m: re.Match) -> str:
         raw = (m.group(1) or "").strip()
         if not raw:
             return m.group(0)
 
-        # --- Reject file:// and absolute paths outright -----------------------
-        # file:// URIs are always absolute and carry no scope.  Absolute
-        # paths (starting with / or ~) can trivially read files outside any
-        # workspace — there is no legitimate public-share use case for them.
-        if raw.startswith("file://") or raw.startswith("/") or raw.startswith("~"):
-            return _PLACEHOLDER
-
         # --- Resolve and validate against allowed roots -----------------------
-        try:
-            p = Path(raw).resolve(strict=False)
-        except (OSError, ValueError, RuntimeError):
-            return _PLACEHOLDER
-
-        # Path traversal guard: the resolved absolute path MUST live inside
-        # at least one allowed root.  is_relative_to() catches ../ escapes.
-        if not allowed or not any(p.is_relative_to(r) for r in allowed):
-            return _PLACEHOLDER
-
-        if not p.is_file():
+        p = _resolve_against_roots(raw)
+        if p is None:
             return _PLACEHOLDER
 
         # --- Size guard -------------------------------------------------------
@@ -254,6 +316,11 @@ def _embed_share_media(text: str, *, allowed_roots: tuple[Path, ...] = ()) -> st
         # --- Embed as base64 <img> -------------------------------------------
         try:
             data = p.read_bytes()
+            # Content-based MIME validation: verify the actual file header
+            # matches the claimed MIME type — catches extension-spoofed files
+            # (e.g. a script renamed to .png).
+            if not _check_image_magic(data, mime_type):
+                return _PLACEHOLDER
             # Sanitise SVG content before embedding — SVG can carry
             # <script> elements and on* event handlers that could leak
             # credentials in the context of a public share page.
@@ -273,10 +340,6 @@ def _embed_share_media(text: str, *, allowed_roots: tuple[Path, ...] = ()) -> st
             return _PLACEHOLDER
 
     return _SHARE_MEDIA_RE.sub(_replace_ref, text)
-
-
-# Static placeholder emitted when a media reference cannot be embedded.
-_PLACEHOLDER = "[*Local attachment omitted from public share*]"
 
 
 def _sanitize_message(message: dict, *, redact_paths=(), allowed_roots: tuple[Path, ...] = ()) -> dict | None:
