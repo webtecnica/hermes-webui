@@ -1502,11 +1502,12 @@ def profile_scope_for_detached_worker(
     set_request_profile(name)
     try:
         if _is_root_profile(name):
-            # Root profile: TLS bound above.  Also save and scrub any
-            # named-profile .env credentials from os.environ so raw
-            # os.getenv() credential readers inside the worker body
-            # cannot see them (#6327).  Restore on exit.
-            saved_env: dict[str, Optional[str]] = {}
+            # Root profile: TLS bound above.  Block fallthrough to the
+            # process env so _thread_local_env_value() callers cannot see
+            # named-profile credentials (#6327).  Setting
+            # block_process_env_fallback on the worker thread's TLS is
+            # sufficient — do NOT mutate the process-wide os.environ
+            # (that would break concurrent named-profile requests).
             previous_block_process_env = False
             try:
                 from api.config import _thread_ctx
@@ -1515,14 +1516,9 @@ def profile_scope_for_detached_worker(
                     getattr(_thread_ctx, "block_process_env_fallback", False)
                 )
                 _thread_ctx.block_process_env_fallback = True
-                for key in list(_loaded_profile_env_keys):
-                    saved_env[key] = os.environ.pop(key, None)
                 yield
             finally:
                 _thread_ctx.block_process_env_fallback = previous_block_process_env
-                for key, value in saved_env.items():
-                    if value is not None:
-                        os.environ[key] = value
         else:
             with profile_env_for_background_worker(
                 name, purpose, logger_override=logger_override
