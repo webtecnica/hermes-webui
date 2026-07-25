@@ -3983,6 +3983,7 @@ async function restartServer() {
 
 function _waitForServerRestart() {
   var statusEl = document.getElementById('restartServerStatus');
+  var btnEl = document.getElementById('btnRestartServer');
   var maxRetries = 60;  // ~60 seconds of polling
   var retryDelay = 1000;
   var attempt = 0;
@@ -3996,7 +3997,7 @@ function _waitForServerRestart() {
             statusEl.textContent = (typeof t === 'function' ? t('settings_restart_reconnected') : 'Server restarted successfully.');
             statusEl.style.color = '#2ecc71';
           }
-          document.getElementById('btnRestartServer').disabled = false;
+          if (btnEl) btnEl.disabled = false;
           location.reload();
         } else if (attempt < maxRetries) {
           setTimeout(poll, retryDelay);
@@ -4005,7 +4006,7 @@ function _waitForServerRestart() {
             statusEl.textContent = (typeof t === 'function' ? t('settings_restart_timeout') : 'Server did not come back. Check the terminal for errors.');
             statusEl.style.color = '#e74c3c';
           }
-          document.getElementById('btnRestartServer').disabled = false;
+          if (btnEl) btnEl.disabled = false;
         }
       })
       .catch(function() {
@@ -4016,7 +4017,7 @@ function _waitForServerRestart() {
             statusEl.textContent = (typeof t === 'function' ? t('settings_restart_timeout') : 'Server did not come back. Check the terminal for errors.');
             statusEl.style.color = '#e74c3c';
           }
-          document.getElementById('btnRestartServer').disabled = false;
+          if (btnEl) btnEl.disabled = false;
         }
       });
   }
