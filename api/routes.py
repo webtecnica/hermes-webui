@@ -20567,8 +20567,8 @@ def _handle_memory_read(handler, parsed=None):
 
     # Respect memory_enabled and user_profile_enabled config flags (#6406)
     cfg = get_config()
-    memory_enabled = _webui_truthy(cfg.get("memory_enabled", True)) if isinstance(cfg, dict) else True
-    user_profile_enabled = _webui_truthy(cfg.get("user_profile_enabled", True)) if isinstance(cfg, dict) else True
+    memory_enabled = _config_flag(cfg, "memory_enabled", True)
+    user_profile_enabled = _config_flag(cfg, "user_profile_enabled", True)
 
     mem_file = mem_dir / "MEMORY.md" if memory_enabled else None
     user_file = mem_dir / "USER.md" if user_profile_enabled else None
@@ -25660,12 +25660,10 @@ def _handle_memory_write(handler, body):
     # Respect memory_enabled and user_profile_enabled config flags (#6406)
     cfg = get_config()
     if section == "memory":
-        memory_enabled = _webui_truthy(cfg.get("memory_enabled", True)) if isinstance(cfg, dict) else True
-        if not memory_enabled:
+        if not _config_flag(cfg, "memory_enabled", True):
             return bad(handler, "Memory is disabled by configuration (memory_enabled: false)", 403)
     elif section == "user":
-        user_profile_enabled = _webui_truthy(cfg.get("user_profile_enabled", True)) if isinstance(cfg, dict) else True
-        if not user_profile_enabled:
+        if not _config_flag(cfg, "user_profile_enabled", True):
             return bad(handler, "User profile is disabled by configuration (user_profile_enabled: false)", 403)
 
     try:
@@ -26353,6 +26351,13 @@ def _handle_mcp_tools_list(handler):
 
 def _webui_truthy(value) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _config_flag(cfg, key: str, default: bool = True) -> bool:
+    """Read a boolean config flag from a config dict with a fallback default."""
+    if not isinstance(cfg, dict):
+        return default
+    return _webui_truthy(cfg.get(key, default))
 
 
 def _external_notes_sources_enabled(config_data: dict | None = None) -> bool:

@@ -311,8 +311,21 @@ def _persistent_state_snapshot(profile_home: str | None) -> dict:
     if not profile_home:
         return {"memory": {}, "skills": {}}
     root = Path(profile_home)
+
+    # Respect memory_enabled and user_profile_enabled config flags (#6406)
+    cfg = get_config()
+    memory_enabled = True
+    user_profile_enabled = True
+    if isinstance(cfg, dict):
+        memory_enabled = str(cfg.get("memory_enabled", True) or "").strip().lower() in {"1", "true", "yes", "on"}
+        user_profile_enabled = str(cfg.get("user_profile_enabled", True) or "").strip().lower() in {"1", "true", "yes", "on"}
+
     memory = {}
     for key, parts in _PERSISTENT_MEMORY_FILES:
+        if key == "memory" and not memory_enabled:
+            continue
+        if key == "user" and not user_profile_enabled:
+            continue
         sig = _file_signature(root.joinpath(*parts))
         if sig is not None:
             memory[key] = sig
