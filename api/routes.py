@@ -22138,7 +22138,30 @@ def _read_active_project_context(workspace: Path | None) -> dict:
     return payload
 
 
+def _memory_config_flags():
+    """Return (memory_enabled, user_profile_enabled) from the active profile config.
+
+    Falls back to (True, True) on any error so a broken config doesn't lock
+    the user out of the Memory panel entirely.
+    """
+    config_path = _active_profile_config_path()
+    try:
+        if config_path.exists():
+            cfg = _load_yaml_config_file(config_path)
+            if isinstance(cfg, dict):
+                mem_cfg = cfg.get("memory", {})
+                if isinstance(mem_cfg, dict):
+                    return (
+                        mem_cfg.get("memory_enabled", True),
+                        mem_cfg.get("user_profile_enabled", True),
+                    )
+    except Exception:
+        pass
+    return True, True
+
+
 def _handle_memory_read(handler, parsed=None):
+    memory_enabled, user_profile_enabled = _memory_config_flags()
     try:
         from api.profiles import get_active_hermes_home
 
@@ -28063,7 +28086,6 @@ def _handle_memory_write(handler, body):
     except ValueError as e:
         return bad(handler, str(e))
     section = body["section"]
-
     # Respect memory_enabled and user_profile_enabled config flags (#6406)
     # Use get_config_snapshot() for per-profile isolation — get_config() returns
     # the process-global mutable _cfg_cache which races across profiles.
@@ -28071,13 +28093,17 @@ def _handle_memory_write(handler, body):
     cfg = get_config_snapshot()
     mem = cfg.get("memory") if isinstance(cfg, dict) else None
     mem_cfg = mem if isinstance(mem, dict) else {}
+    memory_enabled = _webui_truthy(mem_cfg.get("memory_enabled", True))
+    user_profile_enabled = _webui_truthy(mem_cfg.get("user_profile_enabled", True))
     if section == "memory":
-        if not _webui_truthy(mem_cfg.get("memory_enabled", True)):
+        if not memory_enabled:
             return bad(handler, "Memory is disabled by configuration (memory_enabled: false)", 403)
     elif section == "user":
-        if not _webui_truthy(mem_cfg.get("user_profile_enabled", True)):
+        if not user_profile_enabled:
             return bad(handler, "User profile is disabled by configuration (user_profile_enabled: false)", 403)
-
+    elif section == "soul":
+        if not memory_enabled:
+            return bad(handler, "Memory is disabled", 403)
     try:
         from api.profiles import get_active_hermes_home
 
