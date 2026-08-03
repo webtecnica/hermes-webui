@@ -1,6 +1,7 @@
 """Health route and shared gateway restart helper checks."""
 
 import io
+import json
 import subprocess
 import threading
 import types
@@ -20,6 +21,7 @@ class MockPopen:
         communicate_timeout=False,
         wait_timeout=False,
         env=None,
+        pid=None,
     ):
         self.args = args
         self.env = env or {}
@@ -32,6 +34,7 @@ class MockPopen:
         self.killed = False
         self.communicate_timeout_arg = None
         self.wait_timeout_arg = None
+        self.pid = pid
 
     def communicate(self, timeout=None):
         self.communicate_timeout_arg = timeout
@@ -236,6 +239,88 @@ def test_restart_active_profile_gateway_timeout_releases_lock_after_background_w
     assert proc.communicate_timeout_arg == 2.0
     assert proc.wait_timeout_arg == 240.0
     assert gateway_restart._GATEWAY_RESTART_LOCK.locked() is False
+
+
+def _became_gateway_proc(tmp_path, *, pid=4242, wait_timeout=True):
+    return MockPopen(
+        ["/mock/bin/hermes", "gateway", "restart"],
+        communicate_timeout=True,
+        wait_timeout=wait_timeout,
+        pid=pid,
+        env={"HERMES_HOME": str(tmp_path)},
+    )
+
+
+def _write_gateway_state(tmp_path, **fields):
+    (tmp_path / "gateway_state.json").write_text(
+        json.dumps(fields), encoding="utf-8"
+    )
+
+
+def test_restart_timeout_does_not_terminate_when_subprocess_became_gateway(monkeypatch, tmp_path):
+    """#6730: single-container `hermes gateway restart` becomes the gateway
+    itself (no service manager). The 240s background-wait timeout must NOT
+    SIGTERM it — that killed the healthy replacement gateway and dropped every
+    active session/SSE stream."""
+    gateway_restart._GATEWAY_RESTART_LOCK = threading.Lock()
+    proc = _became_gateway_proc(tmp_path)
+    _write_gateway_state(tmp_path, gateway_state="running", pid=proc.pid)
+
+    monkeypatch.setattr(gateway_restart, "get_active_hermes_home", lambda: str(tmp_path))
+    monkeypatch.setattr(gateway_restart.shutil, "which", lambda cmd: "/mock/bin/hermes")
+    monkeypatch.setattr(gateway_restart.subprocess, "Popen", lambda *args, **kwargs: proc)
+    monkeypatch.setattr(gateway_restart.threading, "Thread", InlineThread)
+
+    result = gateway_restart.restart_active_profile_gateway()
+
+    assert result["status"] == "in_progress"
+    # The subprocess IS the gateway: it must be left running, not terminated.
+    assert proc.terminated is False
+    assert proc.killed is False
+    # Lock still released so the next Restart Service click is not blocked.
+    assert gateway_restart._GATEWAY_RESTART_LOCK.locked() is False
+
+
+def test_restart_timeout_still_terminates_when_subprocess_is_not_gateway(monkeypatch, tmp_path):
+    """Fail closed: without a gateway_state.json naming this subprocess PID,
+    the old terminate-on-timeout behaviour must be preserved."""
+    gateway_restart._GATEWAY_RESTART_LOCK = threading.Lock()
+    proc = _became_gateway_proc(tmp_path)
+    # No gateway_state.json written: unverifiable -> terminate.
+
+    monkeypatch.setattr(gateway_restart, "get_active_hermes_home", lambda: str(tmp_path))
+    monkeypatch.setattr(gateway_restart.shutil, "which", lambda cmd: "/mock/bin/hermes")
+    monkeypatch.setattr(gateway_restart.subprocess, "Popen", lambda *args, **kwargs: proc)
+    monkeypatch.setattr(gateway_restart.threading, "Thread", InlineThread)
+
+    result = gateway_restart.restart_active_profile_gateway()
+
+    assert result["status"] == "in_progress"
+    assert proc.terminated is True
+    assert gateway_restart._GATEWAY_RESTART_LOCK.locked() is False
+
+
+def test_subprocess_became_gateway_true_for_matching_running_record(tmp_path):
+    _write_gateway_state(tmp_path, gateway_state="running", pid=4242)
+    proc = MockPopen(["/mock/bin/hermes", "gateway", "restart"], pid=4242)
+    assert gateway_restart._subprocess_became_gateway(proc, tmp_path) is True
+
+
+def test_subprocess_became_gateway_false_on_pid_mismatch(tmp_path):
+    _write_gateway_state(tmp_path, gateway_state="running", pid=999)
+    proc = MockPopen(["/mock/bin/hermes", "gateway", "restart"], pid=4242)
+    assert gateway_restart._subprocess_became_gateway(proc, tmp_path) is False
+
+
+def test_subprocess_became_gateway_false_on_stopped_state(tmp_path):
+    _write_gateway_state(tmp_path, gateway_state="stopped", pid=4242)
+    proc = MockPopen(["/mock/bin/hermes", "gateway", "restart"], pid=4242)
+    assert gateway_restart._subprocess_became_gateway(proc, tmp_path) is False
+
+
+def test_subprocess_became_gateway_false_on_missing_state_file(tmp_path):
+    proc = MockPopen(["/mock/bin/hermes", "gateway", "restart"], pid=4242)
+    assert gateway_restart._subprocess_became_gateway(proc, tmp_path) is False
 
 
 def test_restart_active_profile_gateway_busy_reports_contention(monkeypatch):

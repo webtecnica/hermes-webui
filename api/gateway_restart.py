@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -21,6 +22,11 @@ from api.profiles import (
 logger = logging.getLogger(__name__)
 
 _GATEWAY_RESTART_LOCK = threading.Lock()
+
+# Name of the gateway's persisted runtime status file, written by the gateway
+# process itself (gateway/status.py) into the HERMES_HOME it was launched with.
+# The record carries the gateway's own PID under the "pid" key.
+_GATEWAY_RUNTIME_STATUS_FILE = "gateway_state.json"
 
 
 def _resolve_hermes_command() -> str:
@@ -50,6 +56,42 @@ def _release_lock() -> None:
     except RuntimeError:
         # The lock may already have been released by another path.
         pass
+
+
+def _subprocess_became_gateway(proc: subprocess.Popen, hermes_home: Path) -> bool:
+    """Return True when the restart subprocess has itself become the gateway.
+
+    Single-container deployments have no service manager, so ``hermes gateway
+    restart`` falls through to ``run_gateway()`` and the CLI process becomes
+    the gateway itself: it binds the API-server port and never exits (#6730).
+    The gateway writes ``gateway_state.json`` into the HERMES_HOME it was
+    launched with (the same ``hermes_home`` we put on the subprocess env),
+    recording its own PID under the ``pid`` key.  When that recorded PID
+    equals the subprocess PID and the gateway self-reports as running, the
+    timeout means "restart succeeded and this process IS the gateway", not
+    "restart hung" — terminating it would SIGTERM the healthy replacement.
+
+    Any unverifiable input fails closed (returns False), preserving the
+    previous terminate-on-timeout behaviour for genuinely hung restarts.
+    """
+    try:
+        proc_pid = int(proc.pid)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    try:
+        runtime_status = json.loads(
+            (hermes_home / _GATEWAY_RUNTIME_STATUS_FILE).read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(runtime_status, dict):
+        return False
+    if runtime_status.get("gateway_state") not in ("running", "starting"):
+        return False
+    try:
+        return int(runtime_status.get("pid")) == proc_pid
+    except (TypeError, ValueError):
+        return False
 
 
 def _gateway_restart_profile_context(profile: str | None = None) -> tuple[Path, str | None]:
@@ -160,6 +202,20 @@ def restart_active_profile_gateway(
                 try:
                     proc.wait(timeout=background_wait_seconds)
                 except subprocess.TimeoutExpired:
+                    if _subprocess_became_gateway(proc, active_home):
+                        # Single-container image: no service manager, so the
+                        # restart CLI became the gateway itself. Killing it
+                        # would SIGTERM the healthy replacement and drop every
+                        # active session/SSE stream (#6730). Treat the timeout
+                        # as success: release the lock and leave it running.
+                        logger.warning(
+                            "Gateway restart process timed out after %.1fs but the "
+                            "subprocess has become the gateway itself (PID %s owns "
+                            "gateway_state.json); leaving it running.",
+                            background_wait_seconds,
+                            proc.pid,
+                        )
+                        return
                     logger.error(
                         "Gateway restart process timed out after %.1fs. Terminating process.",
                         background_wait_seconds,
