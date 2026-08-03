@@ -9,6 +9,8 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
+from datetime import datetime
 from pathlib import Path
 
 from api.profiles import (
@@ -25,8 +27,15 @@ _GATEWAY_RESTART_LOCK = threading.Lock()
 
 # Name of the gateway's persisted runtime status file, written by the gateway
 # process itself (gateway/status.py) into the HERMES_HOME it was launched with.
-# The record carries the gateway's own PID under the "pid" key.
+# The record carries the gateway's own PID under the "pid" key and a
+# timezone-aware ISO-8601 "updated_at" timestamp.
 _GATEWAY_RUNTIME_STATUS_FILE = "gateway_state.json"
+
+# Canonical gateway PID file, written by the gateway alongside the runtime
+# status record. Used to cross-check that the PID recorded in
+# ``gateway_state.json`` belongs to the current gateway generation rather than
+# a stale record whose PID was later reused by an unrelated process.
+_GATEWAY_PID_FILE = "gateway.pid"
 
 
 def _resolve_hermes_command() -> str:
@@ -58,7 +67,33 @@ def _release_lock() -> None:
         pass
 
 
-def _subprocess_became_gateway(proc: subprocess.Popen, hermes_home: Path) -> bool:
+def _record_updated_at_epoch(runtime_status: dict) -> float | None:
+    """Return the record's ``updated_at`` as epoch seconds, or ``None`` when
+    missing or unparseable.
+
+    The gateway writes a timezone-aware ISO-8601 timestamp (the same format
+    ``gateway/status.py`` uses and ``api/agent_health.py`` already parses).
+    Naive or unparseable timestamps are refused — they cannot prove the record
+    belongs to the current gateway generation, so the caller must fail closed.
+    """
+    raw_updated_at = runtime_status.get("updated_at")
+    if not isinstance(raw_updated_at, str) or not raw_updated_at:
+        return None
+    try:
+        updated_at = datetime.fromisoformat(raw_updated_at)
+    except (TypeError, ValueError):
+        return None
+    if updated_at.tzinfo is None:
+        return None
+    return updated_at.timestamp()
+
+
+def _subprocess_became_gateway(
+    proc: subprocess.Popen,
+    hermes_home: Path,
+    *,
+    proc_started_at: float | None = None,
+) -> bool:
     """Return True when the restart subprocess has itself become the gateway.
 
     Single-container deployments have no service manager, so ``hermes gateway
@@ -67,9 +102,20 @@ def _subprocess_became_gateway(proc: subprocess.Popen, hermes_home: Path) -> boo
     The gateway writes ``gateway_state.json`` into the HERMES_HOME it was
     launched with (the same ``hermes_home`` we put on the subprocess env),
     recording its own PID under the ``pid`` key.  When that recorded PID
-    equals the subprocess PID and the gateway self-reports as running, the
+    equals the subprocess PID and the gateway self-reports as **running**, the
     timeout means "restart succeeded and this process IS the gateway", not
     "restart hung" — terminating it would SIGTERM the healthy replacement.
+
+    The exemption is deliberately narrow.  The gateway writes ``starting``
+    *before* potentially-blocking plugin/MCP/platform initialization and only
+    flips to ``running`` once fully up, so a ``starting`` record may be a
+    restart child wedged during startup and must still fall through to the
+    240s cleanup + terminate.  Raw PID equality alone also cannot prove
+    process generation: a stale record from a previous gateway generation
+    whose PID was later reused would falsely match.  The PID is therefore
+    validated against canonical metadata — the record must postdate the
+    restart subprocess (``proc_started_at`` start-time proof) and, when the
+    canonical ``gateway.pid`` file is present, must agree with it.
 
     Any unverifiable input fails closed (returns False), preserving the
     previous terminate-on-timeout behaviour for genuinely hung restarts.
@@ -86,12 +132,35 @@ def _subprocess_became_gateway(proc: subprocess.Popen, hermes_home: Path) -> boo
         return False
     if not isinstance(runtime_status, dict):
         return False
-    if runtime_status.get("gateway_state") not in ("running", "starting"):
+    # Only a CONFIRMED running gateway is exempt.  A ``starting`` record is
+    # not proof the child finished initializing — it may be wedged mid-startup.
+    if runtime_status.get("gateway_state") != "running":
         return False
     try:
-        return int(runtime_status.get("pid")) == proc_pid
+        recorded_pid = int(runtime_status.get("pid"))
     except (TypeError, ValueError):
         return False
+    if recorded_pid != proc_pid:
+        return False
+    # Generation proof via start-time metadata: a record written before the
+    # restart subprocess was spawned belongs to a previous gateway generation
+    # (stale record).  With PID reuse it would falsely match the raw equality.
+    if proc_started_at is not None:
+        record_time = _record_updated_at_epoch(runtime_status)
+        if record_time is None or record_time < proc_started_at:
+            return False
+    # Cross-check the recorded PID against the canonical ``gateway.pid`` file
+    # when present.  A mismatching or unreadable pid file means the record is
+    # not the current gateway generation -> fail closed.
+    try:
+        pid_file = hermes_home / _GATEWAY_PID_FILE
+        if pid_file.exists():
+            canonical_pid = int(pid_file.read_text(encoding="utf-8").strip())
+            if canonical_pid != recorded_pid:
+                return False
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 def _gateway_restart_profile_context(profile: str | None = None) -> tuple[Path, str | None]:
@@ -166,6 +235,10 @@ def restart_active_profile_gateway(
             text=True,
             env=env,
         )
+        # Spawn moment of the restart child.  Used as the generation boundary
+        # for the terminate-exemption: only a gateway_state.json record written
+        # AFTER this instant can belong to this subprocess generation.
+        proc_started_at = time.time()
 
         try:
             stdout, stderr = proc.communicate(timeout=quick_timeout_seconds)
@@ -202,7 +275,9 @@ def restart_active_profile_gateway(
                 try:
                     proc.wait(timeout=background_wait_seconds)
                 except subprocess.TimeoutExpired:
-                    if _subprocess_became_gateway(proc, active_home):
+                    if _subprocess_became_gateway(
+                        proc, active_home, proc_started_at=proc_started_at
+                    ):
                         # Single-container image: no service manager, so the
                         # restart CLI became the gateway itself. Killing it
                         # would SIGTERM the healthy replacement and drop every

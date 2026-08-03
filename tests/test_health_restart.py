@@ -4,7 +4,9 @@ import io
 import json
 import subprocess
 import threading
+import time
 import types
+from datetime import datetime, timedelta, timezone
 
 import api.gateway_restart as gateway_restart
 import api.routes as routes
@@ -257,14 +259,27 @@ def _write_gateway_state(tmp_path, **fields):
     )
 
 
+def _future_timestamp() -> str:
+    """A timezone-aware ``updated_at`` guaranteed to postdate any subprocess
+    spawned during the test (matches what a gateway that became the restart
+    child would write after finishing initialization)."""
+    return (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+
+
 def test_restart_timeout_does_not_terminate_when_subprocess_became_gateway(monkeypatch, tmp_path):
     """#6730: single-container `hermes gateway restart` becomes the gateway
     itself (no service manager). The 240s background-wait timeout must NOT
     SIGTERM it — that killed the healthy replacement gateway and dropped every
-    active session/SSE stream."""
+    active session/SSE stream.  Exemption requires a confirmed ``running``
+    record that postdates the restart subprocess and names its PID."""
     gateway_restart._GATEWAY_RESTART_LOCK = threading.Lock()
     proc = _became_gateway_proc(tmp_path)
-    _write_gateway_state(tmp_path, gateway_state="running", pid=proc.pid)
+    _write_gateway_state(
+        tmp_path,
+        gateway_state="running",
+        pid=proc.pid,
+        updated_at=_future_timestamp(),
+    )
 
     monkeypatch.setattr(gateway_restart, "get_active_hermes_home", lambda: str(tmp_path))
     monkeypatch.setattr(gateway_restart.shutil, "which", lambda cmd: "/mock/bin/hermes")
@@ -300,6 +315,65 @@ def test_restart_timeout_still_terminates_when_subprocess_is_not_gateway(monkeyp
     assert gateway_restart._GATEWAY_RESTART_LOCK.locked() is False
 
 
+def test_restart_timeout_still_terminates_for_same_pid_starting_record(monkeypatch, tmp_path):
+    """CHANGES_REQUESTED (#6733): the gateway writes ``starting`` BEFORE
+    potentially-blocking plugin/MCP/platform initialization.  A restart child
+    wedged during startup therefore matches a same-PID ``starting`` record —
+    the termination exemption must NOT apply, and the 240s cleanup must still
+    terminate it (the old code exempted ``starting`` and leaked the process)."""
+    gateway_restart._GATEWAY_RESTART_LOCK = threading.Lock()
+    proc = _became_gateway_proc(tmp_path)
+    # Same PID, fresh timestamp — only the ``starting`` state blocks the
+    # exemption, isolating the state gate from the generation gate.
+    _write_gateway_state(
+        tmp_path,
+        gateway_state="starting",
+        pid=proc.pid,
+        updated_at=_future_timestamp(),
+    )
+
+    monkeypatch.setattr(gateway_restart, "get_active_hermes_home", lambda: str(tmp_path))
+    monkeypatch.setattr(gateway_restart.shutil, "which", lambda cmd: "/mock/bin/hermes")
+    monkeypatch.setattr(gateway_restart.subprocess, "Popen", lambda *args, **kwargs: proc)
+    monkeypatch.setattr(gateway_restart.threading, "Thread", InlineThread)
+
+    result = gateway_restart.restart_active_profile_gateway()
+
+    assert result["status"] == "in_progress"
+    assert proc.terminated is True
+    assert gateway_restart._GATEWAY_RESTART_LOCK.locked() is False
+
+
+def test_restart_timeout_still_terminates_for_stale_generation_record(monkeypatch, tmp_path):
+    """CHANGES_REQUESTED (#6733): a ``running`` record whose ``updated_at``
+    predates the restart subprocess belongs to a previous gateway generation.
+    With PID reuse such a stale record can falsely match raw PID equality —
+    the record must postdate the subprocess spawn, otherwise the genuinely
+    stuck child is terminated instead of exempted."""
+    gateway_restart._GATEWAY_RESTART_LOCK = threading.Lock()
+    proc = _became_gateway_proc(tmp_path)
+    stale_updated_at = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+    # Same PID, ``running`` state — only the stale generation blocks the
+    # exemption, isolating the generation gate from the state gate.
+    _write_gateway_state(
+        tmp_path,
+        gateway_state="running",
+        pid=proc.pid,
+        updated_at=stale_updated_at,
+    )
+
+    monkeypatch.setattr(gateway_restart, "get_active_hermes_home", lambda: str(tmp_path))
+    monkeypatch.setattr(gateway_restart.shutil, "which", lambda cmd: "/mock/bin/hermes")
+    monkeypatch.setattr(gateway_restart.subprocess, "Popen", lambda *args, **kwargs: proc)
+    monkeypatch.setattr(gateway_restart.threading, "Thread", InlineThread)
+
+    result = gateway_restart.restart_active_profile_gateway()
+
+    assert result["status"] == "in_progress"
+    assert proc.terminated is True
+    assert gateway_restart._GATEWAY_RESTART_LOCK.locked() is False
+
+
 def test_subprocess_became_gateway_true_for_matching_running_record(tmp_path):
     _write_gateway_state(tmp_path, gateway_state="running", pid=4242)
     proc = MockPopen(["/mock/bin/hermes", "gateway", "restart"], pid=4242)
@@ -310,6 +384,45 @@ def test_subprocess_became_gateway_false_on_pid_mismatch(tmp_path):
     _write_gateway_state(tmp_path, gateway_state="running", pid=999)
     proc = MockPopen(["/mock/bin/hermes", "gateway", "restart"], pid=4242)
     assert gateway_restart._subprocess_became_gateway(proc, tmp_path) is False
+
+
+def test_subprocess_became_gateway_false_when_canonical_pid_file_mismatches(tmp_path):
+    """CHANGES_REQUESTED (#6733): the recorded PID must agree with the
+    canonical ``gateway.pid`` file when present.  A mismatch means the record
+    is not the current gateway generation — fail closed."""
+    _write_gateway_state(
+        tmp_path,
+        gateway_state="running",
+        pid=4242,
+        updated_at=_future_timestamp(),
+    )
+    (tmp_path / "gateway.pid").write_text("7777", encoding="utf-8")
+    proc = MockPopen(["/mock/bin/hermes", "gateway", "restart"], pid=4242)
+    assert (
+        gateway_restart._subprocess_became_gateway(
+            proc, tmp_path, proc_started_at=time.time() - 60
+        )
+        is False
+    )
+
+
+def test_subprocess_became_gateway_true_when_canonical_pid_file_matches(tmp_path):
+    """A ``running`` record that postdates the subprocess AND agrees with the
+    canonical ``gateway.pid`` file is the current generation — exempt."""
+    _write_gateway_state(
+        tmp_path,
+        gateway_state="running",
+        pid=4242,
+        updated_at=_future_timestamp(),
+    )
+    (tmp_path / "gateway.pid").write_text("4242", encoding="utf-8")
+    proc = MockPopen(["/mock/bin/hermes", "gateway", "restart"], pid=4242)
+    assert (
+        gateway_restart._subprocess_became_gateway(
+            proc, tmp_path, proc_started_at=time.time() - 60
+        )
+        is True
+    )
 
 
 def test_subprocess_became_gateway_false_on_stopped_state(tmp_path):
