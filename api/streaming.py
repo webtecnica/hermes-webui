@@ -7813,6 +7813,11 @@ def _materialize_pending_user_turn_before_error(
         recovered_ts = int(pending_started_at)
     pending_source = getattr(session, 'pending_user_source', None) or 'webui'
     pending_attachments = list(getattr(session, 'pending_attachments', None) or [])
+    # Authoritative per-turn identity (#6407): the pending turn's stream id.
+    # Same legacy/fail-safe policy as _message_matches_pending_checkpoint
+    # callers — prefer the explicit pending_turn_id, fall back to the active
+    # stream id for sessions started before that field existed.
+    pending_turn_id = getattr(session, 'pending_turn_id', None) or getattr(session, 'active_stream_id', None)
 
     # A returned Agent result is settled into ``session.messages`` before its
     # terminal classification runs.  In that path the current user row can
@@ -7857,6 +7862,13 @@ def _materialize_pending_user_turn_before_error(
         existing = messages[-1]
         if not isinstance(existing, dict) or existing.get('role') != 'user':
             return False
+        # Per-turn turn_id collision protection (#6407), mirroring
+        # _message_matches_pending_checkpoint: when BOTH sides carry a turn id,
+        # require an exact match; when either side lacks one (migration
+        # scenario), fall through to the fingerprint checks below.
+        existing_turn_id = existing.get('_turn_id')
+        if pending_turn_id and existing_turn_id and str(existing_turn_id) != str(pending_turn_id):
+            return False
         existing_source = existing.get('_source') or 'webui'
         try:
             existing_ts = int(existing.get('timestamp'))
@@ -7879,6 +7891,8 @@ def _materialize_pending_user_turn_before_error(
     }
     if str(pending_source or '').strip().lower() == 'fork':
         recovered['_fork_child_turn'] = session.session_id
+    if pending_turn_id:
+        recovered['_turn_id'] = pending_turn_id
     stamp_message_source(recovered, pending_source)
     if pending_attachments:
         recovered['attachments'] = pending_attachments
