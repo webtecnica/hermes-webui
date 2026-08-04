@@ -9636,8 +9636,7 @@ _SETTINGS_DEFAULTS = {
     "hide_empty_state_suggestions": False,  # hide the default new-chat suggestion buttons
     "hide_empty_state_panel": False,  # hide the complete new-chat welcome panel
     "new_chat_on_workspace_switch": False,  # #5473 opt-in: switching to a DIFFERENT workspace starts a new chat (leaving the current conversation on its original workspace) instead of mutating the current session's workspace in place. Default OFF preserves the shipped in-place-switch behavior.
-    "virtualize_transcript": False,  # #4343: virtualize long (>80 msg) transcripts. EXPERIMENTAL, opt-IN (default OFF). Was opt-out/default-on in #4325 but caused scroll-up flicker on long sessions with tall tool-call rows (variable-height anchor oscillation) — flipped off for everyone in #4343; re-enabling requires an explicit opt-in (see virtualize_transcript_optin migration in load_settings).
-    "virtualize_transcript_optin": False,  # #4343 migration marker: True only once the user explicitly enables virtualize_transcript AFTER the default-off flip. A stored virtualize_transcript=True WITHOUT this marker is a stale pre-flip value and is reset to False on load (force-off-for-everyone migration).
+    "virtualize_transcript": True,  # #6151: virtualize long (>80 msg) transcripts. DOM virtualization is ON by default after the #4346 Phase B footer-jitter fix resolved the scroll-up flicker root cause that forced #4343 to flip it OFF. Users can opt out via Settings (a stored False is honored on load).
     "show_tps": False,  # show tokens-per-second chip in assistant message headers
     "fade_text_effect": False,  # animate newly streamed words with a lightweight fade-in effect
     "show_cli_sessions": True,  # merge CLI/TUI/messaging sessions from state.db into the sidebar by default (#3988); established installs are grandfathered OFF by the load_settings backfill
@@ -9897,38 +9896,13 @@ def load_settings() -> dict:
             bool(stored.get("onboarding_completed")) or _established_keys
         ):
             settings["show_cli_sessions"] = False
-        # Force-off-for-everyone migration for virtualize_transcript (#4343).
-        # The feature shipped opt-OUT/default-on in #4325, then proved to
-        # cause scroll-up flicker on long sessions (variable-height anchor
-        # oscillation). It is now EXPERIMENTAL/opt-IN (default off). Any
-        # stored virtualize_transcript=True from the #4325 window is a stale
-        # pre-flip value and must be reset to off, so 100% of existing users
-        # land on off — re-enabling requires an explicit opt-in made AFTER
-        # the flip, which writes virtualize_transcript_optin=True alongside.
-        # Honor a stored True only when that marker is present.
-        if not bool(stored.get("virtualize_transcript_optin")):
-            settings["virtualize_transcript"] = False
-    # Fall back to the DEFAULTS, not to None, when nothing is stored.
-    #
-    # `_read_raw_settings_file()` returns {} for a MISSING settings.json, and {}
-    # is a dict — so the `isinstance(stored, dict)` arms were always taken,
-    # `stored.get("theme")` was None, and `_normalize_appearance(None, None)`
-    # fell through to its unknown-theme branch and returned ("dark", "default").
-    # `_SETTINGS_DEFAULTS["theme"]` / `["skin"]` were therefore unreachable for
-    # the one case they exist to serve: a user with no settings file yet.
-    #
-    # This is invisible on stock defaults, because dark/default is exactly what
-    # the fallback produces — the two paths agree. It only surfaces once the
-    # defaults are changed, at which point the dict silently does nothing.
-    #
-    # Gate on the PAIR, not per field. A per-field `or settings.get(...)` looks
-    # equivalent and is not: with a stored legacy theme and no skin, `slate`
-    # normalises to ("dark", "slate"), but per-field fallback injects the
-    # default skin and yields ("dark", "default") — silently destroying the
-    # legacy migration. Same distinction the boot script draws in #6808.
-    _has_stored_appearance = isinstance(stored, dict) and (
-        "theme" in stored or "skin" in stored
-    )
+        # #6151: no force-off migration for virtualize_transcript. The #4343
+        # force-off-for-everyone flip is reverted — DOM virtualization is the
+        # default again (#4346 Phase B resolved the scroll flicker). The
+        # defaults merge above already honors a stored False (explicit opt-out)
+        # and a stored True (matches the new default), so no reset is needed.
+        # A stale `virtualize_transcript_optin` marker from the #4343 era is
+        # dropped on load via _SETTINGS_LEGACY_DROP_KEYS (never re-persisted).
     settings["theme"], settings["skin"] = _normalize_appearance(
         stored.get("theme") if _has_stored_appearance else settings.get("theme"),
         stored.get("skin") if _has_stored_appearance else settings.get("skin"),
@@ -9982,7 +9956,6 @@ _SETTINGS_BOOL_KEYS = {
     "hide_empty_state_panel",
     "new_chat_on_workspace_switch",
     "virtualize_transcript",
-    "virtualize_transcript_optin",
     "show_tps",
     "fade_text_effect",
     "show_cli_sessions",
