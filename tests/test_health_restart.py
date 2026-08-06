@@ -396,7 +396,11 @@ def test_subprocess_became_gateway_false_when_canonical_pid_file_mismatches(tmp_
         pid=4242,
         updated_at=_future_timestamp(),
     )
-    (tmp_path / "gateway.pid").write_text("7777", encoding="utf-8")
+    # Hermes writes gateway.pid as a JSON object, not a plain integer.
+    (tmp_path / "gateway.pid").write_text(
+        json.dumps({"pid": 7777, "started_at": "2026-08-03T20:00:00+00:00"}),
+        encoding="utf-8",
+    )
     proc = MockPopen(["/mock/bin/hermes", "gateway", "restart"], pid=4242)
     assert (
         gateway_restart._subprocess_became_gateway(
@@ -408,7 +412,29 @@ def test_subprocess_became_gateway_false_when_canonical_pid_file_mismatches(tmp_
 
 def test_subprocess_became_gateway_true_when_canonical_pid_file_matches(tmp_path):
     """A ``running`` record that postdates the subprocess AND agrees with the
-    canonical ``gateway.pid`` file is the current generation — exempt."""
+    canonical ``gateway.pid`` file is the current generation — exempt.  Uses
+    the real JSON-object shape Hermes writes (``{"pid": 4242, ...}``)."""
+    _write_gateway_state(
+        tmp_path,
+        gateway_state="running",
+        pid=4242,
+        updated_at=_future_timestamp(),
+    )
+    (tmp_path / "gateway.pid").write_text(
+        json.dumps({"pid": 4242, "started_at": "2026-08-03T20:00:00+00:00"}),
+        encoding="utf-8",
+    )
+    proc = MockPopen(["/mock/bin/hermes", "gateway", "restart"], pid=4242)
+    assert (
+        gateway_restart._subprocess_became_gateway(
+            proc, tmp_path, proc_started_at=time.time() - 60
+        )
+        is True
+    )
+
+
+def test_subprocess_became_gateway_true_with_legacy_plain_integer_pid_file(tmp_path):
+    """A legacy plain-integer ``gateway.pid`` (``"4242"``) is still accepted."""
     _write_gateway_state(
         tmp_path,
         gateway_state="running",
@@ -423,6 +449,92 @@ def test_subprocess_became_gateway_true_when_canonical_pid_file_matches(tmp_path
         )
         is True
     )
+
+
+def test_subprocess_became_gateway_false_when_canonical_pid_file_pid_not_integer(tmp_path):
+    """CORE (#6733 re-gate): a non-integer ``pid`` in the canonical JSON
+    ``gateway.pid`` file (string/float) must fail closed, never exempt."""
+    proc = MockPopen(["/mock/bin/hermes", "gateway", "restart"], pid=4242)
+    for bad_pid in ("4242", 4242.9, True):
+        _write_gateway_state(
+            tmp_path,
+            gateway_state="running",
+            pid=4242,
+            updated_at=_future_timestamp(),
+        )
+        (tmp_path / "gateway.pid").write_text(
+            json.dumps({"pid": bad_pid}), encoding="utf-8"
+        )
+        assert (
+            gateway_restart._subprocess_became_gateway(
+                proc, tmp_path, proc_started_at=time.time() - 60
+            )
+            is False
+        ), f"canonical pid {bad_pid!r} must fail closed"
+
+
+def test_subprocess_became_gateway_false_when_canonical_pid_file_invalid_json(tmp_path):
+    """CORE (#6733 re-gate): an unreadable/non-JSON/non-integer ``gateway.pid``
+    must fail closed (the old ``int()``-on-raw-file parse raised and killed the
+    healthy replacement)."""
+    _write_gateway_state(
+        tmp_path,
+        gateway_state="running",
+        pid=4242,
+        updated_at=_future_timestamp(),
+    )
+    (tmp_path / "gateway.pid").write_text("not-a-pid", encoding="utf-8")
+    proc = MockPopen(["/mock/bin/hermes", "gateway", "restart"], pid=4242)
+    assert (
+        gateway_restart._subprocess_became_gateway(
+            proc, tmp_path, proc_started_at=time.time() - 60
+        )
+        is False
+    )
+
+
+def test_subprocess_became_gateway_false_on_non_integer_runtime_pid(tmp_path):
+    """CORE (#6733 re-gate): a string/float PID in ``gateway_state.json`` must
+    fail closed.  ``int()`` accepted ``"4242"`` and truncated ``4242.9``, so
+    with no canonical pid file a genuinely hung child was exempted."""
+    proc = MockPopen(["/mock/bin/hermes", "gateway", "restart"], pid=4242)
+    for bad_pid in ("4242", 4242.9, True):
+        _write_gateway_state(tmp_path, gateway_state="running", pid=bad_pid)
+        assert (
+            gateway_restart._subprocess_became_gateway(proc, tmp_path) is False
+        ), f"runtime pid {bad_pid!r} must fail closed"
+
+
+def test_restart_timeout_exempts_child_that_wrote_state_during_popen(monkeypatch, tmp_path):
+    """CORE (#6733 re-gate): ``proc_started_at`` must be captured BEFORE
+    ``Popen``.  A fast-starting child can write its ``running`` record while
+    the parent is still inside ``Popen``; a post-Popen capture makes that
+    fresh record look older than the spawn moment and the healthy replacement
+    is terminated.  The pre-Popen capture keeps the exemption intact."""
+    gateway_restart._GATEWAY_RESTART_LOCK = threading.Lock()
+    proc = _became_gateway_proc(tmp_path)
+
+    def _popen_writes_state(*args, **kwargs):
+        # The child writes its running record before Popen returns control to
+        # the parent (i.e. before any post-Popen proc_started_at capture).
+        _write_gateway_state(
+            tmp_path,
+            gateway_state="running",
+            pid=proc.pid,
+            updated_at=datetime.now(timezone.utc).isoformat(),
+        )
+        return proc
+
+    monkeypatch.setattr(gateway_restart, "get_active_hermes_home", lambda: str(tmp_path))
+    monkeypatch.setattr(gateway_restart.shutil, "which", lambda cmd: "/mock/bin/hermes")
+    monkeypatch.setattr(gateway_restart.subprocess, "Popen", _popen_writes_state)
+    monkeypatch.setattr(gateway_restart.threading, "Thread", InlineThread)
+
+    result = gateway_restart.restart_active_profile_gateway()
+
+    assert result["status"] == "in_progress"
+    assert proc.terminated is False
+    assert gateway_restart._GATEWAY_RESTART_LOCK.locked() is False
 
 
 def test_subprocess_became_gateway_false_on_stopped_state(tmp_path):
