@@ -32,9 +32,10 @@ _GATEWAY_RESTART_LOCK = threading.Lock()
 _GATEWAY_RUNTIME_STATUS_FILE = "gateway_state.json"
 
 # Canonical gateway PID file, written by the gateway alongside the runtime
-# status record. Used to cross-check that the PID recorded in
-# ``gateway_state.json`` belongs to the current gateway generation rather than
-# a stale record whose PID was later reused by an unrelated process.
+# status record as a JSON object (``{"pid": 4242, ...}``). Used to cross-check
+# that the PID recorded in ``gateway_state.json`` belongs to the current
+# gateway generation rather than a stale record whose PID was later reused by
+# an unrelated process.
 _GATEWAY_PID_FILE = "gateway.pid"
 
 
@@ -88,6 +89,41 @@ def _record_updated_at_epoch(runtime_status: dict) -> float | None:
     return updated_at.timestamp()
 
 
+def _read_canonical_gateway_pid(pid_file: Path) -> int | None:
+    """Return the canonical gateway PID from a ``gateway.pid`` file, or None.
+
+    Hermes writes ``gateway.pid`` as a JSON object (``{"pid": 4242, ...}``),
+    so the file must be JSON-decoded and its ``pid`` member extracted.  A
+    legacy top-level bare integer (``"4242"``) is still accepted.  Anything
+    else — missing/invalid ``pid`` member, string/float/bool value, or
+    unreadable content — returns None so callers fail closed.  ``int()`` is
+    never used to coerce, because it would accept ``"4242"`` and truncate
+    ``4242.9``, misclassifying a stuck child as the healthy gateway.
+    """
+    try:
+        raw = pid_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        # Legacy plain-integer file (e.g. "4242").
+        try:
+            value = int(raw)
+        except ValueError:
+            return None
+        return value if type(value) is int else None
+    if isinstance(payload, dict):
+        pid = payload.get("pid")
+    else:
+        pid = payload
+    if type(pid) is not int:
+        return None
+    return pid
+
+
 def _subprocess_became_gateway(
     proc: subprocess.Popen,
     hermes_home: Path,
@@ -113,9 +149,11 @@ def _subprocess_became_gateway(
     240s cleanup + terminate.  Raw PID equality alone also cannot prove
     process generation: a stale record from a previous gateway generation
     whose PID was later reused would falsely match.  The PID is therefore
-    validated against canonical metadata — the record must postdate the
-    restart subprocess (``proc_started_at`` start-time proof) and, when the
-    canonical ``gateway.pid`` file is present, must agree with it.
+    validated against canonical metadata — both PID values must be real
+    integers (no ``int()`` coercion, so string/float PIDs fail closed), the
+    record must postdate the restart subprocess (``proc_started_at``
+    start-time proof), and, when the canonical ``gateway.pid`` file is
+    present, the recorded PID must agree with the JSON-decoded value.
 
     Any unverifiable input fails closed (returns False), preserving the
     previous terminate-on-timeout behaviour for genuinely hung restarts.
@@ -136,9 +174,11 @@ def _subprocess_became_gateway(
     # not proof the child finished initializing — it may be wedged mid-startup.
     if runtime_status.get("gateway_state") != "running":
         return False
-    try:
-        recorded_pid = int(runtime_status.get("pid"))
-    except (TypeError, ValueError):
+    # Strict integer PID: ``int()`` would accept "4242" and truncate 4242.9,
+    # failing open (exempting a stuck child) when the canonical pid file is
+    # absent.  Only a genuine int can prove identity.
+    recorded_pid = runtime_status.get("pid")
+    if type(recorded_pid) is not int:
         return False
     if recorded_pid != proc_pid:
         return False
@@ -150,16 +190,13 @@ def _subprocess_became_gateway(
         if record_time is None or record_time < proc_started_at:
             return False
     # Cross-check the recorded PID against the canonical ``gateway.pid`` file
-    # when present.  A mismatching or unreadable pid file means the record is
-    # not the current gateway generation -> fail closed.
-    try:
-        pid_file = hermes_home / _GATEWAY_PID_FILE
-        if pid_file.exists():
-            canonical_pid = int(pid_file.read_text(encoding="utf-8").strip())
-            if canonical_pid != recorded_pid:
-                return False
-    except (OSError, ValueError):
-        return False
+    # when present.  A mismatching, unreadable, or non-integer pid file means
+    # the record is not the current gateway generation -> fail closed.
+    pid_file = hermes_home / _GATEWAY_PID_FILE
+    if pid_file.exists():
+        canonical_pid = _read_canonical_gateway_pid(pid_file)
+        if canonical_pid is None or canonical_pid != recorded_pid:
+            return False
     return True
 
 
@@ -228,6 +265,14 @@ def restart_active_profile_gateway(
                 cli_profile,
                 active_home,
             )
+        # Spawn moment of the restart child.  Used as the generation boundary
+        # for the terminate-exemption: only a gateway_state.json record written
+        # AFTER this instant can belong to this subprocess generation.
+        # Captured BEFORE ``Popen``: a fast-starting child can write its
+        # ``running`` record while the parent is still inside ``Popen``, and a
+        # post-Popen capture would make that fresh record look older than the
+        # spawn moment, terminating the healthy replacement.
+        proc_started_at = time.time()
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -235,10 +280,6 @@ def restart_active_profile_gateway(
             text=True,
             env=env,
         )
-        # Spawn moment of the restart child.  Used as the generation boundary
-        # for the terminate-exemption: only a gateway_state.json record written
-        # AFTER this instant can belong to this subprocess generation.
-        proc_started_at = time.time()
 
         try:
             stdout, stderr = proc.communicate(timeout=quick_timeout_seconds)
