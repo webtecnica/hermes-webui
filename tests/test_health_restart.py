@@ -374,6 +374,60 @@ def test_restart_timeout_still_terminates_for_stale_generation_record(monkeypatc
     assert gateway_restart._GATEWAY_RESTART_LOCK.locked() is False
 
 
+def test_restart_timeout_still_terminates_when_canonical_pid_file_unreadable(monkeypatch, tmp_path):
+    """Re-gate (#6733): malformed canonical metadata must fail CLOSED.  The
+    old parse let ``UnicodeDecodeError`` escape ``_read_canonical_gateway_pid``,
+    so the background thread released ``_GATEWAY_RESTART_LOCK`` in its
+    ``finally`` but SKIPPED ``terminate()``/``kill()`` — a genuinely hung
+    restart child survived.  State + PID + generation all match here; only the
+    non-UTF-8 ``gateway.pid`` blocks the exemption, and the child must still
+    be terminated with the lock released."""
+    gateway_restart._GATEWAY_RESTART_LOCK = threading.Lock()
+    proc = _became_gateway_proc(tmp_path)
+    _write_gateway_state(
+        tmp_path,
+        gateway_state="running",
+        pid=proc.pid,
+        updated_at=_future_timestamp(),
+    )
+    (tmp_path / "gateway.pid").write_bytes(bytes([0xFF, 0xFE, 0x00, 0x01]) + b"binary-pid")
+
+    monkeypatch.setattr(gateway_restart, "get_active_hermes_home", lambda: str(tmp_path))
+    monkeypatch.setattr(gateway_restart.shutil, "which", lambda cmd: "/mock/bin/hermes")
+    monkeypatch.setattr(gateway_restart.subprocess, "Popen", lambda *args, **kwargs: proc)
+    monkeypatch.setattr(gateway_restart.threading, "Thread", InlineThread)
+
+    result = gateway_restart.restart_active_profile_gateway()
+
+    assert result["status"] == "in_progress"
+    assert proc.terminated is True
+    assert gateway_restart._GATEWAY_RESTART_LOCK.locked() is False
+
+
+def test_restart_timeout_still_terminates_when_identity_verification_raises(monkeypatch, tmp_path):
+    """Re-gate (#6733): if ``_subprocess_became_gateway`` itself throws, the
+    call site must treat the exception as \"not confirmed\" and still run the
+    terminate/kill cleanup — a verifier exception must never skip the
+    timed-out child's termination."""
+    gateway_restart._GATEWAY_RESTART_LOCK = threading.Lock()
+    proc = _became_gateway_proc(tmp_path)
+
+    def _exploding_verifier(*args, **kwargs):
+        raise RuntimeError("verifier boom")
+
+    monkeypatch.setattr(gateway_restart, "_subprocess_became_gateway", _exploding_verifier)
+    monkeypatch.setattr(gateway_restart, "get_active_hermes_home", lambda: str(tmp_path))
+    monkeypatch.setattr(gateway_restart.shutil, "which", lambda cmd: "/mock/bin/hermes")
+    monkeypatch.setattr(gateway_restart.subprocess, "Popen", lambda *args, **kwargs: proc)
+    monkeypatch.setattr(gateway_restart.threading, "Thread", InlineThread)
+
+    result = gateway_restart.restart_active_profile_gateway()
+
+    assert result["status"] == "in_progress"
+    assert proc.terminated is True
+    assert gateway_restart._GATEWAY_RESTART_LOCK.locked() is False
+
+
 def test_subprocess_became_gateway_true_for_matching_running_record(tmp_path):
     _write_gateway_state(tmp_path, gateway_state="running", pid=4242)
     proc = MockPopen(["/mock/bin/hermes", "gateway", "restart"], pid=4242)
@@ -484,6 +538,47 @@ def test_subprocess_became_gateway_false_when_canonical_pid_file_invalid_json(tm
         updated_at=_future_timestamp(),
     )
     (tmp_path / "gateway.pid").write_text("not-a-pid", encoding="utf-8")
+    proc = MockPopen(["/mock/bin/hermes", "gateway", "restart"], pid=4242)
+    assert (
+        gateway_restart._subprocess_became_gateway(
+            proc, tmp_path, proc_started_at=time.time() - 60
+        )
+        is False
+    )
+
+
+def test_subprocess_became_gateway_false_when_canonical_pid_file_not_utf8(tmp_path):
+    """Re-gate (#6733): non-UTF-8 ``gateway.pid`` content must fail closed
+    instead of raising out of the verifier.  An escaping ``UnicodeDecodeError``
+    skipped the timed-out child's terminate cleanup (fail-open leak)."""
+    _write_gateway_state(
+        tmp_path,
+        gateway_state="running",
+        pid=4242,
+        updated_at=_future_timestamp(),
+    )
+    (tmp_path / "gateway.pid").write_bytes(bytes([0xFF, 0xFE, 0x00, 0x01]) + b"binary-pid")
+    proc = MockPopen(["/mock/bin/hermes", "gateway", "restart"], pid=4242)
+    assert (
+        gateway_restart._subprocess_became_gateway(
+            proc, tmp_path, proc_started_at=time.time() - 60
+        )
+        is False
+    )
+
+
+def test_subprocess_became_gateway_false_when_canonical_pid_file_oversized_integer(tmp_path):
+    """Re-gate (#6733): a ``gateway.pid`` whose integer exceeds the
+    interpreter's string-conversion digit limit raises ValueError from both
+    ``json.loads`` and ``int()``; the read must stay non-throwing and fail
+    closed rather than skipping the timed-out child's cleanup."""
+    _write_gateway_state(
+        tmp_path,
+        gateway_state="running",
+        pid=4242,
+        updated_at=_future_timestamp(),
+    )
+    (tmp_path / "gateway.pid").write_text("9" * 5000, encoding="utf-8")
     proc = MockPopen(["/mock/bin/hermes", "gateway", "restart"], pid=4242)
     assert (
         gateway_restart._subprocess_became_gateway(

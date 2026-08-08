@@ -95,21 +95,31 @@ def _read_canonical_gateway_pid(pid_file: Path) -> int | None:
     Hermes writes ``gateway.pid`` as a JSON object (``{"pid": 4242, ...}``),
     so the file must be JSON-decoded and its ``pid`` member extracted.  A
     legacy top-level bare integer (``"4242"``) is still accepted.  Anything
-    else — missing/invalid ``pid`` member, string/float/bool value, or
-    unreadable content — returns None so callers fail closed.  ``int()`` is
-    never used to coerce, because it would accept ``"4242"`` and truncate
-    ``4242.9``, misclassifying a stuck child as the healthy gateway.
+    else — missing/invalid ``pid`` member, string/float/bool value, unreadable
+    content, non-UTF-8 bytes, or unparseable JSON (including the Python 3.11+
+    integer-string conversion limit on oversized digit strings) — returns
+    None so callers fail closed.  The read/parse is deliberately
+    non-throwing: an escaping exception would propagate out of the
+    background restart thread and skip the timed-out child's terminate/kill
+    cleanup, leaking a genuinely hung restart child.  ``int()`` is never used
+    to coerce, because it would accept ``"4242"`` and truncate ``4242.9``,
+    misclassifying a stuck child as the healthy gateway.
     """
     try:
         raw = pid_file.read_text(encoding="utf-8").strip()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
+        # Missing/unreadable/non-UTF-8 file: cannot confirm the canonical PID.
         return None
     if not raw:
         return None
     try:
         payload = json.loads(raw)
-    except json.JSONDecodeError:
-        # Legacy plain-integer file (e.g. "4242").
+    except ValueError:
+        # Non-JSON content, or a JSON value json.loads refused (e.g. an
+        # oversized integer beyond the interpreter's digit-conversion limit).
+        # ``json.JSONDecodeError`` and ``UnicodeDecodeError`` are ValueError
+        # subclasses, so this also covers malformed JSON.  Fall back to a
+        # legacy plain-integer file (e.g. "4242").
         try:
             value = int(raw)
         except ValueError:
@@ -316,9 +326,21 @@ def restart_active_profile_gateway(
                 try:
                     proc.wait(timeout=background_wait_seconds)
                 except subprocess.TimeoutExpired:
-                    if _subprocess_became_gateway(
-                        proc, active_home, proc_started_at=proc_started_at
-                    ):
+                    try:
+                        became_gateway = _subprocess_became_gateway(
+                            proc, active_home, proc_started_at=proc_started_at
+                        )
+                    except Exception:
+                        # Fail closed: a verifier exception must never skip
+                        # termination.  If we cannot confirm the child IS the
+                        # healthy gateway, treat it as "not confirmed" and fall
+                        # through to the terminate/kill cleanup below.
+                        logger.exception(
+                            "Gateway identity verification raised; treating the "
+                            "timed-out restart process as NOT the gateway."
+                        )
+                        became_gateway = False
+                    if became_gateway:
                         # Single-container image: no service manager, so the
                         # restart CLI became the gateway itself. Killing it
                         # would SIGTERM the healthy replacement and drop every
