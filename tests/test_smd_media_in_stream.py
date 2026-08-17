@@ -44,6 +44,10 @@ NODE = shutil.which("node")
 
 
 def _extract_js_function(src: str, name: str) -> str:
+    """
+    Extract a JavaScript function by name, correctly handling braces inside
+    strings, template literals, regex literals, and comments.
+    """
     match = re.search(rf"function\s+{re.escape(name)}\s*\(", src)
     if not match:
         raise ValueError(f"Could not find JS function {name}")
@@ -51,11 +55,64 @@ def _extract_js_function(src: str, name: str) -> str:
     brace = src.index("{", match.end())
     depth = 1
     pos = brace + 1
+    in_single = False
+    in_double = False
+    in_template = False
+    in_regex = False
+    in_line_comment = False
+    in_block_comment = False
+    escape_next = False
     while pos < len(src) and depth:
-        if src[pos] == "{":
+        ch = src[pos]
+        nxt = src[pos + 1] if pos + 1 < len(src) else ""
+        prev = src[pos - 1] if pos > 0 else ""
+
+        # Handle escape sequences inside strings/templates/regex
+        if escape_next:
+            escape_next = False
+        elif ch == "\\" and (in_single or in_double or in_template or in_regex):
+            escape_next = True
+        # Single-quoted string
+        elif ch == "'" and not in_double and not in_template and not in_regex and not in_line_comment and not in_block_comment:
+            in_single = not in_single
+        # Double-quoted string
+        elif ch == '"' and not in_single and not in_template and not in_regex and not in_line_comment and not in_block_comment:
+            in_double = not in_double
+        # Template literal
+        elif ch == "`" and not in_single and not in_double and not in_regex and not in_line_comment and not in_block_comment:
+            in_template = not in_template
+        # Line comment
+        elif ch == "/" and nxt == "/" and not in_single and not in_double and not in_template and not in_regex and not in_block_comment:
+            in_line_comment = True
+        elif ch == "\n" and in_line_comment:
+            in_line_comment = False
+        # Block comment
+        elif ch == "/" and nxt == "*" and not in_single and not in_double and not in_template and not in_regex and not in_line_comment:
+            in_block_comment = True
+        elif ch == "*" and nxt == "/" and in_block_comment:
+            in_block_comment = False
+            pos += 1  # skip the closing '/'
+        # Regex literal: starts with / when not in string/template/comment and
+        # previous non-whitespace char is one that allows regex ( ( , = : [ ? ! & | { ; )
+        # We approximate: treat / as regex start if not preceded by identifier-like char.
+        elif ch == "/" and not in_single and not in_double and not in_template and not in_line_comment and not in_block_comment and not in_regex:
+            # Look back for context to distinguish division from regex
+            j = pos - 1
+            while j >= 0 and src[j] in " \t\r\n":
+                j -= 1
+            prev_nonspace = src[j] if j >= 0 else ""
+            # Regex can follow: ( , = : [ ? ! & | { ; return throw
+            if prev_nonspace in "({[;,:=?&|!":
+                in_regex = True
+        # Regex ends at unescaped /
+        elif ch == "/" and in_regex and not escape_next:
+            in_regex = False
+        # Brace counting only when not inside any literal/comment
+        elif ch == "{" and not in_single and not in_double and not in_template and not in_regex and not in_line_comment and not in_block_comment:
             depth += 1
-        elif src[pos] == "}":
+        elif ch == "}" and not in_single and not in_double and not in_template and not in_regex and not in_line_comment and not in_block_comment:
             depth -= 1
+
         pos += 1
     return src[start:pos]
 
@@ -63,6 +120,7 @@ def _extract_js_function(src: str, name: str) -> str:
 def _run_real_smd_media_cases() -> dict:
     helpers = "\n".join(
         [
+            _extract_js_function(UI_JS, "_cleanMediaTokenRef"),
             _extract_js_function(MESSAGES_JS, "_smdMediaPrefixTail"),
             _extract_js_function(MESSAGES_JS, "_smdAppendPlainText"),
             _extract_js_function(MESSAGES_JS, "_smdMediaWriteText"),
@@ -199,7 +257,11 @@ def _run_real_smd_media_cases() -> dict:
         "const pdf=renderModes(['MEDIA:C:/tmp/report.pdf ']);\n"
         "const falsePrefix=renderModes(['M', 'aybe plain prose ']);\n"
         "const crossParent=renderModes(['- ME', '\\n- ow']);\n"
-        "console.log(JSON.stringify({prefixSplits, refSplit, finalExtensionless, pdf, falsePrefix, crossParent}));\n"
+        "const mdEmphasis=renderModes(['MEDIA:C:/tmp/live.png** ']);\n"
+        "const mdEmphasisEnd=renderModes(['MEDIA:C:/tmp/live.png**']);\n"
+        "const mdTrailingPunct=renderModes(['MEDIA:C:/tmp/live.png, ']);\n"
+        "const mdTrailingPeriod=renderModes(['MEDIA:C:/tmp/live.png. ']);\n"
+        "console.log(JSON.stringify({prefixSplits, refSplit, finalExtensionless, pdf, falsePrefix, crossParent, mdEmphasis, mdEmphasisEnd, mdTrailingPunct, mdTrailingPeriod}));\n"
     )
     completed = subprocess.run(
         [NODE, "--input-type=module", "-e", script],
@@ -573,6 +635,42 @@ class TestSmdMediaRealParserBehaviour(unittest.TestCase):
                 if mode == "fade":
                     self.assertTrue(result["fadeWords"])
                     self.assertEqual("".join(result["fadeWords"]), "MEow")
+
+    # #6890: MEDIA: tokens wrapped in markdown emphasis or followed by
+    # punctuation must render the CLEANED ref (no trailing * , . …), both
+    # mid-stream and at stream end.
+
+    def test_real_smd_parser_strips_trailing_emphasis_mid_stream(self):
+        for mode, result in self.cases["mdEmphasis"].items():
+            with self.subTest(mode=mode):
+                self.assertIn('class="media-node"', result["html"])
+                self.assertIn('data-ref="C:/tmp/live.png"', result["html"])
+                self.assertNotIn("live.png**", result["html"])
+                self.assertNotIn("MEDIA:", result["text"])
+
+    def test_real_smd_parser_strips_trailing_emphasis_at_stream_end(self):
+        # No trailing space: the chunk ends with the emphasis marker. The
+        # boundary check must run against the CLEANED ref so the token is
+        # treated as complete and rendered immediately, not buffered.
+        for mode, result in self.cases["mdEmphasisEnd"].items():
+            with self.subTest(mode=mode):
+                self.assertIn('class="media-node"', result["html"])
+                self.assertIn('data-ref="C:/tmp/live.png"', result["html"])
+                self.assertNotIn("live.png**", result["html"])
+
+    def test_real_smd_parser_strips_trailing_comma(self):
+        for mode, result in self.cases["mdTrailingPunct"].items():
+            with self.subTest(mode=mode):
+                self.assertIn('class="media-node"', result["html"])
+                self.assertIn('data-ref="C:/tmp/live.png"', result["html"])
+                self.assertNotIn("live.png,", result["html"])
+
+    def test_real_smd_parser_strips_trailing_period(self):
+        for mode, result in self.cases["mdTrailingPeriod"].items():
+            with self.subTest(mode=mode):
+                self.assertIn('class="media-node"', result["html"])
+                self.assertIn('data-ref="C:/tmp/live.png"', result["html"])
+                self.assertNotIn("live.png.", result["html"])
 
 
 if __name__ == "__main__":
