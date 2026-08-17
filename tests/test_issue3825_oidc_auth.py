@@ -2,6 +2,7 @@ import io
 import json
 import socket
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
@@ -252,6 +253,39 @@ def test_login_page_renders_absolute_oidc_href_when_enabled(monkeypatch):
 
     assert captured["content_type"] == "text/html; charset=utf-8"
     assert 'href="/api/auth/oidc/start?next=/workspace/demo"' in captured["body"]
+
+
+def test_login_page_hides_password_controls_when_only_oidc_is_enabled(monkeypatch):
+    import api.routes as routes
+
+    captured = {}
+    monkeypatch.setattr("api.auth_oidc.is_oidc_enabled", lambda: True)
+    monkeypatch.setattr("api.auth.get_password_hash", lambda: None)
+    monkeypatch.setattr(
+        routes,
+        "t",
+        lambda _handler, body, *, content_type=None, **_kwargs: captured.update(
+            {"body": body, "content_type": content_type}
+        ) or True,
+    )
+
+    handler = RouteFakeHandler()
+    routes.handle_get(handler, SimpleNamespace(path="/login", query=""))
+
+    assert 'id="oidc-login"' in captured["body"]
+    assert 'id="pw"' not in captured["body"]
+    assert 'Enter your password to continue' not in captured["body"]
+
+
+def test_settings_hides_disable_auth_action_when_oidc_is_enabled():
+    """The action only clears local password auth, never native OIDC."""
+    panels_js = (Path(__file__).parent.parent / "static" / "panels.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert "let _settingsOidcEnabled=false;" in panels_js
+    assert "_settingsOidcEnabled=!!authStatus.oidc_enabled;" in panels_js
+    assert "disableBtn.style.display=active&&!_settingsOidcEnabled?'':'none';" in panels_js
 
 
 def test_oidc_enablement_requires_explicit_allowlist(monkeypatch):
