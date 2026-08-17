@@ -685,6 +685,18 @@ def test_mobile_sidebar_open_syncs_panel_from_visible_detail_view():
     assert "_currentPanel=panel" in sync_body
     assert "document.querySelectorAll('[data-panel]')" in sync_body
     assert "document.querySelectorAll('.panel-view')" in sync_body
+    assert "showing-x-" in sync_body, (
+        "Mobile sidebar sync must recognize an active extension panel instead of treating it as Chat"
+    )
+    assert "data-panel-token" in sync_body, (
+        "Mobile sidebar sync must restore the extension's matching sidebar view"
+    )
+    assert "const extensionPanel=`x-${extensionToken}`" in sync_body, (
+        "Extension nav buttons use x- tokens and must regain their active state on mobile"
+    )
+    assert "_currentPanel=extensionPanel" not in sync_body, (
+        "Extension tokens are not host panels and must not corrupt switchPanel's native state"
+    )
     boot_js = (REPO / "static" / "boot.js").read_text(encoding="utf-8")
     toggle_body = _js_function_body(boot_js, "toggleMobileSidebar")
     assert "_syncMobileSidebarPanelFromMainView()" in toggle_body, (
@@ -1443,7 +1455,7 @@ def test_reasoning_chip_updates_desktop_and_mobile_controls():
     """Reasoning chip sync should keep both footer and mobile overflow labels current."""
     ui_js = (REPO / "static" / "ui.js").read_text(encoding="utf-8")
     chip_start = ui_js.index("function _applyReasoningChip(eff)")
-    chip_end = ui_js.index("function fetchReasoningChip()", chip_start)
+    chip_end = ui_js.index("function fetchReasoningChip(", chip_start)
     chip_body = ui_js[chip_start:chip_end]
     for expected in (
         "composerReasoningWrap",

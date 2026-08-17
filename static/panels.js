@@ -353,6 +353,32 @@ function _panelFromCurrentMainView(){
 }
 
 function _syncMobileSidebarPanelFromMainView(){
+  const mainEl=document.querySelector('main.main');
+  // Extension panels are intentionally outside MAIN_VIEW_PANELS: the host must
+  // not try to lazy-load or own their main view. They do, however, publish the
+  // visible view as `showing-x-<token>` and install a matching sidebar
+  // `.panel-view[data-panel-token]`. The mobile drawer is reopened through this
+  // sync helper, so treating that state as Chat deactivated the extension's
+  // sidebar view every time the operator opened the hamburger or edge drawer.
+  // The frame remained behind the drawer, but its content had no reachable
+  // navigation state on the phone.
+  const extensionClass=mainEl&&Array.from(mainEl.classList)
+    .find(name=>name.startsWith('showing-x-'));
+  const extensionToken=extensionClass&&extensionClass.slice('showing-x-'.length);
+  if(extensionToken){
+    const extensionView=Array.from(document.querySelectorAll('.sidebar .panel-view'))
+      .find(view=>view.dataset.panelToken===extensionToken);
+    if(extensionView){
+      const extensionPanel=`x-${extensionToken}`;
+      document.querySelectorAll('[data-panel]').forEach(t=>t.classList.toggle('active',t.dataset.panel===extensionPanel));
+      document.querySelectorAll('.panel-view').forEach(p=>p.classList.remove('active'));
+      extensionView.classList.add('active');
+      // Do not put an extension token in _currentPanel: switchPanel owns that
+      // state and only accepts its native panel names. Returning the token keeps
+      // this helper truthful without corrupting the host state machine.
+      return extensionPanel;
+    }
+  }
   const panel=_panelFromCurrentMainView();
   if(!panel)return _currentPanel||'chat';
   const panelEl=$('panel'+panel.charAt(0).toUpperCase()+panel.slice(1));
@@ -395,6 +421,18 @@ async function switchPanel(name, opts = {}) {
     if (typeof _kanbanStopPolling === 'function') _kanbanStopPolling();
   }
   _currentPanel = nextPanel;
+  // Mobile drawer visibility: a rail/tab click on a phone should surface the
+  // panel synchronously, NOT after the panel's async data load. If the re-open
+  // stayed at the bottom of this function, a form opened from inside the drawer
+  // (e.g. openWorkspaceCreate closing the drawer) would race the deferred
+  // re-open and the drawer would win, covering the main-view form.
+  if (opts.fromRailClick && typeof _isDesktopWidth === 'function' && !_isDesktopWidth()) {
+    const sidebar = document.querySelector('.sidebar');
+    if (sidebar) {
+      sidebar.classList.remove('mobile-session-page');
+      sidebar.classList.add('mobile-panel-drawer', 'mobile-open');
+    }
+  }
   // Update nav tabs (rail + mobile sidebar-nav share data-panel)
   document.querySelectorAll('[data-panel]').forEach(t => t.classList.toggle('active', t.dataset.panel === nextPanel));
   // Refresh aria-expanded on the newly-active rail button to mirror sidebar state.
@@ -426,13 +464,6 @@ async function switchPanel(name, opts = {}) {
   if (nextPanel === 'settings') {
     switchSettingsSection(_currentSettingsSection);
     loadSettingsPanel();
-  }
-  if (opts.fromRailClick && typeof _isDesktopWidth === 'function' && !_isDesktopWidth()) {
-    const sidebar = document.querySelector('.sidebar');
-    if (sidebar) {
-      sidebar.classList.remove('mobile-session-page');
-      sidebar.classList.add('mobile-panel-drawer', 'mobile-open');
-    }
   }
   _resyncChatSidebarAfterPanelSwitch();
   if (nextPanel === 'chat' && typeof syncTopbar === 'function') syncTopbar();
@@ -1545,6 +1576,10 @@ function openCronCreate(){
   _cronSkillsCache = null;
   api('/api/skills').then(d=>{_cronSkillsCache=d.skills||[]; _bindCronSkillPicker();}).catch(()=>{});
   loadCronProfiles().then(()=>_refreshCronProfileSelect('')).catch(()=>{});
+  // Mobile: the cron form lives in the main view, which is covered by the
+  // full-screen sidebar drawer. Close the drawer so the form is visible (mirror
+  // openCronDetail's behaviour); no-op on desktop.
+  _closeMobileSidebarAfterPanelSelection();
 }
 
 function openCronEdit(job){
@@ -2526,6 +2561,7 @@ function _kanbanRenderBoard(){
     board.innerHTML = _kanbanEmptyBoardHtml();
     return;
   }
+  board.classList.toggle('kanban-board-consolidated', !_kanbanLanesByProfile);
   const columns = _kanbanVisibleTasks();
   const total = columns.reduce((n, col) => n + (col.tasks || []).length, 0);
   if ($('kanbanSummary')) $('kanbanSummary').textContent = String(t('kanban_visible_tasks')).replace('{0}', total);
@@ -2658,7 +2694,7 @@ function _kanbanLooksLikeStaleClientError(err){
 function _kanbanUnavailableHtml(err){
   const raw = String((err && err.message) || err || '');
   if (_kanbanLooksLikeStaleClientError(err)) {
-    return `<div class="main-view-empty"><div class="main-view-empty-title">Kanban needs a hard refresh</div><div class="main-view-empty-subtitle">The server rejected an obsolete Kanban endpoint. This usually means the browser or Mac app is still running a stale cached WebUI bundle after an update.</div><button class="btn primary" type="button" onclick="hardRefreshWebUIClient()">Hard refresh now</button><div class="main-view-empty-subtitle">Original error: ${esc(raw || 'not found')}</div></div>`;
+    return `<div class="main-view-empty"><div class="main-view-empty-title">Kanban needs a hard refresh</div><div class="main-view-empty-subtitle">The server rejected an obsolete Kanban endpoint. This usually means the browser or Mac app is still running a stale cached WebUI bundle after an update.</div><button class="btn primary" type="button" onclick="hardRefreshWebUIClient()">${esc(t('update_hard_refresh_now')||'Hard refresh now')}</button><div class="main-view-empty-subtitle">Original error: ${esc(raw || 'not found')}</div></div>`;
   }
   const msg = `${esc(t('kanban_unavailable'))}: ${esc(raw)}`;
   return `<div class="main-view-empty"><div class="main-view-empty-title">${msg}</div></div>`;
@@ -3897,12 +3933,8 @@ async function loadKanbanBoards(){
     _kanbanSetSavedBoard('default');
   }
   _kanbanCurrentBoard = (active === 'default') ? null : active;
-  // The switcher is visible whenever ≥1 non-default board exists OR the
-  // current board is non-default. (If you only have 'default', a switcher
-  // adds clutter without value.)
-  const hasMultiple = boards.length > 1 || (active !== 'default');
-  switcher.hidden = !hasMultiple;
-  if (!hasMultiple) return;
+  // Keep the switcher visible because it is also the default-board settings path.
+  switcher.hidden = false;
   // Update the toggle label/icon
   const activeMeta = boards.find(b => b.slug === active) || {slug: active, name: active, icon: '', color: ''};
   const nameEl = document.getElementById('kanbanBoardSwitcherName');
@@ -3946,10 +3978,7 @@ function _renderKanbanBoardMenu(boards, current){
       <span class="kanban-board-switcher-item-count">${esc(String(total))}</span>
     </button>`;
   }).join('');
-  // Actions row — disable rename/archive when the only option is `default`
-  // (the default board's display metadata is editable but the slug isn't,
-  // and `default` cannot be archived).
-  const renameDisabled = current === 'default';
+  // The default board is editable but cannot be archived.
   const archiveDisabled = current === 'default';
   const actions = `
     <div class="kanban-board-switcher-divider" role="separator"></div>
@@ -3957,9 +3986,9 @@ function _renderKanbanBoardMenu(boards, current){
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
       <span>${esc(t('kanban_new_board') || 'New board…')}</span>
     </button>
-    <button type="button" class="kanban-board-switcher-action" onclick="openKanbanRenameBoard()" ${renameDisabled ? 'disabled' : ''} data-i18n="kanban_rename_board">
+    <button type="button" class="kanban-board-switcher-action" onclick="openKanbanRenameBoard()" data-i18n="kanban_rename_board">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
-      <span>${esc(t('kanban_rename_board') || 'Rename current board…')}</span>
+      <span>${esc(t('kanban_rename_board') || 'Board settings…')}</span>
     </button>
     <button type="button" class="kanban-board-switcher-action danger" onclick="archiveKanbanBoard()" ${archiveDisabled ? 'disabled' : ''} data-i18n="kanban_archive_board">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg>
@@ -4034,6 +4063,16 @@ async function switchKanbanBoard(slug){
 
 // ── Create / rename / archive board modals ──────────────────────────────────
 
+async function _loadKanbanBoardWorkdirOptions(){
+  await loadWorkspaceList();
+  const list = document.getElementById('kanbanBoardModalWorkdirs');
+  if (!list) return;
+  list.innerHTML = (_workspaceList || []).map(ws => {
+    const path = typeof ws === 'string' ? ws : ws && ws.path;
+    return path ? `<option value="${esc(path)}"></option>` : '';
+  }).join('');
+}
+
 function openKanbanCreateBoard(){
   const modal = document.getElementById('kanbanBoardModal');
   if (!modal) return;
@@ -4047,6 +4086,9 @@ function openKanbanCreateBoard(){
   document.getElementById('kanbanBoardModalDesc').value = '';
   document.getElementById('kanbanBoardModalIcon').value = '';
   document.getElementById('kanbanBoardModalColor').value = '#7aa2ff';
+  document.getElementById('kanbanBoardModalDefaultWorkdir').value = '';
+  document.getElementById('kanbanBoardModalOriginalDefaultWorkdir').value = '';
+  _loadKanbanBoardWorkdirOptions();
   document.getElementById('kanbanBoardModalError').textContent = '';
   modal.hidden = false;
   if (_kanbanBoardModalFocusCleanup) {
@@ -4077,12 +4119,11 @@ function openKanbanRenameBoard(){
   const modal = document.getElementById('kanbanBoardModal');
   if (!modal) return;
   const current = _kanbanCurrentBoard || 'default';
-  if (current === 'default') return;  // default's slug is immutable
   const meta = (_kanbanBoardsList || []).find(b => b.slug === current);
   if (!meta) return;
   document.getElementById('kanbanBoardModalMode').value = 'rename';
   document.getElementById('kanbanBoardModalSlug').value = current;
-  document.getElementById('kanbanBoardModalTitle').textContent = t('kanban_rename_board') || 'Rename board';
+  document.getElementById('kanbanBoardModalTitle').textContent = t('kanban_board_settings') || 'Board settings';
   document.getElementById('kanbanBoardModalName').value = meta.name || '';
   document.getElementById('kanbanBoardModalSlugInput').value = current;
   document.getElementById('kanbanBoardModalSlugInput').disabled = true;  // slug is immutable
@@ -4091,6 +4132,10 @@ function openKanbanRenameBoard(){
   document.getElementById('kanbanBoardModalDesc').value = meta.description || '';
   document.getElementById('kanbanBoardModalIcon').value = meta.icon || '';
   document.getElementById('kanbanBoardModalColor').value = meta.color || '#7aa2ff';
+  const originalDefaultWorkdir = (meta.default_workdir || '').trim();
+  document.getElementById('kanbanBoardModalDefaultWorkdir').value = originalDefaultWorkdir;
+  document.getElementById('kanbanBoardModalOriginalDefaultWorkdir').value = originalDefaultWorkdir;
+  _loadKanbanBoardWorkdirOptions();
   document.getElementById('kanbanBoardModalError').textContent = '';
   modal.hidden = false;
   if (_kanbanBoardModalFocusCleanup) {
@@ -4125,6 +4170,8 @@ async function submitKanbanBoardModal(){
   const description = (document.getElementById('kanbanBoardModalDesc').value || '').trim();
   const icon = (document.getElementById('kanbanBoardModalIcon').value || '').trim();
   const color = (document.getElementById('kanbanBoardModalColor').value || '').trim();
+  const defaultWorkdir = (document.getElementById('kanbanBoardModalDefaultWorkdir').value || '').trim();
+  const originalDefaultWorkdir = (document.getElementById('kanbanBoardModalOriginalDefaultWorkdir').value || '').trim();
   const submitBtn = document.getElementById('kanbanBoardModalSubmit');
   if (!name) {
     errEl.textContent = t('kanban_board_name_required') || 'Name is required';
@@ -4137,9 +4184,11 @@ async function submitKanbanBoardModal(){
     }
     if (submitBtn) submitBtn.disabled = true;
     try {
+      const payload = {slug: slugInput, name, description, icon, color, switch: true};
+      if (defaultWorkdir) payload.default_workdir = defaultWorkdir;
       const res = await api('/api/kanban/boards', {
         method: 'POST',
-        body: JSON.stringify({slug: slugInput, name, description, icon, color, switch: true}),
+        body: JSON.stringify(payload),
       });
       closeKanbanBoardModal();
       // Switch to the new board and reload
@@ -4161,9 +4210,11 @@ async function submitKanbanBoardModal(){
     if (!slug) { errEl.textContent = 'Missing slug'; return; }
     if (submitBtn) submitBtn.disabled = true;
     try {
+      const payload = {name, description, icon, color};
+      if (defaultWorkdir !== originalDefaultWorkdir) payload.default_workdir = defaultWorkdir;
       await api('/api/kanban/boards/' + encodeURIComponent(slug), {
         method: 'PATCH',
-        body: JSON.stringify({name, description, icon, color}),
+        body: JSON.stringify(payload),
       });
       closeKanbanBoardModal();
       await loadKanbanBoards();  // refresh switcher label/icon
@@ -5089,6 +5140,10 @@ function openSkillCreate() {
   _editingSkillName = null;
   _skillMode = 'create';
   _renderSkillForm({ name: '', category: '', content: '', isEdit: false });
+  // Mobile: the new-skill form lives in the main view, which is covered by the
+  // full-screen sidebar drawer. Close the drawer so the form is visible (mirror
+  // openSkillDetail's behaviour); no-op on desktop.
+  _closeMobileSidebarAfterPanelSelection();
 }
 
 function _renderSkillForm({ name, category, content, isEdit }) {
@@ -5648,19 +5703,24 @@ function syncWorkspaceDisplays(){
   const mobileAction=$('composerMobileWorkspaceAction');
   const mobileLabel=$('composerMobileWorkspaceLabel');
   const composerDropdown=$('composerWsDropdown');
-  if(!hasWorkspace && composerDropdown) composerDropdown.classList.remove('open');
+  if(!hasWorkspace && composerDropdown) _setWorkspaceDropdownOpenState(composerDropdown,false);
   // Only show workspace label once boot has finished to prevent
   // flash of "No workspace" before the saved session finishes loading.
   if(composerLabel) composerLabel.textContent=S._bootReady?label:'';
   if(mobileLabel) mobileLabel.textContent=S._bootReady?label:'';
+  const composerExpanded=!!(composerDropdown&&composerDropdown.classList.contains('open'));
   if(composerChip){
     composerChip.disabled=!hasWorkspace;
     composerChip.title=hasWorkspace?ws:t('no_workspace');
-    composerChip.classList.toggle('active',!!(composerDropdown&&composerDropdown.classList.contains('open')));
+    composerChip.setAttribute('aria-label',hasWorkspace?t('workspace_switcher_aria',label):t('no_workspace'));
+    composerChip.setAttribute('aria-expanded',composerExpanded?'true':'false');
+    composerChip.classList.toggle('active',composerExpanded);
   }
   if(mobileAction){
     mobileAction.title=hasWorkspace?ws:t('no_workspace');
-    mobileAction.classList.toggle('active',!!(composerDropdown&&composerDropdown.classList.contains('open')));
+    mobileAction.setAttribute('aria-label',hasWorkspace?t('workspace_switcher_aria',label):t('no_workspace'));
+    mobileAction.setAttribute('aria-expanded',composerExpanded?'true':'false');
+    mobileAction.classList.toggle('active',composerExpanded);
   }
 }
 
@@ -5673,6 +5733,41 @@ async function loadWorkspaceList(){
     if(typeof syncTerminalButton==='function') syncTerminalButton();
     return data;
   }catch(e){ return {workspaces:[], last:''}; }
+}
+
+function _setWorkspaceDropdownOpenState(dd,open){
+  if(!dd)return;
+  dd.classList.toggle('open',!!open);
+  dd.hidden=!open;
+  dd.setAttribute('aria-hidden',open?'false':'true');
+  if(open){
+    try{dd.inert=false;}catch(_){}
+    dd.removeAttribute('inert');
+  }else{
+    try{dd.inert=true;}catch(_){}
+    dd.setAttribute('inert','');
+  }
+}
+
+function _getComposerWorkspaceFocusTarget(){
+  const panel=(typeof $==='function')?$('composerMobileConfigPanel'):null;
+  const mobileAction=(typeof $==='function')?$('composerMobileWorkspaceAction'):null;
+  if(panel&&panel.classList.contains('open')&&mobileAction&&!mobileAction.disabled) return mobileAction;
+  return (typeof $==='function')?$('composerWorkspaceChip'):null;
+}
+
+function _focusComposerWorkspaceTarget(target){
+  if(target&&!target.disabled&&typeof target.focus==='function'){
+    try{target.focus({preventScroll:true});}
+    catch(_){target.focus();}
+  }
+}
+
+function _shouldRestoreComposerWorkspaceFocus(dd){
+  if(typeof document==='undefined') return true;
+  const active=document.activeElement;
+  if(!active||active===document.body) return true;
+  return !!(dd&&dd.contains(active));
 }
 
 function _renderWorkspaceAction(label, meta, iconSvg, onClick){
@@ -5828,7 +5923,7 @@ function toggleWsDropdown(){
     closeProfileDropdown(); // close profile dropdown if open
     loadWorkspaceList().then(data=>{
       renderWorkspaceDropdownInto(dd, data.workspaces, S.session?.workspace||S._profileDefaultWorkspace||data.last||'');
-      dd.classList.add('open');
+      _setWorkspaceDropdownOpenState(dd,true);
     });
   }
 }
@@ -5848,10 +5943,16 @@ function toggleComposerWsDropdown(){
     if(typeof closeReasoningDropdown==='function') closeReasoningDropdown();
     loadWorkspaceList().then(data=>{
       renderWorkspaceDropdownInto(dd, data.workspaces, S.session?.workspace||S._profileDefaultWorkspace||data.last||'');
-      dd.classList.add('open');
+      _setWorkspaceDropdownOpenState(dd,true);
       _positionComposerWsDropdown();
-      if(chip) chip.classList.add('active');
-      if(mobileAction) mobileAction.classList.add('active');
+      if(chip){
+        chip.classList.add('active');
+        chip.setAttribute('aria-expanded','true');
+      }
+      if(mobileAction){
+        mobileAction.classList.add('active');
+        mobileAction.setAttribute('aria-expanded','true');
+      }
     });
   }
 }
@@ -5861,10 +5962,16 @@ function closeWsDropdown(){
   const composerDd=$('composerWsDropdown');
   const composerChip=$('composerWorkspaceChip');
   const mobileAction=$('composerMobileWorkspaceAction');
-  if(dd)dd.classList.remove('open');
-  if(composerDd)composerDd.classList.remove('open');
-  if(composerChip)composerChip.classList.remove('active');
-  if(mobileAction)mobileAction.classList.remove('active');
+  if(dd)_setWorkspaceDropdownOpenState(dd,false);
+  if(composerDd)_setWorkspaceDropdownOpenState(composerDd,false);
+  if(composerChip){
+    composerChip.classList.remove('active');
+    composerChip.setAttribute('aria-expanded','false');
+  }
+  if(mobileAction){
+    mobileAction.classList.remove('active');
+    mobileAction.setAttribute('aria-expanded','false');
+  }
 }
 document.addEventListener('click',e=>{
   if(
@@ -6085,6 +6192,10 @@ function openWorkspaceCreate(){
   _workspacePreFormDetail = _currentWorkspaceDetail ? { ..._currentWorkspaceDetail } : null;
   _workspaceMode = 'create';
   _renderWorkspaceForm({ name:'', path:'', isEdit:false });
+  // Mobile: the add-space form lives in the main view, which is covered by the
+  // full-screen sidebar drawer. Close the drawer so the form is visible (mirror
+  // openWorkspaceDetail's behaviour); no-op on desktop.
+  _closeMobileSidebarAfterPanelSelection();
 }
 
 function editCurrentWorkspace(){
@@ -6251,7 +6362,9 @@ async function promptWorkspacePath(){
     const ws=(typeof S._profileDefaultWorkspace==='string'&&S._profileDefaultWorkspace)||'';
     if(!ws)return;
     try{
-      const r=await api('/api/session/new',{method:'POST',body:JSON.stringify({workspace:ws})});
+      // System-minted session (#6022): worktree:false is explicit so a config
+      // worktree default can't leak a worktree from a workspace prompt.
+      const r=await api('/api/session/new',{method:'POST',body:JSON.stringify({workspace:ws,worktree:false})});
       if(r&&r.session){S._pendingSessionToolsets=null;S.session=r.session;S.messages=[];if(typeof syncTopbar==='function')syncTopbar();if(typeof renderMessages==='function')renderMessages();if(typeof renderSessionList==='function')await renderSessionList();}
     }catch(e){showToast(t('workspace_switch_failed')+e.message);return;}
     if(!S.session)return;
@@ -6287,7 +6400,9 @@ async function switchToWorkspace(path,name){
     const ws=path||(typeof S._profileDefaultWorkspace==='string'&&S._profileDefaultWorkspace)||'';
     if(!ws){showToast(t('no_workspace'));return;}
     try{
-      const r=await api('/api/session/new',{method:'POST',body:JSON.stringify({workspace:ws})});
+      // System-minted session (#6022): explicit worktree:false — a workspace
+      // switch from a blank page is not deliberate New Chat intent.
+      const r=await api('/api/session/new',{method:'POST',body:JSON.stringify({workspace:ws,worktree:false})});
       if(r&&r.session){S._pendingSessionToolsets=null;S.session=r.session;S.messages=[];if(typeof syncTopbar==='function')syncTopbar();if(typeof renderMessages==='function')renderMessages();if(typeof renderSessionList==='function')await renderSessionList();}
     }catch(e){if(typeof setStatus==='function')setStatus(t('switch_failed')+e.message);return;}
     if(!S.session)return;
@@ -6295,6 +6410,36 @@ async function switchToWorkspace(path,name){
   // Workspace mutation during a live turn would desync the active stream context.
   if(S.busy){
     showToast(t('workspace_busy_switch'));
+    return;
+  }
+  // #5473 (opt-in, default off): treat switching to a DIFFERENT workspace as a
+  // new-chat boundary instead of mutating the current session in place. A
+  // workspace switch changes the project-context files the agent loaded, so
+  // reusing the session would carry stale cross-workspace context. Only fires
+  // when: the setting is on, the target workspace actually differs from the
+  // current one, and the current conversation has real messages worth keeping on
+  // its original workspace. Same-workspace selection stays an in-place refresh.
+  if(
+    window._newChatOnWorkspaceSwitch===true &&
+    S.session && S.session.workspace && path && path!==S.session.workspace &&
+    Array.isArray(S.messages) && S.messages.length>0
+  ){
+    if(typeof _previewDirty!=='undefined'&&_previewDirty){
+      const discard=await showConfirmDialog({
+        title:t('discard_file_edits_title'),
+        message:t('discard_file_edits_message'),
+        confirmLabel:t('discard'),
+        danger:true
+      });
+      if(!discard)return;
+      if(typeof cancelEditMode==='function')cancelEditMode();
+      if(typeof clearPreview==='function')clearPreview();
+    }
+    closeWsDropdown();
+    // Bind the new chat to the selected workspace via the one-shot flag newSession() reads.
+    S._profileSwitchWorkspace=path;
+    if(typeof newSession==='function') await newSession(false);
+    showToast(t('workspace_switched_new_chat',name||getWorkspaceFriendlyName(path)));
     return;
   }
   if(typeof _previewDirty!=='undefined'&&_previewDirty){
@@ -6308,8 +6453,16 @@ async function switchToWorkspace(path,name){
     if(typeof cancelEditMode==='function')cancelEditMode();
     if(typeof clearPreview==='function')clearPreview();
   }
+  const composerDd=(typeof $==='function')?$('composerWsDropdown'):null;
+  const restoreComposerFocusTarget=(composerDd&&composerDd.classList.contains('open')&&typeof _getComposerWorkspaceFocusTarget==='function')
+    ? _getComposerWorkspaceFocusTarget()
+    : null;
   try{
     closeWsDropdown();
+    // Invalidate any older /api/list response before the explicit workspace
+    // mutation. Otherwise a delayed recovery response for this same session can
+    // overwrite the user's newer selection and reject this switch's fresh tree.
+    if(typeof bumpWorkspaceTreeGen==='function')bumpWorkspaceTreeGen();
     await api('/api/session/update',{method:'POST',body:JSON.stringify({
       session_id:S.session.session_id, workspace:path, model:S.session.model, model_provider:S.session.model_provider||null
     })});
@@ -6319,6 +6472,12 @@ async function switchToWorkspace(path,name){
     S._profileSwitchWorkspace=null;
     S._pendingSessionToolsets=null;
     syncTopbar();
+    if(
+      restoreComposerFocusTarget&&
+      typeof _shouldRestoreComposerWorkspaceFocus==='function'&&
+      _shouldRestoreComposerWorkspaceFocus(composerDd)&&
+      typeof _focusComposerWorkspaceTarget==='function'
+    ) _focusComposerWorkspaceTarget(restoreComposerFocusTarget);
     await loadDir('.');
     if (_currentPanel === 'memory') await loadMemory(true);
     showToast(t('workspace_switched_to',name||getWorkspaceFriendlyName(path)));
@@ -6503,8 +6662,8 @@ async function loadProfilesPanel() {
       explainer.innerHTML = `
         <div class="profile-card-header">
           <div style="min-width:0;flex:1">
-            <div class="profile-card-name">Profiles vs workspaces</div>
-            <div class="profile-card-meta">Use profiles for how the agent works; use workspaces for what files it works on.</div>
+            <div class="profile-card-name">${esc(t('profile_concept_title'))}</div>
+            <div class="profile-card-meta">${esc(t('profile_concept_subtitle'))}</div>
           </div>
         </div>`;
       explainer.onclick = () => _renderProfileConceptHelp(data.active || 'default');
@@ -6564,14 +6723,15 @@ function _renderProfileConceptHelp(activeName){
   const body = $('profileDetailBody');
   const empty = $('profileDetailEmpty');
   if (!title || !body) return;
-  title.textContent = 'Profiles vs workspaces';
+  title.textContent = t('profile_concept_title');
   body.innerHTML = `
     <div class="main-view-content">
       <div class="detail-card">
-        <div class="detail-card-title">Use profiles for how; workspaces for what</div>
-        <div class="detail-row"><div class="detail-row-label">Profiles</div><div class="detail-row-value">Agent identity, memory, skills, model/provider config, and connected tools. Create profiles for roles like researcher, writer, marketer, or developer when those roles should carry different context or capabilities.</div></div>
-        <div class="detail-row"><div class="detail-row-label">Workspaces</div><div class="detail-row-value">Project or product folders on disk. Use one workspace per repo/product so chat, terminal, and file browsing point at the right files.</div></div>
-        <div class="detail-row"><div class="detail-row-label">Together</div><div class="detail-row-value">A profile can have a default workspace, but you can still switch workspaces for a session. Profiles answer “who is working?”; workspaces answer “where are they working?”</div></div>
+        <div class="detail-card-title">${esc(t('profile_concept_title'))}</div>
+        <div class="detail-row"><div class="detail-row-label">${esc(t('tab_profiles'))}</div><div class="detail-row-value">${esc(t('profile_concept_desc_profiles'))}</div></div>
+        <div class="detail-row"><div class="detail-row-label">${esc(t('tab_workspaces'))}</div><div class="detail-row-value">${esc(t('profile_concept_desc_workspaces'))}</div></div>
+        <div class="detail-row"><div class="detail-row-label">${esc(t('profile_concept_label_together'))}</div><div class="detail-row-value">${esc(t('profile_concept_desc_together'))}</div></div>
+        <div class="detail-row" style="border-top:1px solid var(--border);padding-top:8px;margin-top:4px"><div class="detail-row-label">${esc(t('profile_concept_label_example'))}</div><div class="detail-row-value">${esc(t('profile_concept_example'))}</div></div>
       </div>
     </div>`;
   body.style.display = '';
@@ -6828,7 +6988,7 @@ async function switchToProfile(name) {
   // already on this profile, so paths like activateCurrentProfile() (which
   // doesn't pre-check) can't flash a skeleton→restore for a click that changes
   // nothing. (#4662 Opus gate)
-  if (name && name === S.activeProfile) return;
+  if (name && name === S.activeProfile) return true;
   S._pendingSessionToolsets=null;
   // Profile switches are per-client cookie/TLS scoped, so a running stream in
   // the current session can safely continue while this tab moves to another
@@ -6909,9 +7069,12 @@ async function switchToProfile(name) {
     // the single source of truth for switch failure and is gated on _switchGen, so the
     // error surfaces ONLY when the CURRENT switch genuinely fails (@rodboev review, #4662).
     const data = await api('/api/profile/switch', { method: 'POST', body: JSON.stringify({ name }), timeoutToast: false });
-    if (_switchGen !== _profileSwitchGeneration) return;
+    if (_switchGen !== _profileSwitchGeneration) return false;
     S.activeProfile = data.active || name;
     S.activeProfileIsDefault = !!data.is_default;
+    if (typeof _resetCronUnreadForProfileSwitch === 'function') {
+      _resetCronUnreadForProfileSwitch();
+    }
     const targetActiveProfile = S.activeProfile || 'default';
     let sessionProfileMatchesTarget = true;
     if (!sessionInProgress && S.session) {
@@ -6925,13 +7088,6 @@ async function switchToProfile(name) {
         sessionInProgress = true;
       }
     }
-    // #4650 review: a profile switch can change agent.reasoning_effort (and other
-    // reasoning inputs like base_url) WITHOUT changing the default model/provider,
-    // which is all the reasoning-chip cache key tracks. Force exactly one reasoning
-    // refetch for the new profile so the chip reflects the new profile's effort
-    // (the syncTopbar() calls below route through syncReasoningChip()).
-    if (typeof _lastReasoningFetchKey !== 'undefined') _lastReasoningFetchKey = null;
-
     // Reconnect the gateway SSE to the NEW profile's watcher. The backend watcher
     // registry is now profile-keyed (#3629), but this tab's existing EventSource is
     // still subscribed to the PREVIOUS profile's watcher — and the probe-based
@@ -6995,6 +7151,9 @@ async function switchToProfile(name) {
     if (S.session && !sessionInProgress) {
       S.session.profile = data.active || name;
     }
+    if (typeof refreshProfileTransitionReasoningChip === 'function') {
+      refreshProfileTransitionReasoningChip(data.default_model, data.default_model_provider);
+    }
 
     // ── Apply workspace ────────────────────────────────────────────────────
     if (data.default_workspace) {
@@ -7030,15 +7189,15 @@ async function switchToProfile(name) {
       const workspaceVisible = typeof _workspacePanelMode !== 'undefined' && _workspacePanelMode !== 'closed';
       if (typeof _setProfileSwitchListEmbargo === 'function') _setProfileSwitchListEmbargo(false);
       await renderSessionList();
-      if (_switchGen !== _profileSwitchGeneration) return;
+      if (_switchGen !== _profileSwitchGeneration) return false;
       if (workspaceVisible && typeof clearWorkspaceTreeSkeleton === 'function') clearWorkspaceTreeSkeleton();
       showToast(t('profile_switched', name));
     } else if (sessionInProgress) {
       // The current session has messages and belongs to the previous profile.
       // Start a new session for the new profile so nothing gets cross-tagged.
       const workspaceVisible = typeof _workspacePanelMode !== 'undefined' && _workspacePanelMode !== 'closed';
-      await newSession(false, {awaitWorkspaceLoad: workspaceVisible});
-      if (_switchGen !== _profileSwitchGeneration) return;
+      await newSession(false, {awaitWorkspaceLoad: workspaceVisible, worktree: false});
+      if (_switchGen !== _profileSwitchGeneration) return false;
       // Keep topbar chips (workspace/profile) in sync after creating the
       // new profile-scoped session.
       syncTopbar();
@@ -7052,7 +7211,7 @@ async function switchToProfile(name) {
       // the superseded switch would clear the newer switch's workspace skeleton
       // and pop a stale toast. Mirrors the no-messages branch guard below.
       // (@rodboev/greptile review, #4662)
-      if (_switchGen !== _profileSwitchGeneration) return;
+      if (_switchGen !== _profileSwitchGeneration) return false;
       if (typeof _openProfileSwitchSessionBrowser === 'function') _openProfileSwitchSessionBrowser();
       // Safety net: if the new session has no workspace, newSession() won't have
       // painted the file tree — clear the up-front skeleton so it can't strand
@@ -7093,6 +7252,7 @@ async function switchToProfile(name) {
 
     await _profileSwitchPanelLoad();
     _refreshProfileSwitchBackground(_switchGen);
+    return true;
 
   } catch (e) {
     // Revert the optimistic name update on error
@@ -7119,6 +7279,7 @@ async function switchToProfile(name) {
         clearWorkspaceTreeSkeleton();
       }
     }
+    return false;
   } finally {
     // Always remove loading indicator regardless of success or failure
     if (_switchGen === _profileSwitchGeneration && _chip) { _chip.classList.remove('switching'); _chip.disabled = false; }
@@ -7138,6 +7299,10 @@ function openProfileCreate(){
   _profilePreFormDetail = _currentProfileDetail ? { ..._currentProfileDetail } : null;
   _profileMode = 'create';
   _renderProfileForm();
+  // Mobile: the new-profile form lives in the main view, which is covered by the
+  // full-screen sidebar drawer. Close the drawer so the form is visible (mirror
+  // openWorkspaceDetail's behaviour); no-op on desktop.
+  _closeMobileSidebarAfterPanelSelection();
 }
 
 function _renderProfileForm(){
@@ -8168,10 +8333,16 @@ function _syncHermesPanelSessionActions(){
   const visibleMessages=hasSession?(S.messages||[]).filter(m=>m&&m.role&&m.role!=='tool').length:0;
   const title=hasSession?(S.session.title||t('untitled')):t('active_conversation_none');
   const meta=$('hermesSessionMeta');
+  const hasShare=!!(hasSession&&S.session&&S.session.share_token);
   if(meta){
-    meta.textContent=hasSession
-      ? t('active_conversation_meta', title, visibleMessages)
-      : t('active_conversation_none');
+    if(!hasSession){
+      meta.textContent=t('active_conversation_none');
+    }else{
+      const base=t('active_conversation_meta', title, visibleMessages);
+      meta.textContent=hasShare
+        ? `${base} · ${t('share_session_status_active')}`
+        : base;
+    }
   }
   const setDisabled=(id,disabled)=>{
     const el=$(id);
@@ -8181,6 +8352,8 @@ function _syncHermesPanelSessionActions(){
   };
   setDisabled('btnDownload',!hasSession||visibleMessages===0);
   setDisabled('btnExportJSON',!hasSession);
+  setDisabled('btnShareSession',!hasSession||visibleMessages===0);
+  setDisabled('btnStopSharingSession',!hasShare);
   setDisabled('btnClearConvModal',!hasSession||visibleMessages===0);
 }
 
@@ -8302,11 +8475,15 @@ function _syncStructuredCodeLinesEnabled(){
 function _appearancePayloadFromUi(){
   const worklogDetailsExpanded=!!($('settingsWorklogDetailsExpandedDefault')||{}).checked;
   const chatActivityModeSel=$('settingsChatActivityDisplayMode');
+  const transparentEventTimestamps=$('settingsTransparentEventTimestamps');
   return {
     theme: ($('settingsTheme')||{}).value || localStorage.getItem('hermes-theme') || 'dark',
     skin: ($('settingsSkin')||{}).value || localStorage.getItem('hermes-skin') || 'default',
     font_size: ($('settingsFontSize')||{}).value || localStorage.getItem('hermes-font-size') || 'default',
-    chat_activity_display_mode: chatActivityModeSel&&chatActivityModeSel.value==='transparent_stream'?'transparent_stream':'compact_worklog',
+    chat_activity_display_mode: chatActivityModeSel&&(chatActivityModeSel.value==='transparent_stream'||chatActivityModeSel.value==='hide_all_activity')
+      ? chatActivityModeSel.value
+      : 'compact_worklog',
+    transparent_stream_event_timestamps: transparentEventTimestamps ? transparentEventTimestamps.checked : true,
     session_jump_buttons: !!($('settingsSessionJumpButtons')||{}).checked,
     session_endless_scroll: !!($('settingsSessionEndlessScroll')||{}).checked,
     auto_scroll_follow: !!($('settingsAutoScrollFollow')||{}).checked,
@@ -8325,7 +8502,7 @@ function _appearancePayloadFromUi(){
 }
 
 function _syncChatActivityDisplayModeControl(mode){
-  const next=mode==='transparent_stream'?'transparent_stream':'compact_worklog';
+  const next=mode==='transparent_stream'||mode==='hide_all_activity' ? mode : 'compact_worklog';
   const select=$('settingsChatActivityDisplayMode');
   if(select) select.value=next;
   document.querySelectorAll('[data-chat-activity-mode]').forEach(btn=>{
@@ -8335,6 +8512,20 @@ function _syncChatActivityDisplayModeControl(mode){
   });
   window._chatActivityDisplayMode=next;
   window._transparentStream=next==='transparent_stream';
+  if(typeof _syncTransparentEventTimestampsControl==='function') _syncTransparentEventTimestampsControl(window._transparentEventTimestamps,next);
+  if(next==='hide_all_activity'&&typeof window._hideLiveActivityForFinalAnswerOnly==='function') window._hideLiveActivityForFinalAnswerOnly();
+}
+
+function _syncTransparentEventTimestampsControl(enabled, mode){
+  const next=enabled!==false;
+  const activeMode=mode==='transparent_stream'||mode==='hide_all_activity' ? mode : (window._chatActivityDisplayMode||'compact_worklog');
+  const checkbox=$('settingsTransparentEventTimestamps');
+  if(checkbox){
+    checkbox.checked=next;
+    checkbox.disabled=activeMode!=='transparent_stream';
+    checkbox.style.opacity=activeMode==='transparent_stream'?'':'0.5';
+  }
+  window._transparentEventTimestamps=next;
 }
 
 function _pickChatActivityDisplayMode(mode){
@@ -8344,6 +8535,14 @@ function _pickChatActivityDisplayMode(mode){
   _scheduleAppearanceAutosave();
 }
 if(typeof window!=='undefined') window._pickChatActivityDisplayMode=_pickChatActivityDisplayMode;
+
+function _pickTransparentEventTimestamps(enabled){
+  _syncTransparentEventTimestampsControl(enabled,window._chatActivityDisplayMode);
+  if(typeof clearMessageRenderCache==='function') clearMessageRenderCache();
+  if(typeof renderMessages==='function') renderMessages({preserveScroll:true});
+  _scheduleAppearanceAutosave();
+}
+if(typeof window!=='undefined') window._pickTransparentEventTimestamps=_pickTransparentEventTimestamps;
 
 function _setAppearanceAutosaveStatus(state){
   const el=$('settingsAppearanceAutosaveStatus');
@@ -8383,7 +8582,7 @@ function _scheduleAppearanceAutosave(){
 
 async function _autosaveAppearanceSettings(payload){
   try{
-    const saved=await api('/api/settings',{method:'POST',body:JSON.stringify(payload)});
+    const saved=await _enqueueSettingsPost({method:'POST',body:JSON.stringify(payload)});
     _settingsAppearanceAutosaveRetryPayload=null;
     _rememberAppearanceSaved(payload);
     if(saved&&saved.font_size){
@@ -8393,8 +8592,10 @@ async function _autosaveAppearanceSettings(payload){
       window._sessionJumpButtonsEnabled=!!saved.session_jump_buttons;
       if(Object.prototype.hasOwnProperty.call(saved,'chat_activity_display_mode')){
         const beforeMode=window._chatActivityDisplayMode;
+        const beforeTimestamps=window._transparentEventTimestamps!==false;
         _syncChatActivityDisplayModeControl(saved.chat_activity_display_mode);
-        if(window._chatActivityDisplayMode!==beforeMode){
+        _syncTransparentEventTimestampsControl(saved.transparent_stream_event_timestamps, saved.chat_activity_display_mode);
+        if(window._chatActivityDisplayMode!==beforeMode||((window._transparentEventTimestamps!==false)!==beforeTimestamps)){
           if(typeof clearMessageRenderCache==='function') clearMessageRenderCache();
           if(typeof renderMessages==='function') renderMessages({preserveScroll:true});
         }
@@ -8403,6 +8604,14 @@ async function _autosaveAppearanceSettings(payload){
     }
     window._sessionEndlessScrollEnabled=!!(saved&&saved.session_endless_scroll);
     window._autoScrollFollow=!saved||saved.auto_scroll_follow!==false;
+    // #6819: persist ONLY from an explicit boolean in the server response.
+    // A failed autosave (`saved` falsy) or a partial response without the key
+    // would otherwise write the synthesized default (ON) into the mirror,
+    // corrupting the value a later boot-failure fallback would restore
+    // (Greptile P1 review on #6856).
+    if(saved&&typeof saved.auto_scroll_follow==='boolean'&&typeof _persistAutoScrollFollow==='function'){
+      _persistAutoScrollFollow(saved.auto_scroll_follow);
+    }
     window._largeTextPasteAsAttachment=!saved||saved.large_text_paste_as_attachment!==false;
     window._projectQuickCreate=!!(saved&&saved.project_quick_create_buttons);
     if(saved&&Object.prototype.hasOwnProperty.call(saved,'structured_code_default_view')){
@@ -8507,6 +8716,8 @@ function _preferencesPayloadFromUi(){
   if(showConversationOutlineCb) payload.show_conversation_outline=showConversationOutlineCb.checked;
   const hideSuggestionsCb=$('settingsHideSuggestions');
   if(hideSuggestionsCb) payload.hide_empty_state_suggestions=hideSuggestionsCb.checked;
+  const hideEmptyStatePanelCb=$('settingsHideEmptyStatePanel');
+  if(hideEmptyStatePanelCb) payload.hide_empty_state_panel=hideEmptyStatePanelCb.checked;
   const virtualizeTranscriptCb=$('settingsVirtualizeTranscript');
   if(virtualizeTranscriptCb){
     payload.virtualize_transcript=virtualizeTranscriptCb.checked;
@@ -8537,12 +8748,17 @@ function _preferencesPayloadFromUi(){
   if(showCronCb) payload.show_cron_sessions=!!(showCliCb&&showCliCb.checked&&showCronCb.checked);
   const showWebhookCb=$('settingsShowWebhookSessions');
   if(showWebhookCb) payload.show_webhook_sessions=!!(showCliCb&&showCliCb.checked&&showWebhookCb.checked);
+  const showKanbanCb=$('settingsShowKanbanSessions');
+  if(showKanbanCb) payload.show_kanban_sessions=!!(showCliCb&&showCliCb.checked&&showKanbanCb.checked);
   const showPreviousMessagingCb=$('settingsShowPreviousMessagingSessions');
   if(showPreviousMessagingCb) payload.show_previous_messaging_sessions=showPreviousMessagingCb.checked;
   const syncCb=$('settingsSyncInsights');
   if(syncCb) payload.sync_to_insights=syncCb.checked;
   const updateCb=$('settingsCheckUpdates');
   if(updateCb) payload.check_for_updates=updateCb.checked;
+  // update_channel is NOT included here — it has its own dedicated write path
+  // (_saveUpdateChannelFromSelector) so a stale tab's generic autosave cannot
+  // overwrite a newer channel selection made in another tab. (#6612)
   const ignoreAgentUpdatesCb=$('settingsIgnoreAgentUpdates');
   if(ignoreAgentUpdatesCb) payload.ignore_agent_updates=ignoreAgentUpdatesCb.checked;
   const whatsNewSummaryCb=$('settingsWhatsNewSummary');
@@ -8563,6 +8779,8 @@ function _preferencesPayloadFromUi(){
   if(defaultMessageModeSel) payload.default_message_mode=defaultMessageModeSel.value;
   const showBusyPlaceholderHintCb=$('settingsShowBusyPlaceholderHint');
   if(showBusyPlaceholderHintCb) payload.show_busy_placeholder_hint=showBusyPlaceholderHintCb.checked;
+  const newChatOnWorkspaceSwitchCb=$('settingsNewChatOnWorkspaceSwitch');
+  if(newChatOnWorkspaceSwitchCb) payload.new_chat_on_workspace_switch=newChatOnWorkspaceSwitchCb.checked;
   const botNameField=$('settingsBotName');
   if(botNameField) payload.bot_name=botNameField.value;
   Object.assign(payload,_speechPreferencesPayloadFromUi());
@@ -8593,9 +8811,42 @@ function _speechPreferencesPayloadFromUi(){
   return payload;
 }
 
-function _setPreferencesAutosaveStatus(state){
+// Keep same-page settings merges FIFO so one response cannot race the next read-modify-write.
+let _settingsPanelPostQueue=Promise.resolve();
+
+function _enqueueSettingsPost(options){
+  const requestOptions={...(options||{})};
+  if(typeof requestOptions.body==='string') requestOptions.body=String(requestOptions.body);
+  const run=_settingsPanelPostQueue.then(async()=>{
+    const saved=await api('/api/settings',requestOptions);
+    if(!saved||typeof saved!=='object'||Array.isArray(saved)){
+      throw new Error('Invalid settings response');
+    }
+    return saved;
+  });
+  _settingsPanelPostQueue=run.catch(()=>{});
+  return run;
+}
+
+// Ownership token for the shared preferences autosave status slot. Prevents
+// the channel writer from clearing or overwriting a 'failed'+Retry state the
+// generic preferences autosave set; that Retry button has exactly one call
+// site and becomes unreachable if another writer replaces the node.
+let _preferencesAutosaveStatusOwner=null;
+
+function _setPreferencesAutosaveStatus(state,owner){
+  owner=owner||'preferences';
   const el=$('settingsPreferencesAutosaveStatus');
   if(!el) return;
+  // Guard: if the slot shows 'failed' from a different writer, do not overwrite.
+  // The DOM class is the source of truth; an external clear would remove
+  // 'is-failed' and unblock writes without needing an extra variable.
+  if(_preferencesAutosaveStatusOwner&&
+     _preferencesAutosaveStatusOwner!==owner&&
+     el.classList.contains('is-failed')){
+    return;
+  }
+  _preferencesAutosaveStatusOwner=state?owner:null;
   el.className='settings-autosave-status';
   if(!state){
     el.textContent='';
@@ -8637,7 +8888,7 @@ function _schedulePreferencesAutosave(){
 
 async function _autosavePreferencesSettings(payload){
   try{
-    const saved=await api('/api/settings',{method:'POST',body:JSON.stringify(payload)});
+    const saved=await _enqueueSettingsPost({method:'POST',body:JSON.stringify(payload)});
     if(payload&&payload.terminal_auto_expand_on_output!==undefined){
       window._terminalAutoExpandOnOutput=!!(saved&&saved.terminal_auto_expand_on_output);
     }
@@ -8656,6 +8907,10 @@ async function _autosavePreferencesSettings(payload){
       window._hideEmptyStateSuggestions=!!(saved&&saved.hide_empty_state_suggestions);
       if(typeof applyEmptyStateSuggestionPref==='function') applyEmptyStateSuggestionPref();
     }
+    if(payload&&payload.hide_empty_state_panel!==undefined){
+      window._hideEmptyStatePanel=!!(saved&&saved.hide_empty_state_panel);
+      if(typeof applyEmptyStatePanelPref==='function') applyEmptyStatePanelPref();
+    }
     if(payload&&payload.show_conversation_outline!==undefined){
       window._showConversationOutline=!!(saved&&saved.show_conversation_outline);
       document.documentElement.dataset.conversationOutline=window._showConversationOutline?'enabled':'disabled';
@@ -8671,6 +8926,9 @@ async function _autosavePreferencesSettings(payload){
     if(payload&&payload.show_busy_placeholder_hint!==undefined){
       window._showBusyPlaceholderHint=!!(saved&&saved.show_busy_placeholder_hint);
       if(typeof _applyBusyComposerPlaceholder==='function') _applyBusyComposerPlaceholder();
+    }
+    if(payload&&payload.new_chat_on_workspace_switch!==undefined){
+      window._newChatOnWorkspaceSwitch=!!(saved&&saved.new_chat_on_workspace_switch);  // #5473
     }
     _settingsPreferencesAutosaveRetryPayload=null;
     _setPreferencesAutosaveStatus('saved');
@@ -8717,6 +8975,57 @@ function _retryPreferencesAutosave(){
   _autosavePreferencesSettings(payload);
 }
 
+let _channelSaveSeq=0;
+// Last server-confirmed update_channel value. Seeded at panel hydration so the
+// failure-revert path always has a known-good value. _confirmedUpdateChannel is
+// the only reliable "previous" value: by the time a change event fires the
+// browser has already applied the picked option to the <select>, so
+// channelSel.value inside the handler IS the new value, not the old one.
+let _confirmedUpdateChannel=null;
+
+async function _saveUpdateChannelFromSelector(channelSel){
+  // #6612: dedicated write path for update_channel so the generic preferences
+  // autosave payload never carries this field. A stale tab toggling an unrelated
+  // preference must not overwrite a newer channel selection from another tab.
+  if(!channelSel) return;
+  const val=channelSel.value==='experimental'?'experimental':'stable';
+  const seq=++_channelSaveSeq;
+  if(typeof _setPreferencesAutosaveStatus==='function') _setPreferencesAutosaveStatus('saving','channel');
+  try{
+    const saved=await _enqueueSettingsPost({method:'POST',body:JSON.stringify({update_channel:val})});
+    const confirmed=(saved&&(saved.update_channel==='experimental'||saved.update_channel==='stable'))
+      ?saved.update_channel:val;
+    _confirmedUpdateChannel=confirmed;
+    // The queue makes the server state FIFO; the sequence guard protects only
+    // the selector and other response-driven UI from stale completions.
+    if(seq!==_channelSaveSeq) return;
+    channelSel.value=confirmed;
+    if(typeof _setPreferencesAutosaveStatus==='function') _setPreferencesAutosaveStatus('saved','channel');
+    // Run the update check and badge sync against the confirmed server value,
+    // not the optimistic pre-save value.
+    if(typeof checkUpdatesNow==='function'){
+      try{checkUpdatesNow(confirmed);}catch(_){}
+    }
+    if(typeof _syncUpdateChannelBadge==='function') _syncUpdateChannelBadge(confirmed);
+  }catch(e){
+    console.warn('[settings] update_channel save failed',e);
+    // Revert selector and badge to the last server-confirmed value so both
+    // controls agree with what the server actually holds. Status clear and
+    // revert are both inside the seq guard so a superseded in-flight failure
+    // does not clear status that a newer write or the generic autosave owns.
+    if(seq===_channelSaveSeq){
+      const revertTo=_confirmedUpdateChannel||'stable';
+      channelSel.value=revertTo;
+      if(typeof _syncUpdateChannelBadge==='function') _syncUpdateChannelBadge(revertTo);
+      // Do not call _setPreferencesAutosaveStatus('failed','channel'): its retry
+      // button replays _retryPreferencesAutosave(), which cannot contain
+      // update_channel (#6612). Clear the saving indicator instead; the selector
+      // snap-back is the user's signal.
+      if(typeof _setPreferencesAutosaveStatus==='function') _setPreferencesAutosaveStatus(null,'channel');
+    }
+  }
+}
+
 function _syncSettingsMaxTokensPlaceholder(field, fallbackValue){
   if(!field) return;
   const parsedFallback=parseInt(fallbackValue,10);
@@ -8735,9 +9044,21 @@ async function loadSettingsPanel(){
     checkWebUIVersionSkew(settings);
     // Populate the version badges from the server — keeps them in sync with git
     // tags automatically without any manual release step.
+    //
+    // The DISPLAY badge uses update_channel_version (a channel-scoped
+    // `git describe --match`), which is SEPARATE from settings.webui_version.
+    // webui_version is load-bearing for asset cache-busting / SW cache / stale-
+    // client skew detection and must stay channel-neutral — never render it as
+    // the channel badge. See api/updates.channel_version_badge().
     const webuiBadge = $('settings-webui-version-badge');
     if(webuiBadge){
-      webuiBadge.textContent = `WebUI: ${settings.webui_version || 'not detected'}`;
+      const chanVer = settings.update_channel_version || settings.webui_version || 'not detected';
+      const chan = settings.update_channel==='experimental' ? 'experimental' : 'stable';
+      // Only annotate the channel when on experimental — stable is the implicit
+      // default and needs no extra chrome.
+      webuiBadge.textContent = chan==='experimental'
+        ? `WebUI: ${chanVer} · Experimental`
+        : `WebUI: ${chanVer}`;
     }
     const agentBadge = $('settings-agent-version-badge');
     if(agentBadge){
@@ -8800,6 +9121,14 @@ async function loadSettingsPanel(){
     if(autoScrollFollowCb){
       autoScrollFollowCb.checked=settings.auto_scroll_follow!==false;
       window._autoScrollFollow=autoScrollFollowCb.checked;
+      // #6819/#6856: a successful settings GET is an authoritative resolve, so
+      // sync the global mirror too — otherwise an explicit OFF applied here
+      // leaves a stale ON mirror that a later boot-fetch failure would restore.
+      // Persist ONLY when the server explicitly sent a boolean (never persist a
+      // synthesized default from an absent field — matches the boot contract).
+      if(typeof settings.auto_scroll_follow==='boolean'&&typeof _persistAutoScrollFollow==='function'){
+        _persistAutoScrollFollow(settings.auto_scroll_follow);
+      }
       autoScrollFollowCb.onchange=function(){
         window._autoScrollFollow=this.checked;
         _scheduleAppearanceAutosave();
@@ -8807,10 +9136,17 @@ async function loadSettingsPanel(){
     }
     const worklogDetailsExpandedCb=$('settingsWorklogDetailsExpandedDefault');
     const chatActivityModeSel=$('settingsChatActivityDisplayMode');
+    const transparentEventTimestampsCb=$('settingsTransparentEventTimestamps');
     if(chatActivityModeSel){
       _syncChatActivityDisplayModeControl(settings.chat_activity_display_mode);
+      _syncTransparentEventTimestampsControl(settings.transparent_stream_event_timestamps, settings.chat_activity_display_mode);
       chatActivityModeSel.addEventListener('change',()=>{
         _pickChatActivityDisplayMode(chatActivityModeSel.value);
+      },{once:false});
+    }
+    if(transparentEventTimestampsCb){
+      transparentEventTimestampsCb.addEventListener('change',()=>{
+        _pickTransparentEventTimestamps(transparentEventTimestampsCb.checked);
       },{once:false});
     }
     if(worklogDetailsExpandedCb){
@@ -8944,6 +9280,11 @@ async function loadSettingsPanel(){
           for(const m of [...(g.models||[]),...(g.extra_models||[])]){
             const opt=document.createElement('option');
             opt.value=m.id;opt.textContent=m.label;
+            if(m && (m.supports_fast_tier === true || String(m.supports_fast_tier).toLowerCase()==='true')){
+              opt.dataset.fast='1';
+            }else if(m && (m.supports_fast_tier === false || String(m.supports_fast_tier).toLowerCase()==='false')){
+              opt.dataset.fast='0';
+            }
             og.appendChild(opt);
           }
           modelSel.appendChild(og);
@@ -9031,6 +9372,17 @@ async function loadSettingsPanel(){
       hideSuggestionsCb.addEventListener('change',()=>{
         window._hideEmptyStateSuggestions=hideSuggestionsCb.checked;
         if(typeof applyEmptyStateSuggestionPref==='function') applyEmptyStateSuggestionPref();
+        _schedulePreferencesAutosave();
+      },{once:false});
+    }
+    const hideEmptyStatePanelCb=$('settingsHideEmptyStatePanel');
+    if(hideEmptyStatePanelCb){
+      hideEmptyStatePanelCb.checked=settings.hide_empty_state_panel===true;
+      window._hideEmptyStatePanel=hideEmptyStatePanelCb.checked;
+      if(typeof applyEmptyStatePanelPref==='function') applyEmptyStatePanelPref();
+      hideEmptyStatePanelCb.addEventListener('change',()=>{
+        window._hideEmptyStatePanel=hideEmptyStatePanelCb.checked;
+        if(typeof applyEmptyStatePanelPref==='function') applyEmptyStatePanelPref();
         _schedulePreferencesAutosave();
       },{once:false});
     }
@@ -9122,12 +9474,31 @@ async function loadSettingsPanel(){
       showWebhookCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});
       if(showCliCb){showCliCb.addEventListener('change',function(){showWebhookCb.disabled=!showCliCb.checked;},{once:false});}
     }
+    const showKanbanCb=$('settingsShowKanbanSessions');
+    if(showKanbanCb){
+      showKanbanCb.checked=!!settings.show_kanban_sessions;
+      showKanbanCb.disabled=showCliCb?!showCliCb.checked:true;
+      showKanbanCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});
+      if(showCliCb){showCliCb.addEventListener('change',function(){showKanbanCb.disabled=!showCliCb.checked;},{once:false});}
+    }
     const showPreviousMessagingCb=$('settingsShowPreviousMessagingSessions');
     if(showPreviousMessagingCb){showPreviousMessagingCb.checked=!!settings.show_previous_messaging_sessions;showPreviousMessagingCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const syncCb=$('settingsSyncInsights');
     if(syncCb){syncCb.checked=!!settings.sync_to_insights;syncCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const updateCb=$('settingsCheckUpdates');
     if(updateCb){updateCb.checked=settings.check_for_updates!==false;updateCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
+    const updateChannelSel=$('settingsUpdateChannel');
+    if(updateChannelSel){
+      updateChannelSel.value=settings.update_channel==='experimental'?'experimental':'stable';
+      _confirmedUpdateChannel=updateChannelSel.value; // #6612: seed revert baseline
+      updateChannelSel.addEventListener('change',function(){
+        // #6612: use the dedicated channel writer so generic preference autosaves
+        // from a stale tab cannot overwrite a newer explicit channel selection.
+        // Update check, badge sync, and failure status are handled inside
+        // _saveUpdateChannelFromSelector after the POST is confirmed.
+        _saveUpdateChannelFromSelector(updateChannelSel);
+      },{once:false});
+    }
     const ignoreAgentUpdatesCb=$('settingsIgnoreAgentUpdates');
     if(ignoreAgentUpdatesCb){ignoreAgentUpdatesCb.checked=!!settings.ignore_agent_updates;ignoreAgentUpdatesCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const whatsNewSummaryCb=$('settingsWhatsNewSummary');
@@ -9331,6 +9702,12 @@ async function loadSettingsPanel(){
       showBusyPlaceholderHintCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});
     }
     if(typeof _applyBusyComposerPlaceholder==='function') _applyBusyComposerPlaceholder();
+    const newChatOnWorkspaceSwitchCb=$('settingsNewChatOnWorkspaceSwitch');
+    if(newChatOnWorkspaceSwitchCb){
+      newChatOnWorkspaceSwitchCb.checked=!!settings.new_chat_on_workspace_switch;
+      window._newChatOnWorkspaceSwitch=newChatOnWorkspaceSwitchCb.checked;
+      newChatOnWorkspaceSwitchCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});
+    }
     // Bot name — debounced autosave (text input)
     const botNameField=$('settingsBotName');
     if(botNameField){
@@ -9624,6 +10001,13 @@ function _extensionSidecarCard(sidecars){
     const proxyConsentRequired=proxy.consent_required===true;
     const proxyOriginChanged=proxy.origin_changed===true;
     const proxyPath=(proxy&&proxy.path)||'';
+    // token-v1 posture: 'local_unprotected' = WebUI auth is off, so proxy consent
+    // is grantable by any unauthenticated local caller. Warn the operator to
+    // enable authentication before wiring up a sidecar (design §9.1).
+    const proxyUnprotected=proxy.posture==='local_unprotected';
+    const proxyWarning=proxyUnprotected
+      ?`<div class="extension-sidecar-warning">⚠ WebUI authentication is off. This sidecar's proxy consent can be granted by any local process. Set a password in Settings → Password before using sidecar extensions.</div>`
+      :'';
     const proxyStatus=proxyConsented
       ?'consented'
       :(proxyOriginChanged
@@ -9648,6 +10032,7 @@ function _extensionSidecarCard(sidecars){
         <div><span>Proxy path</span><code>${esc(proxyPath)}</code></div>
       </div>
       <div class="extension-sidecar-actions">${proxyButton}</div>
+      ${proxyWarning}
       <div class="extension-sidecar-runtime" data-sidecar-runtime-index="${index}" hidden></div>
     </div>`;
   }).join('')}</div>`:'<div class="extension-url-empty">No loopback sidecars declared.</div>';
@@ -10298,7 +10683,7 @@ async function handlePluginEnableToggle(pluginKey, checked){
   try{
     const body={dashboard_plugins:{}};
     body.dashboard_plugins[pluginKey]=!!checked;
-    await api('/api/settings',{method:'POST',body:JSON.stringify(body)});
+    await _enqueueSettingsPost({method:'POST',body:JSON.stringify(body)});
     loadPluginsPanel();
   }catch(e){
     showToast(t('settings_save_failed')+e.message);
@@ -10913,7 +11298,7 @@ function _attachBudgetControls(wrap,history,card,paceNum){
 
   async function _saveBudget(value){
     try{
-      await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider_cost_budget:value})});
+      await _enqueueSettingsPost({method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider_cost_budget:value})});
       const existing=card.querySelector('.provider-cost-chart-wrap');
       if(existing) existing.remove();
       renderProviderCostChart(card);
@@ -11530,7 +11915,7 @@ function _updateAuthDisabledWarning(authStatus){
 
 async function _setAuthDisabledAck(checked){
   try{
-    await api('/api/settings',{method:'POST',body:JSON.stringify({_auth_disabled_acknowledged:!!checked})});
+    await _enqueueSettingsPost({method:'POST',body:JSON.stringify({_auth_disabled_acknowledged:!!checked})});
     try{
       const authStatus=await api('/api/auth/status');
       _updateAuthWarningBadge(authStatus);
@@ -11637,6 +12022,7 @@ function _applySavedSettingsUi(saved, body, opts){
   window._showThinking=body.show_thinking!==false;
   window._simplifiedToolCalling=true;
   _syncChatActivityDisplayModeControl(body.chat_activity_display_mode);
+  _syncTransparentEventTimestampsControl(body.transparent_stream_event_timestamps, body.chat_activity_display_mode);
   window._terminalAutoExpandOnOutput=!!body.terminal_auto_expand_on_output;
   window._workspaceTodosTab=!!body.workspace_todos_tab;
   if(typeof _applyWorkspaceTodosTabVisibility==='function') _applyWorkspaceTodosTabVisibility();
@@ -11649,7 +12035,13 @@ function _applySavedSettingsUi(saved, body, opts){
     ? _persistDefaultMessageMode(body.default_message_mode||body.busy_input_mode)
     : (body.default_message_mode||body.busy_input_mode||'steer');
   window._sessionEndlessScrollEnabled=!!body.session_endless_scroll;
-  window._autoScrollFollow=body.auto_scroll_follow!==false;
+  // #6819: only override auto-follow when the body actually carries the key.
+  // A partial settings body without it must not silently re-enable follow
+  // (`undefined !== false` evaluates true — the old clobber).
+  if(Object.prototype.hasOwnProperty.call(body,'auto_scroll_follow')){
+    window._autoScrollFollow=body.auto_scroll_follow!==false;
+    if(typeof _persistAutoScrollFollow==='function') _persistAutoScrollFollow(window._autoScrollFollow);
+  }
   window._largeTextPasteAsAttachment=body.large_text_paste_as_attachment!==false;
   window._projectQuickCreate=!!body.project_quick_create_buttons;
   if(Object.prototype.hasOwnProperty.call(body,'structured_code_default_view')){
@@ -11703,7 +12095,21 @@ function _applySavedSettingsUi(saved, body, opts){
   if(typeof renderSessionList==='function') renderSessionList();
 }
 
-async function checkUpdatesNow(){
+// Instant client-side badge feedback when the update channel is toggled, before
+// the server round-trip that authoritatively re-renders the badge from
+// update_channel_version. Keeps the "· Experimental" suffix in sync immediately.
+function _syncUpdateChannelBadge(channel){
+  try{
+    const badge=$('settings-webui-version-badge');
+    if(!badge) return;
+    let base=badge.textContent||'';
+    // Strip any existing " · Experimental" suffix, then re-append if needed.
+    base=base.replace(/\s·\sExperimental\s*$/,'');
+    badge.textContent = channel==='experimental' ? (base+' · Experimental') : base;
+  }catch(e){}
+}
+
+async function checkUpdatesNow(channelOverride){
   const btn=$('btnCheckUpdatesNow');
   const label=$('checkUpdatesLabel');
   const spinner=$('checkUpdatesSpinner');
@@ -11714,8 +12120,15 @@ async function checkUpdatesNow(){
   if(spinner) spinner.style.display='';
   if(label) label.textContent=t('settings_checking');
   if(status) status.textContent='';
+
   try {
-    const data=await api('/api/updates/check',{method:'POST',body:JSON.stringify({force:true}),timeoutMs:60000});
+    // Pass the channel explicitly when the caller has one (e.g. the dropdown
+    // just switched) so the check cannot race the debounced settings autosave
+    // and answer for the previous channel. Omit otherwise → server uses the
+    // saved setting. (Fable UX gate.)
+    const _checkBody={force:true};
+    if(channelOverride==='stable'||channelOverride==='experimental') _checkBody.channel=channelOverride;
+    const data=await api('/api/updates/check',{method:'POST',body:JSON.stringify(_checkBody),timeoutMs:60000});
     if(data.disabled){
       if(status){status.textContent=t('settings_updates_disabled');status.style.color='var(--muted)';}
     } else {
@@ -11735,14 +12148,18 @@ async function checkUpdatesNow(){
       const agentPart=formatUpdatePart('Agent',data.agent);
       if(webuiPart) parts.push(webuiPart);
       if(agentPart) parts.push(agentPart);
+      const manualInstruction=(typeof _formatManualUpdateInstruction==='function')
+        ? _formatManualUpdateInstruction(data.webui)
+        : null;
       // Track non-git targets separately so a mixed deployment (one git
       // checkout + one no-git install) never hides the "can't check" state
       // behind an up-to-date summary (#4356).
       const noGitParts=[];
-      if(data.webui&&data.webui.no_git) noGitParts.push('WebUI');
+      if(data.webui&&data.webui.no_git&&!data.webui.manual_update) noGitParts.push('WebUI');
       if(data.agent&&data.agent.no_git&&!data.agent.ignored) noGitParts.push('Agent');
       if(parts.length){
         let txt=t('settings_updates_available').replace('{count}',parts.join(', '));
+        if(manualInstruction) txt+=' · '+manualInstruction;
         if(noGitParts.length) txt+=' · '+t('settings_update_no_git');
         if(status){status.textContent=txt;status.style.color='var(--accent)';}
         // Also trigger the update banner
@@ -11777,29 +12194,57 @@ async function checkUpdatesNow(){
 
 // ── Auxiliary Models ──────────────────────────────────────────────────────────
 
-// Canonical auxiliary task slots with display names.
-// Keep in sync with hermes_cli/main.py _AUX_TASKS and hermes_cli/web_server.py _AUX_TASK_SLOTS.
-const _AUX_TASK_SLOTS=[
- {key:'vision',nameKey:'settings_aux_task_vision',descKey:'settings_aux_task_vision_desc'},
- {key:'compression',nameKey:'settings_aux_task_compression',descKey:'settings_aux_task_compression_desc'},
- {key:'web_extract',nameKey:'settings_aux_task_web_extract',descKey:'settings_aux_task_web_extract_desc'},
- {key:'session_search',nameKey:'settings_aux_task_session_search',descKey:'settings_aux_task_session_search_desc'},
- {key:'approval',nameKey:'settings_aux_task_approval',descKey:'settings_aux_task_approval_desc'},
- {key:'mcp',nameKey:'settings_aux_task_mcp',descKey:'settings_aux_task_mcp_desc'},
- {key:'title_generation',nameKey:'settings_aux_task_title_generation',descKey:'settings_aux_task_title_generation_desc'},
- {key:'skills_hub',nameKey:'settings_aux_task_skills_hub',descKey:'settings_aux_task_skills_hub_desc'},
- {key:'curator',nameKey:'settings_aux_task_curator',descKey:'settings_aux_task_curator_desc'},
- {key:'kanban_decomposer',nameKey:'settings_aux_task_kanban_decomposer',descKey:'settings_aux_task_kanban_decomposer_desc'},
- {key:'profile_describer',nameKey:'settings_aux_task_profile_describer',descKey:'settings_aux_task_profile_describer_desc'},
- {key:'triage_specifier',nameKey:'settings_aux_task_triage_specifier',descKey:'settings_aux_task_triage_specifier_desc'},
-];
-
 let _auxProviders=[];       // cached provider list from /api/models
+let _auxTasks=[];           // sanitized auxiliary task configs from /api/model/auxiliary
 let _auxOriginalConfig=null; // snapshot of initial config for dirty detection
 let _mainAdvancedConfig=null; // current advanced config for the default chat model
 
 function _auxSelectStyle(){
  return 'width:100%;padding:6px 8px;background:var(--code-bg);color:var(--text);border:1px solid var(--border2);border-radius:6px;font-size:12px;box-sizing:border-box';
+}
+
+function _auxTaskLabelFromMeta(taskKey, taskCfg){
+  const nameKey='settings_aux_task_'+taskKey;
+  const descKey=nameKey+'_desc';
+  const tName=t(nameKey);
+  const tDesc=t(descKey);
+  const name=(tName&&tName!==nameKey)?String(tName).trim():'';
+  const description=(tDesc&&tDesc!==descKey)?String(tDesc).trim():'';
+  const fallbackName=(taskCfg&&typeof taskCfg.label==='string'&&taskCfg.label.trim())?String(taskCfg.label).trim():taskKey;
+  const fallbackDesc=(taskCfg&&typeof taskCfg.description==='string'&&taskCfg.description.trim())?String(taskCfg.description).trim():'';
+  return {
+    task: taskKey,
+    label: name||fallbackName,
+    description: description||fallbackDesc,
+  };
+}
+
+function _normalizeAuxiliaryTasks(rawTasks){
+  const tasks=Array.isArray(rawTasks)?rawTasks:[];
+  const out=[];
+  const seen=new Set();
+  for(const rawTask of tasks){
+    if(!rawTask||typeof rawTask!=='object') continue;
+    const task=(typeof rawTask.task==='string'?String(rawTask.task).trim():'');
+    if(!task||seen.has(task)) continue;
+    seen.add(task);
+    const meta=_auxTaskLabelFromMeta(task,rawTask);
+    const entry={
+      task,
+      provider:String(rawTask.provider||'auto').trim()||'auto',
+      model:String(rawTask.model||'').trim(),
+      base_url:String(rawTask.base_url||'').trim(),
+      timeout:rawTask.timeout,
+      download_timeout:rawTask.download_timeout,
+      max_concurrency:rawTask.max_concurrency,
+      extra_body:rawTask.extra_body&&typeof rawTask.extra_body==='object'?rawTask.extra_body:{},
+      api_key_set:!!rawTask.api_key_set,
+      label:meta.label,
+      description:meta.description,
+    };
+    out.push(entry);
+  }
+  return out;
 }
 
 function _buildAuxProviderOptions(sel,providers,currentProvider){
@@ -11930,26 +12375,19 @@ function _mainModelSupportsServiceTier(cfg){
  const optgroup=selectedOpt&&selectedOpt.parentElement&&selectedOpt.parentElement.tagName==='OPTGROUP'?selectedOpt.parentElement:null;
  const provider=((selectedOpt&&selectedOpt.dataset&&selectedOpt.dataset.provider)||(optgroup&&optgroup.dataset&&optgroup.dataset.provider)||(cfg&&cfg.provider)||'').trim().toLowerCase();
  if(provider!=='openai'&&provider!=='openai-api'&&provider!=='openai-codex') return false;
- if(provider==='openai-codex') return false;
- const rawModel=String((selectedOpt&&selectedOpt.value)||(selected&&selected.value)||(cfg&&cfg.model)||'').trim().toLowerCase();
- if(!rawModel) return true;
- let bareModel=rawModel;
- if(rawModel.includes('/')){
-  const slash=rawModel.indexOf('/');
-  if(rawModel.slice(0,slash)!=='openai') return false;
-  bareModel=rawModel.slice(slash+1);
- }
- if(bareModel.includes('codex')) return false;
- return bareModel.startsWith('gpt-')||bareModel.startsWith('o1')||bareModel.startsWith('o3')||bareModel.startsWith('o4');
+ const fastSupport = selectedOpt&&selectedOpt.dataset?selectedOpt.dataset.fast:'';
+ if(fastSupport) return fastSupport==='1'||fastSupport==='true';
+ return cfg&&cfg.supports_fast_tier===true;
 }
 
-function _openAuxAdvancedOptions(taskKey,cfg){
- const isMain=taskKey==='__main__';
- const slot=isMain?{key:taskKey,nameKey:'settings_label_model',descKey:'settings_desc_model'}:(_AUX_TASK_SLOTS.find(s=>s.key===taskKey)||{key:taskKey,nameKey:'',descKey:''});
+function _openAuxAdvancedOptions(taskCfg,cfg){
+ const isMain=taskCfg==='__main__';
+ const taskKey=isMain?'__main__':(taskCfg&&typeof taskCfg==='object'&&typeof taskCfg.task==='string'?taskCfg.task:typeof taskCfg==='string'?taskCfg:'');
+ const slot=isMain?{task:taskKey,label:(t('settings_label_model')||'Default model')}:_auxTaskLabelFromMeta(taskKey,taskCfg);
  const overlay=_ensureAuxAdvancedModal();
  overlay.dataset.task=taskKey;
  const title=$('auxAdvancedTitle'),sub=$('auxAdvancedSubtitle'),body=$('auxAdvancedBody');
- const slotName=t(slot.nameKey)||slot.key;
+ const slotName=isMain?(t('settings_label_model')||'Default model'):(slot&&slot.label)||taskKey;
  if(title) title.textContent=isMain?(t('settings_main_advanced_title')||'Main model options'):((t('settings_aux_advanced_title')||'{task} options').replace('{task}',slotName));
  if(sub) sub.textContent=isMain?(t('settings_main_advanced_subtitle')||'Advanced config for the default chat model.'):(t('settings_aux_advanced_subtitle')||'Advanced config for auxiliary.');
  const extraBody=cfg&&cfg.extra_body&&typeof cfg.extra_body==='object'&&Object.keys(cfg.extra_body).length?JSON.stringify(cfg.extra_body,null,2):'';
@@ -11967,7 +12405,7 @@ function _openAuxAdvancedOptions(taskKey,cfg){
    _auxAdvancedInputHtml('auxAdvancedBaseUrl',t('settings_aux_advanced_base_url')||'Base URL',_auxAdvancedValue(cfg,'base_url'),t('settings_aux_advanced_base_url_desc')||'Optional provider endpoint override.','text','inputmode="url"')+
    serviceTierField+
    timingFields+
-   `<label style="display:grid;gap:4px;font-size:12px;color:var(--text)"><span style="font-weight:600">${esc(t('settings_aux_advanced_extra_body')||'Extra body JSON')}</span><textarea id="auxAdvancedExtraBody" rows="6" style="width:100%;box-sizing:border-box;padding:7px 8px;background:var(--code-bg);color:var(--text);border:1px solid var(--border2);border-radius:6px;font-size:12px;font-family:var(--mono,monospace)">${esc(extraBody)}</textarea><span style="font-size:10px;color:var(--muted);line-height:1.35">${esc(t('settings_aux_advanced_extra_body_desc')||'Optional JSON object merged into the model request body.')}</span></label>`+
+    `<label style="display:grid;gap:4px;font-size:12px;color:var(--text)"><span style="font-weight:600">${esc(t('settings_aux_advanced_extra_body')||'Extra body JSON')}</span><textarea id="auxAdvancedExtraBody" rows="6" style="width:100%;box-sizing:border-box;padding:7px 8px;background:var(--code-bg);color:var(--text);border:1px solid var(--border2);border-radius:6px;font-size:12px;font-family:var(--font-mono)">${esc(extraBody)}</textarea><span style="font-size:10px;color:var(--muted);line-height:1.35">${esc(t('settings_aux_advanced_extra_body_desc')||'Optional JSON object merged into the model request body.')}</span></label>`+
    _auxAdvancedInputHtml('auxAdvancedApiKey',t('settings_aux_advanced_api_key')||'API key override','',apiKeyHint,'text','autocomplete="one-time-code" inputmode="text" readonly onfocus="this.removeAttribute(&quot;readonly&quot;)"',';-webkit-text-security:disc')+
    `<label style="display:${cfg&&cfg.api_key_set?'flex':'none'};align-items:center;gap:8px;font-size:12px;color:var(--text)"><input id="auxAdvancedApiKeyClear" type="checkbox" style="width:15px;height:15px;accent-color:var(--accent)"><span>${esc(t('settings_aux_advanced_api_key_clear')||'Clear existing API key override')}</span></label>`;
  }
@@ -12073,68 +12511,68 @@ async function _loadAuxiliaryModels(){
  container.innerHTML='<div style="color:var(--muted);font-size:12px">'+(t('settings_aux_loading')||'Loading…')+'</div>';
 
  try{
- // Fetch auxiliary config AND the WebUI's own /api/models for provider/model lists
- const [auxData,modelsData]=await Promise.all([
- api('/api/model/auxiliary').catch(()=>null),
- api('/api/models').catch(()=>null),
- ]);
- // Build provider list from /api/models groups
- // /api/models returns: { groups: [{ provider: str, provider_id: str, models: [{id,label}] }] }
- const groups=(modelsData&&modelsData.groups)||[];
- _auxProviders=groups.filter(g=>g.provider&&((g.models&&g.models.length>0)||(g.extra_models&&g.extra_models.length>0))).map(g=>({
- slug:g.provider_id||g.provider,
- name:g.provider,
- models:[...(g.models||[]),...(g.extra_models||[])].map(m=>m.id),
- }));
- if(auxData&&Object.prototype.hasOwnProperty.call(auxData,'main')){
- _mainAdvancedConfig=auxData.main||{};
- }else{
- _mainAdvancedConfig=null;
- }
- _bindMainAdvancedOptionsButton();
- const tasks=(auxData&&auxData.tasks)||[];
-  // Build a quick lookup: taskKey → {provider, model}
+  // Fetch auxiliary config AND the WebUI's own /api/models for provider/model lists
+  const [auxData,modelsData]=await Promise.all([
+   api('/api/model/auxiliary').catch(()=>null),
+   api('/api/models').catch(()=>null),
+  ]);
+  // Build provider list from /api/models groups
+  // /api/models returns: { groups: [{ provider: str, provider_id: str, models: [{id,label}] }] }
+  const groups=(modelsData&&modelsData.groups)||[];
+  _auxProviders=groups.filter(g=>g.provider&&((g.models&&g.models.length>0)||(g.extra_models&&g.extra_models.length>0))).map(g=>({
+   slug:g.provider_id||g.provider,
+   name:g.provider,
+   models:[...(g.models||[]),...(g.extra_models||[])].map(m=>m.id),
+  }));
+  if(auxData&&Object.prototype.hasOwnProperty.call(auxData,'main')){
+   _mainAdvancedConfig=auxData.main||{};
+  }else{
+   _mainAdvancedConfig=null;
+  }
+  _bindMainAdvancedOptionsButton();
+  _auxTasks=_normalizeAuxiliaryTasks((auxData&&auxData.tasks)||[]);
+  // Build a quick lookup: taskKey → config
   const taskMap={};
-  for(const t of tasks) taskMap[t.task]=t;
+  for(const task of _auxTasks) taskMap[task.task]=task;
   _auxOriginalConfig=JSON.parse(JSON.stringify(taskMap));
 
   container.innerHTML='';
-  for(const slot of _AUX_TASK_SLOTS){
-   const cfg=taskMap[slot.key]||{provider:'auto',model:''};
+  for(const task of _auxTasks){
+   const cfg=taskMap[task.task]||{provider:'auto',model:''};
    const row=document.createElement('div');
    row.style.cssText='display:grid;grid-template-columns:120px 1fr 1fr 34px;gap:8px;align-items:center;margin-bottom:8px';
 
    // Task name + description
    const label=document.createElement('div');
    label.style.cssText='font-size:12px;font-weight:500;color:var(--text);line-height:1.3';
-   label.innerHTML=esc(t(slot.nameKey)||slot.key)+'<div style="font-size:10px;color:var(--muted);font-weight:400">'+esc(t(slot.descKey)||'')+'</div>';
+   label.innerHTML=esc(task.label||task.task)+'<div style="font-size:10px;color:var(--muted);font-weight:400">'+esc(task.description||'')+'</div>';
    row.appendChild(label);
 
    // Provider select
    const provSel=document.createElement('select');
-   provSel.id='aux-prov-'+slot.key;
+   provSel.id='aux-prov-'+task.task;
    provSel.style.cssText=_auxSelectStyle();
    _buildAuxProviderOptions(provSel,_auxProviders,cfg.provider);
-   provSel.addEventListener('change',()=>_onAuxProviderChange(slot.key,_auxProviders));
+   provSel.addEventListener('change',()=>_onAuxProviderChange(task.task,_auxProviders));
    row.appendChild(provSel);
 
    // Model select
    const modelSel=document.createElement('select');
-   modelSel.id='aux-model-'+slot.key;
+   modelSel.id='aux-model-'+task.task;
    modelSel.style.cssText=_auxSelectStyle();
    _buildAuxModelOptions(modelSel,cfg.provider,_auxProviders,cfg.model);
-   modelSel.addEventListener('change',()=>_onAuxModelChange(slot.key));
+   modelSel.addEventListener('change',()=>_onAuxModelChange(task.task));
    row.appendChild(modelSel);
 
    const advancedBtn=document.createElement('button');
    advancedBtn.type='button';
    advancedBtn.className='aux-advanced-btn model-advanced-btn';
    const advTitle=t('settings_aux_advanced_button_title')||'Advanced options';
-   const slotName=t(slot.nameKey)||slot.key;
+   const taskName=task.label||task.task;
    advancedBtn.title=advTitle;
-   advancedBtn.setAttribute('aria-label',(t('settings_aux_advanced_button_aria')||'Advanced options for {task}').replace('{task}',slotName));
+   advancedBtn.setAttribute('aria-label',(t('settings_aux_advanced_button_aria')||'Advanced options for {task}').replace('{task}',taskName));
    advancedBtn.innerHTML=typeof li==='function'?li('settings',15):'⚙';
-   advancedBtn.addEventListener('click',()=>_openAuxAdvancedOptions(slot.key,cfg));
+   advancedBtn.addEventListener('click',()=>_openAuxAdvancedOptions(task,cfg));
    row.appendChild(advancedBtn);
 
    container.appendChild(row);
@@ -12172,20 +12610,20 @@ async function _loadAuxiliaryModels(){
 
 async function _applyAuxModels(){
  let saved=0;
- for(const slot of _AUX_TASK_SLOTS){
-  const provSel=$('aux-prov-'+slot.key);
-  const modelSel=$('aux-model-'+slot.key);
+ for(const task of _auxTasks){
+  const provSel=$('aux-prov-'+task.task);
+  const modelSel=$('aux-model-'+task.task);
   if(!provSel) continue;
   const provider=provSel.value;
   const model=(modelSel&&modelSel.value!=='__custom__')?(modelSel.value||''):'';
-  const orig=_auxOriginalConfig?.[slot.key]||{provider:'auto',model:''};
+  const orig=_auxOriginalConfig?.[task.task]||{provider:'auto',model:''};
   // Only save if changed
   if(provider!==orig.provider||model!==orig.model){
    try{
-    await api('/api/model/set',{method:'POST',body:JSON.stringify({scope:'auxiliary',task:slot.key,provider,model})});
+    await api('/api/model/set',{method:'POST',body:JSON.stringify({scope:'auxiliary',task:task.task,provider,model})});
     saved++;
    }catch(e){
-    console.warn('[settings] failed to save aux task',slot.key,e);
+    console.warn('[settings] failed to save aux task',task.task,e);
     if(typeof showToast==='function') showToast(t('settings_aux_save_failed')||'Failed to save auxiliary model');
     return;
    }
@@ -12212,6 +12650,7 @@ async function saveSettings(andClose){
   const showClaudeCodeSessions=!!($('settingsShowClaudeCodeSessions')||{}).checked;
   const showCronSessions=!!($('settingsShowCronSessions')||{}).checked;
   const showWebhookSessions=!!($('settingsShowWebhookSessions')||{}).checked;
+  const showKanbanSessions=!!($('settingsShowKanbanSessions')||{}).checked;
   const showPreviousMessagingSessions=!!($('settingsShowPreviousMessagingSessions')||{}).checked;
   const pinnedSessionsLimit=parseInt(($('settingsPinnedSessionsLimit')||{}).value,10)||3;
   const pw=($('settingsPassword')||{}).value;
@@ -12231,7 +12670,11 @@ async function saveSettings(andClose){
   body.font_size=fontSize;
   body.session_jump_buttons=!!($('settingsSessionJumpButtons')||{}).checked;
   body.session_endless_scroll=!!($('settingsSessionEndlessScroll')||{}).checked;
-  body.chat_activity_display_mode=(($('settingsChatActivityDisplayMode')||{}).value==='transparent_stream')?'transparent_stream':'compact_worklog';
+  body.chat_activity_display_mode=((($('settingsChatActivityDisplayMode')||{}).value==='transparent_stream')
+    ||(($('settingsChatActivityDisplayMode')||{}).value==='hide_all_activity'))
+    ? ($('settingsChatActivityDisplayMode')||{}).value
+    : 'compact_worklog';
+  body.transparent_stream_event_timestamps=(($('settingsTransparentEventTimestamps')||{}).checked)!==false;
   body.auto_scroll_follow=!!($('settingsAutoScrollFollow')||{}).checked;
   body.render_user_markdown=!!($('settingsRenderUserMarkdown')||{}).checked;
   body.large_text_paste_as_attachment=!!($('settingsLargeTextPasteAsAttachment')||{}).checked;
@@ -12264,6 +12707,7 @@ async function saveSettings(andClose){
   // mirror the autosave path so the explicit Save Settings button persists them too. (#3514)
   body.show_cron_sessions=showCliSessions&&showCronSessions;
   body.show_webhook_sessions=showCliSessions&&showWebhookSessions;
+  body.show_kanban_sessions=showCliSessions&&showKanbanSessions;
   body.show_previous_messaging_sessions=showPreviousMessagingSessions;
   body.pinned_sessions_limit=pinnedSessionsLimit;
   body.sync_to_insights=!!($('settingsSyncInsights')||{}).checked;
@@ -12291,7 +12735,7 @@ async function saveSettings(andClose){
     const payload={...body,_set_password:pw.trim()};
     if(_settingsPasswordAuthEnabled) payload._current_password=currentPw;
     try{
-      const saved=await api('/api/settings',{method:'POST',body:JSON.stringify(payload)});
+      const saved=await _enqueueSettingsPost({method:'POST',body:JSON.stringify(payload)});
       if(modelChanged && model){
         try{
           await api('/api/default-model',{method:'POST',body:JSON.stringify({model,provider:modelState.model_provider||null})});
@@ -12321,7 +12765,7 @@ async function saveSettings(andClose){
     }catch(e){showToast(t('settings_save_failed')+e.message);return;}
   }
   try{
-    const saved=await api('/api/settings',{method:'POST',body:JSON.stringify(body)});
+    const saved=await _enqueueSettingsPost({method:'POST',body:JSON.stringify(body)});
     if(modelChanged && model){
       try{
         await api('/api/default-model',{method:'POST',body:JSON.stringify({model,provider:modelState.model_provider||null})});
@@ -12344,8 +12788,8 @@ async function saveSettings(andClose){
 
 async function signOut(){
   try{
-    await api('/api/auth/logout',{method:'POST',body:'{}'});
-    window.location.href='login';
+    const response=await api('/api/auth/logout',{method:'POST',body:'{}'});
+    window.location.href=response.trusted_logout_url||'login';
   }catch(e){
     showToast(t('sign_out_failed')+e.message);
   }
@@ -12358,7 +12802,7 @@ async function goPasswordless(){
   const payload={_passwordless:true};
   if(_settingsPasswordAuthEnabled && currentPw) payload._current_password=currentPw;
   try{
-    const saved=await api('/api/settings',{method:'POST',body:JSON.stringify(payload)});
+    const saved=await _enqueueSettingsPost({method:'POST',body:JSON.stringify(payload)});
     showToast('Password removed. Passkey sign-in remains enabled.');
     _setSettingsAuthButtonsVisible(!!saved.auth_enabled);
     _syncPasswordlessButton({auth_enabled:saved.auth_enabled,password_auth_enabled:false,passkeys_count:1});
@@ -12388,7 +12832,7 @@ async function disableAuth(){
   const payload={_clear_password:true};
   if(_settingsPasswordAuthEnabled) payload._current_password=currentPw;
   try{
-    const saved=await api('/api/settings',{method:'POST',body:JSON.stringify(payload)});
+    const saved=await _enqueueSettingsPost({method:'POST',body:JSON.stringify(payload)});
     showToast(t('auth_disabled'));
     const disableBtn=$('btnDisableAuth');
     if(disableBtn) disableBtn.style.display='none';
@@ -12416,7 +12860,21 @@ async function disableAuth(){
 let _cronPollSince=Date.now()/1000;  // track from page load
 let _cronPollTimer=null;
 let _cronUnreadCount=0;
+let _cronPollGeneration=0;
 const _cronNewJobIds=new Set();  // track which job IDs had new completions (unread)
+
+function _resetCronUnreadForProfileSwitch(){
+  _cronPollGeneration++;
+  _cronNewJobIds.clear();
+  _cronPollSince=Date.now()/1000;
+  // Clear persisted cron sidebar markers from the profile we left. Non-cron
+  // completion unread stays intact (#5960 gate: sticky all-profile leak).
+  if(typeof _clearCronSessionCompletionUnreadForInactiveProfiles==='function'){
+    const activeProfile=(typeof S!=='undefined'&&S&&S.activeProfile)||'default';
+    _clearCronSessionCompletionUnreadForInactiveProfiles(activeProfile);
+  }
+  updateCronBadge();
+}
 
 // Auto-refresh the cron list when a job is created from chat or any external source.
 // The chat path dispatches this event when the agent response mentions cron creation.
@@ -12429,7 +12887,9 @@ function startCronPolling(){
   _cronPollTimer=setInterval(async()=>{
     if(document.hidden) return;  // don't poll when tab is in background
     try{
+      const pollGeneration=_cronPollGeneration;
       const data=await api(`/api/crons/recent?since=${_cronPollSince}`);
+      if(pollGeneration!==_cronPollGeneration) return;
       if(data.completions&&data.completions.length>0){
         for(const c of data.completions){
           if(c.toast_notifications !== false){
@@ -12438,7 +12898,11 @@ function startCronPolling(){
           _cronPollSince=Math.max(_cronPollSince,c.completed_at);
           if(c.job_id) _cronNewJobIds.add(String(c.job_id));
           if(c.session_id && typeof _markSessionCompletionUnreadIfBackground === 'function'){
-            _markSessionCompletionUnreadIfBackground(c.session_id, c.message_count);
+            const activeProfile=(typeof S!=='undefined'&&S&&S.activeProfile)||'default';
+            _markSessionCompletionUnreadIfBackground(c.session_id, c.message_count, {
+              source:'cron',
+              profile:activeProfile,
+            });
           }
         }
         // _cronUnreadCount is derived from _cronNewJobIds.size in updateCronBadge.
