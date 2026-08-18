@@ -20859,7 +20859,6 @@ function _appendWsLoadMoreRow(container, dirPath, meta, depth){
   btn.onclick=(e)=>{
     e.stopPropagation();
     if(meta.loading)return;
-    meta.loading=true;
     btn.disabled=true;
     btn.textContent=t('workspace_dir_loading');
     _wsLoadMoreDirEntries(dirPath);
