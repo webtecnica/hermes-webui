@@ -68,6 +68,7 @@ from api.models import (
     StateDBSessionMessagesSnapshot,
     _is_empty_partial_activity_message,
     _evict_sessions_over_cap,
+    _message_matches_pending_checkpoint,
     clear_process_wakeup_pause,
     get_state_db_session_messages,
     record_process_wakeup_provider_unavailable_pause,
@@ -1701,6 +1702,11 @@ def _active_turn_authority(session, stream_id, msg_text):
         'attachments': copy.deepcopy(getattr(session, 'pending_attachments', None) or []),
         'checkpoint': checkpoint,
         'current_turn_user_idx': None,
+        # WebUI checkpoint identity (#6407 re-gate): the pending turn's
+        # stream-owned id, separate from the Agent's independent turn id.
+        # Settlement paths stamp THIS id (not the Agent's) on user rows so
+        # the shared strict matcher recognizes the exact turn.
+        'pending_turn_id': str(getattr(session, 'pending_turn_id', None) or stream_id),
         'turn_id': '',
     }
 
@@ -1788,6 +1794,13 @@ def _mark_active_turn_checkpoint(message, identity):
         and identity.get('token')
     ):
         message['_active_turn_token'] = identity['token']
+        # WebUI checkpoint identity (#6407 re-gate): when the Agent result
+        # already contains the user row, stamp the WebUI pending_turn_id too —
+        # not just the token — so the shared strict matcher recognizes this
+        # exact turn and a one-sided legacy row can never be claimed.
+        _webui_turn_id = str(identity.get('pending_turn_id') or '').strip()
+        if _webui_turn_id:
+            message['_turn_id'] = _webui_turn_id
     return message
 
 
@@ -1882,7 +1895,13 @@ def _materialize_active_turn_user(identity, msg_text, source):
             message['timestamp'] = identity['timestamp']
         if identity.get('attachments'):
             message['attachments'] = copy.deepcopy(identity['attachments'])
-        _turn_id = str(identity.get('turn_id') or '').strip()
+        # WebUI checkpoint identity (#6407 re-gate): prefer the stream-owned
+        # pending_turn_id over the Agent's independent turn id. The Agent turn
+        # id is a boundary hint; the WebUI pending_turn_id is what the shared
+        # strict matcher compares, so a synthesized settlement row must carry
+        # the WebUI id when it exists.
+        _webui_turn_id = str(identity.get('pending_turn_id') or '').strip()
+        _turn_id = _webui_turn_id or str(identity.get('turn_id') or '').strip()
         if _turn_id:
             # Per-turn identity (#6407): the deferred success merge must stamp
             # the SAME _turn_id the pending checkpoint uses, so the recovery
@@ -7864,28 +7883,19 @@ def _materialize_pending_user_turn_before_error(
             break
 
     def is_exact_checkpoint(messages):
+        # Route through the shared strict matcher (api.models) so the
+        # streaming error-materializer enforces the SAME one-sided turn-id
+        # rule as every other checkpoint consumer (#6407 re-gate: a one-sided
+        # missing row id is never a match). No second copy to drift.
         if not isinstance(messages, list) or not messages:
             return False
-        existing = messages[-1]
-        if not isinstance(existing, dict) or existing.get('role') != 'user':
-            return False
-        # Per-turn turn_id collision protection (#6407), mirroring
-        # _message_matches_pending_checkpoint: when BOTH sides carry a turn id,
-        # require an exact match; when either side lacks one (migration
-        # scenario), fall through to the fingerprint checks below.
-        existing_turn_id = existing.get('_turn_id')
-        if pending_turn_id and existing_turn_id and str(existing_turn_id) != str(pending_turn_id):
-            return False
-        existing_source = existing.get('_source') or 'webui'
-        try:
-            existing_ts = int(existing.get('timestamp'))
-        except (TypeError, ValueError):
-            return False
-        return (
-            _normalize_user_text(_message_text(existing.get('content'))) == _normalize_user_text(pending_text)
-            and existing_ts == recovered_ts
-            and existing_source == pending_source
-            and list(existing.get('attachments') or []) == pending_attachments
+        return _message_matches_pending_checkpoint(
+            messages[-1],
+            pending_text,
+            recovered_ts,
+            pending_source,
+            pending_attachments,
+            pending_turn_id=pending_turn_id,
         )
 
     if is_exact_checkpoint(getattr(session, 'messages', None)):
@@ -13308,8 +13318,31 @@ def cancel_stream(stream_id: str) -> bool:
                             # must NOT short-circuit synthesis — that would re-introduce
                             # the data-loss bug this guard is supposed to prevent.
                             if isinstance(_last_content, str) and _last_ts >= _pending_started:
+                                # Identity gate (#6407 re-gate): when the pending side
+                                # carries a turn id, the tail row must carry the SAME
+                                # non-empty _turn_id to be considered already-persisted.
+                                # A one-sided missing/different id means this is a
+                                # different turn — synthesize the prompt instead of
+                                # suppressing it (fail-safe, never destructive).
+                                _cancel_turn_id = (
+                                    getattr(_cs, 'pending_turn_id', None) or stream_id
+                                )
+                                _last_turn_id = _last_user.get('_turn_id')
+                                _identity_ok = (
+                                    not _cancel_turn_id
+                                    or (
+                                        bool(_last_turn_id)
+                                        and str(_last_turn_id) == str(_cancel_turn_id)
+                                    )
+                                )
                                 # Tolerate the workspace prefix the streaming thread prepends.
-                                if _pending_user == _last_content or _pending_user in _last_content:
+                                if (
+                                    _identity_ok
+                                    and (
+                                        _pending_user == _last_content
+                                        or _pending_user in _last_content
+                                    )
+                                ):
                                     _already_persisted = True
                         if not _already_persisted:
                             _recovered_ts = int(time.time())

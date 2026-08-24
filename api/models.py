@@ -2427,13 +2427,15 @@ def _normalize_journal_recovery_text(value) -> str:
 def _message_matches_pending_checkpoint(message, pending_text, timestamp, source, attachments, pending_turn_id=None):
     if not isinstance(message, dict) or message.get('role') != 'user':
         return False
-    # Per-turn turn_id collision protection (#6407): migration-aware check.
-    # When BOTH sides have _turn_id, require exact match.
-    # When either side lacks _turn_id (migration scenario), fall through to
-    # the text+ts+source+attachments fingerprint checks below.
+    # Per-turn turn_id collision protection (#6407): strict one-sided rule.
+    # When the pending side carries a non-empty pending_turn_id, the candidate
+    # MUST carry the same non-empty _turn_id — a one-sided missing row id is
+    # NOT a match. Fingerprint migration is permitted only when the pending
+    # side itself lacks the new field (legacy sessions).
     msg_turn_id = message.get('_turn_id')
-    if pending_turn_id and msg_turn_id and str(msg_turn_id) != str(pending_turn_id):
-        return False
+    if pending_turn_id:
+        if not msg_turn_id or str(msg_turn_id) != str(pending_turn_id):
+            return False
     try:
         message_timestamp = int(message.get('timestamp'))
         expected_timestamp = int(timestamp)
@@ -2762,6 +2764,7 @@ def _pending_recovery_turn_start(session) -> int | None:
     pending_text = getattr(session, 'pending_user_message', None)
     if not pending_text:
         return None
+    pending_turn_id = getattr(session, 'pending_turn_id', None) or session.active_stream_id
     for idx in range(len(session.messages or []) - 1, -1, -1):
         message = session.messages[idx]
         if _message_matches_pending_checkpoint(
@@ -2770,8 +2773,13 @@ def _pending_recovery_turn_start(session) -> int | None:
             session.pending_started_at,
             session.pending_user_source,
             session.pending_attachments,
-            pending_turn_id=getattr(session, 'pending_turn_id', None) or session.active_stream_id,
-        ) or _message_matches_pending_text(message, pending_text):
+            pending_turn_id=pending_turn_id,
+        ):
+            return idx
+        # Text-only fallback (#6378 migration): allowed ONLY when the pending
+        # side itself lacks the new field. When pending_turn_id is present, a
+        # one-sided missing row id is NOT a match (#6407 re-gate).
+        if not pending_turn_id and _message_matches_pending_text(message, pending_text):
             return idx
     return None
 
@@ -3541,22 +3549,27 @@ def _apply_core_sync_or_error_marker(
         _recovered_ts = int(time.time())
         if isinstance(session.pending_started_at, (int, float)) and session.pending_started_at > 0:
             _recovered_ts = int(session.pending_started_at)
+        _pending_turn_id = getattr(session, 'pending_turn_id', None) or stream_id_for_recheck or session.active_stream_id
         _already_checkpointed = _message_matches_pending_checkpoint(
             session.messages[-1],
             session.pending_user_message,
             _recovered_ts,
             session.pending_user_source,
             session.pending_attachments,
-            pending_turn_id=getattr(session, 'pending_turn_id', None) or stream_id_for_recheck or session.active_stream_id,
+            pending_turn_id=_pending_turn_id,
         )
         _tail_user_already_checkpointed = _already_checkpointed or (
             # Migration-era fallback (#6378): legacy eager-checkpoint rows
             # predate the _turn_id field and may lack fingerprint
             # timestamps; a text-only tail match is the only identity they
             # carry. Gated on the tail row carrying NO _turn_id so an exact
-            # turn-id mismatch is never overridden by text (#6407).
+            # turn-id mismatch is never overridden by text, AND on the
+            # pending side itself lacking the field — when pending_turn_id
+            # is present, a one-sided missing row id is NOT a match
+            # (#6407 re-gate).
             isinstance(session.messages[-1], dict)
             and not session.messages[-1].get('_turn_id')
+            and not _pending_turn_id
             and _message_matches_pending_text(
                 session.messages[-1], session.pending_user_message,
             )
@@ -3646,23 +3659,27 @@ def _apply_core_sync_or_error_marker(
             _recovered_ts = int(time.time())
             if isinstance(session.pending_started_at, (int, float)) and session.pending_started_at > 0:
                 _recovered_ts = int(session.pending_started_at)
+            _pending_turn_id = getattr(session, 'pending_turn_id', None) or stream_id_for_recheck or session.active_stream_id
             _already_checkpointed = _message_matches_pending_checkpoint(
                 session.messages[-1] if session.messages else None,
                 session.pending_user_message,
                 _recovered_ts,
                 session.pending_user_source,
                 session.pending_attachments,
-                pending_turn_id=getattr(session, 'pending_turn_id', None) or stream_id_for_recheck or session.active_stream_id,
+                pending_turn_id=_pending_turn_id,
             )
             _tail_user_already_checkpointed = _already_checkpointed or (
                 # Migration-era fallback (#6378): legacy eager-checkpoint
                 # rows predate the _turn_id field and may lack fingerprint
                 # timestamps; a text-only tail match is the only identity
                 # they carry. Gated on the tail row carrying NO _turn_id so
-                # an exact turn-id mismatch is never overridden by text
-                # (#6407).
+                # an exact turn-id mismatch is never overridden by text,
+                # AND on the pending side itself lacking the field — when
+                # pending_turn_id is present, a one-sided missing row id is
+                # NOT a match (#6407 re-gate).
                 isinstance(session.messages[-1], dict)
                 and not session.messages[-1].get('_turn_id')
+                and not _pending_turn_id
                 and _message_matches_pending_text(
                     session.messages[-1], session.pending_user_message,
                 )

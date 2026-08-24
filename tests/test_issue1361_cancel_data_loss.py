@@ -900,17 +900,19 @@ def test_same_prompt_two_turns_stale_recovery_cannot_claim_new_row():
 
 
 def test_legacy_rows_without_turn_id_use_migration_fingerprint():
-    """Test-plan item 4: rows persisted before the _turn_id field existed
-    must still match via the migration fingerprint (text + timestamp +
-    source + attachments) — the turn-id gate only applies when BOTH sides
-    carry a _turn_id."""
+    """Test-plan item 4 (re-gate): fingerprint migration is permitted ONLY
+    when the pending side itself lacks the new field. When the pending side
+    carries a non-empty pending_turn_id, a one-sided missing row _turn_id is
+    NOT a match — even with identical text/timestamp/source/attachments in
+    the same integer second."""
     legacy = {"role": "user", "content": "please restart the WebUI", "timestamp": 100}
-    # No _turn_id on the row, pending side carries one → fingerprint match.
+    # Pending side carries an id but the row does not → one-sided missing →
+    # NOT a match (#6407 re-gate). Same-second collision is rejected.
     assert models._message_matches_pending_checkpoint(
         legacy, "please restart the WebUI", 100, None, [],
         pending_turn_id="stream_6407_legacy",
-    ) is True
-    # No _turn_id on either side → fingerprint match.
+    ) is False
+    # No _turn_id on either side → genuine legacy fingerprint match.
     assert models._message_matches_pending_checkpoint(
         legacy, "please restart the WebUI", 100, None, [],
         pending_turn_id=None,
@@ -918,15 +920,112 @@ def test_legacy_rows_without_turn_id_use_migration_fingerprint():
     # Fingerprint mismatch still fails (legacy rows are not text-only).
     assert models._message_matches_pending_checkpoint(
         legacy, "please restart the WebUI", 999, None, [],
-        pending_turn_id="stream_6407_legacy",
+        pending_turn_id=None,
     ) is False
-    # Row WITH _turn_id but pending side without (reverse migration) → fallback.
+    # Row WITH _turn_id but pending side without (reverse migration): the
+    # pending side lacks the field, so fingerprint migration is permitted.
     stamped = {"role": "user", "content": "please restart the WebUI",
                "timestamp": 100, "_turn_id": "turn_6407_a"}
     assert models._message_matches_pending_checkpoint(
         stamped, "please restart the WebUI", 100, None, [],
         pending_turn_id=None,
     ) is True
+
+
+def test_same_second_one_sided_collision_rejected():
+    """Re-gate blocker regression: a REAL collision — current pending_turn_id,
+    an ID-less historical row, identical text/source/attachments, and
+    timestamps in the SAME integer second — must be rejected. The old code
+    fell through to the fingerprint and claimed the ID-less row as the
+    current identified turn."""
+    # Historical row persisted before _turn_id existed, same integer second.
+    historical = {
+        "role": "user",
+        "content": "please restart the WebUI",
+        "timestamp": 1778098700,
+        "_source": "webui",
+        "attachments": [{"name": "visible-state.png"}],
+    }
+    # One-sided missing row id → NOT a match, same-second collision rejected.
+    assert models._message_matches_pending_checkpoint(
+        historical, "please restart the WebUI", 1778098700, "webui",
+        [{"name": "visible-state.png"}],
+        pending_turn_id="stream_6407_current",
+    ) is False
+    # Same fingerprint but the row DOES carry the matching id → match.
+    stamped = dict(historical, _turn_id="stream_6407_current")
+    assert models._message_matches_pending_checkpoint(
+        stamped, "please restart the WebUI", 1778098700, "webui",
+        [{"name": "visible-state.png"}],
+        pending_turn_id="stream_6407_current",
+    ) is True
+    # Streaming error-materializer must enforce the SAME rule via the shared
+    # matcher: an ID-less tail row with identical fingerprint is NOT an exact
+    # checkpoint for a pending turn that carries an id → the turn is
+    # materialized, never destructively suppressed.
+    from api.streaming import _materialize_pending_user_turn_before_error
+
+    sid = "test_6407_collision"
+    s = _make_session(
+        session_id=sid,
+        pending_msg="please restart the WebUI",
+        messages=[
+            {"role": "assistant", "content": "previous answer"},
+            dict(historical),
+        ],
+    )
+    s.pending_started_at = 1778098700.0
+    s.pending_turn_id = "stream_6407_current"
+    s.active_stream_id = "stream_6407_current"
+    appended = _materialize_pending_user_turn_before_error(s)
+    assert appended is True
+    user_rows = [m for m in s.messages if m.get("role") == "user"]
+    assert len(user_rows) == 2
+    assert user_rows[-1]["_turn_id"] == "stream_6407_current"
+    assert user_rows[-1]["timestamp"] == 1778098700
+
+
+def test_deferred_settlement_prefers_webui_pending_turn_id_over_agent_turn_id():
+    """Re-gate item 3: settlement paths must stamp the WebUI checkpoint
+    identity (pending_turn_id), NOT the Agent's independent turn id, when the
+    two differ. Covers both the synthesized-row path (_materialize_active_turn_user)
+    and the existing-row path (_mark_active_turn_checkpoint)."""
+    from api.streaming import (
+        _materialize_active_turn_user,
+        _mark_active_turn_checkpoint,
+    )
+
+    identity = {
+        "token": "tok_6407_settle",
+        "text": "please restart the WebUI",
+        "timestamp": 1778098700.0,
+        "source": "webui",
+        "attachments": [],
+        "current_turn_user_idx": 0,
+        "turn_id": "agent_turn_777",  # Agent's independent turn id — must NOT win
+        "pending_turn_id": "stream_6407_webui",  # WebUI checkpoint identity
+    }
+    # Synthesized user row carries the WebUI id.
+    merged = _materialize_active_turn_user(
+        identity, "please restart the WebUI", "webui"
+    )
+    assert merged["_turn_id"] == "stream_6407_webui"
+    assert merged["_active_turn_token"] == "tok_6407_settle"
+    # The committed row is an exact checkpoint for the WebUI identity...
+    assert models._message_matches_pending_checkpoint(
+        merged, "please restart the WebUI", 1778098700, None, [],
+        pending_turn_id="stream_6407_webui",
+    ) is True
+    # ...and is rejected for the Agent-only id (one-sided rule).
+    assert models._message_matches_pending_checkpoint(
+        merged, "please restart the WebUI", 1778098700, None, [],
+        pending_turn_id="agent_turn_777",
+    ) is False
+    # Existing row path: _mark_active_turn_checkpoint stamps the WebUI id too.
+    existing = {"role": "user", "content": "please restart the WebUI"}
+    _mark_active_turn_checkpoint(existing, identity)
+    assert existing["_active_turn_token"] == "tok_6407_settle"
+    assert existing["_turn_id"] == "stream_6407_webui"
 
 
 def test_pending_turn_id_survives_save_load_and_terminal_paths_clear_it():
