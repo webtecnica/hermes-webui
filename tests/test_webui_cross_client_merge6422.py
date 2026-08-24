@@ -679,3 +679,157 @@ class TestGenerationAwareRecovery:
         assert observed.get("acquired") is False, (
             f"sidecar lock must be held through the recovery replace; observed={observed}"
         )
+
+
+class TestReGate20260824:
+    """Re-gate 2026-08-24: release-blocker smoke + production-composed
+    regressions for the append-intent, CAS-fail-closed, directory-fsync, and
+    integer-ID/no-UUID findings."""
+
+    def test_ordinary_save_durable_reload_smoke(self, _isolate_session_dir):
+        """RELEASE BLOCKER repro: a plain `Session.save()` must persist and
+        reload.  Previously `payload` was only assigned inside the CAS-rebuild
+        arm, so the normal path hit `f.write(payload)` with an unbound
+        variable (UnboundLocalError) — every ordinary session save crashed."""
+        session_dir, index_file = _isolate_session_dir
+        sid = "plain_save_smoke"
+        s = Session(
+            session_id=sid,
+            title="smoke title",
+            messages=[
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi there"},
+            ],
+            context_messages=[
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi there"},
+            ],
+        )
+        s.save()  # must NOT raise
+
+        reloaded = Session.load(sid)
+        assert reloaded is not None
+        assert [m["content"] for m in reloaded.messages] == ["hello", "hi there"]
+        assert [m["content"] for m in reloaded.context_messages] == ["hello", "hi there"]
+        assert reloaded.title == "smoke title"
+        persisted = json.loads((session_dir / f"{sid}.json").read_text(encoding="utf-8"))
+        assert persisted["message_count"] == 2
+
+    def test_gateway_append_intent_preserves_concurrent_rows(self, _isolate_session_dir):
+        """Gateway success/error settlement is an APPEND producer: after a
+        concurrent writer persisted rows, the gateway's save must reconcile
+        (merge) instead of overwriting them."""
+        session_dir, index_file = _isolate_session_dir
+        sid = "gateway_vs_stream"
+        base = [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"}]
+
+        # Streaming client completes first.
+        streamer = Session(session_id=sid, messages=[dict(m) for m in base])
+        streamer.save()
+
+        # Gateway error settlement: loaded from the same base, appends its
+        # error row, and (per the fix) establishes append intent.
+        gateway = Session.load(sid)
+        gateway.messages.append({"role": "assistant", "content": "gateway error row"})
+        gateway._merge_concurrent_appends()
+        gateway.save()
+
+        assert _durable_contents(session_dir, sid) == [
+            "q1", "a1", "gateway error row",
+        ]
+
+    def test_synchronous_append_intent_preserves_concurrent_rows(self, _isolate_session_dir):
+        """Synchronous completion producer: a stale client that loaded before
+        a concurrent append must keep the disk rows when it saves with append
+        intent."""
+        session_dir, index_file = _isolate_session_dir
+        sid = "sync_vs_stream"
+        base = [{"role": "user", "content": "q1"}]
+
+        s1 = Session(session_id=sid, messages=[dict(m) for m in base])
+        s1.save()
+
+        # Sync client loaded from the base, appends its turn.
+        sync_client = Session(session_id=sid, messages=[dict(m) for m in base])
+        sync_client.messages.append({"role": "assistant", "content": "sync answer"})
+        # Concurrent stream appends a second row before the sync client saves.
+        other = Session.load(sid)
+        other.messages.append({"role": "assistant", "content": "stream row"})
+        other._merge_concurrent_appends()
+        other.save()
+
+        sync_client._merge_concurrent_appends()
+        sync_client.save()
+
+        assert _durable_contents(session_dir, sid) == [
+            "q1", "stream row", "sync answer",
+        ]
+
+    def test_cas_exhaustion_fails_closed(self, _isolate_session_dir, monkeypatch):
+        """CAS retry exhaustion must ABORT (fail closed), not publish a
+        best-effort merge that could overwrite a concurrent append."""
+        session_dir, index_file = _isolate_session_dir
+        sid = "cas_exhaust"
+        s = Session(session_id=sid, messages=[{"role": "user", "content": "q1"}])
+        s.save()
+
+        stale = Session.load(sid)
+        stale.messages.append({"role": "assistant", "content": "a_fresh"})
+
+        def _never_converges(self):
+            # Every re-merge records a fingerprint that never matches the
+            # on-disk state → the CAS loop exhausts its 3 attempts.
+            self._merge_snapshot_fingerprint = "stale-sentinel-forever"
+
+        monkeypatch.setattr(
+            Session, "_merge_concurrent_appends_locked", _never_converges
+        )
+        stale._merge_concurrent_appends()
+        with pytest.raises(RuntimeError, match="CAS retries exhausted"):
+            stale.save()
+
+        # Disk untouched: the concurrent append was not clobbered.
+        persisted = json.loads((session_dir / f"{sid}.json").read_text(encoding="utf-8"))
+        assert [m["content"] for m in persisted["messages"]] == ["q1"]
+
+    def test_directory_fsync_failure_is_best_effort(self, _isolate_session_dir, monkeypatch):
+        """The parent-directory fsync boundary is best-effort: a platform that
+        refuses directory fsync must not fail the save, and the payload must
+        still be durable."""
+        session_dir, index_file = _isolate_session_dir
+        sid = "dir_fsync_fail"
+        s = Session(session_id=sid, messages=[{"role": "user", "content": "q1"}])
+
+        real_fsync = models.os.fsync
+        calls = {"n": 0}
+
+        def _fsync_then_fail(fd):
+            calls["n"] += 1
+            real_fsync(fd)
+            if calls["n"] == 2:  # second fsync = the directory fd
+                raise OSError("directory fsync not supported")
+
+        monkeypatch.setattr(models.os, "fsync", _fsync_then_fail)
+        s.save()  # must not raise
+
+        assert _durable_contents(session_dir, sid) == ["q1"]
+
+    def test_integer_id_no_uuid_mints_durable_lineage(self):
+        """A genuinely new row whose integer id was supplied by the provider
+        must still receive a uuid: two writers minting the SAME integer id for
+        different rows are disambiguated by the uuid lineage."""
+        rows_a = [{"id": 7, "role": "assistant", "content": "row from A"}]
+        rows_b = [{"id": 7, "role": "assistant", "content": "row from B"}]
+        stamped_a = _assign_stable_message_ids(rows_a)
+        stamped_b = _assign_stable_message_ids(rows_b)
+
+        assert stamped_a == 1 and stamped_b == 1
+        assert rows_a[0]["uuid"] and rows_b[0]["uuid"]
+        assert rows_a[0]["uuid"] != rows_b[0]["uuid"]
+        assert rows_a[0]["id"] == 7 and rows_b[0]["id"] == 7
+
+        # Existing uuid lineage is carried forward untouched.
+        row = [{"id": 3, "uuid": "abc123", "role": "assistant"}]
+        assert _assign_stable_message_ids(row) == 0
+        assert row[0]["uuid"] == "abc123"
+

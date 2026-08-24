@@ -1926,19 +1926,28 @@ class Session:
                     if _new_fp is None or _new_fp == _cur_fp:
                         break  # Re-merge converged or had nothing to merge.
                     # Stalemate — another write happened during re-merge.
+                    # Re-gate 2026-08-24: FAIL CLOSED instead of publishing a
+                    # best-effort merge — a write we could not reconcile
+                    # against could overwrite a concurrent append.
                     if _cas_attempt == 2:
-                        logger.warning(
-                            "Cross-process CAS retries exhausted for session %s "
-                            "(attempts=%d, fingerprint=%s); proceeding with best-effort merge",
-                            self.session_id, _cas_attempt + 1, _cur_fp,
+                        raise RuntimeError(
+                            f"Cross-process CAS retries exhausted for session "
+                            f"{self.session_id} (attempts={_cas_attempt + 1}, "
+                            f"fingerprint={_cur_fp}); refusing to publish an "
+                            f"unreconciled best-effort merge"
                         )
-                if _cas_fp != getattr(self, '_merge_snapshot_fingerprint', None):
-                    # Messages (or adopted generation) changed during re-merge —
-                    # rebuild payload.
-                    meta['message_count'] = len(self.messages or [])
-                    meta['messages'] = self.messages
-                    meta['truncate_generation'] = self.truncate_generation
-                    payload = json.dumps({**meta, **extra}, ensure_ascii=False, indent=2)
+
+            # ── #6422 re-gate 2026-08-24: build the COMPLETE sidecar payload
+            # from the final in-lock state before EVERY write.  Previously the
+            # payload was only built inside the CAS-rebuild arm (where ``meta``
+            # and ``extra`` were no longer in scope), so the normal path hit
+            # ``f.write(payload)`` with an unbound ``payload`` →
+            # UnboundLocalError (release blocker).  ``_sidecar_payload()``
+            # serializes messages, context_messages, message_count, the
+            # truncate generation, and every metadata/extra field from the
+            # current object — which is exactly the authoritative state after
+            # the generation decision and any CAS re-merge above.
+            payload = self._sidecar_payload()
 
             tmp = self.path.with_suffix(f'.tmp.{os.getpid()}.{threading.current_thread().ident}')
             try:
@@ -1947,6 +1956,22 @@ class Session:
                     f.flush()
                     os.fsync(f.fileno())
                 _safe_replace(tmp, self.path)
+                # Re-gate 2026-08-24: complete the parent-directory fsync
+                # boundary so the rename is durable before we advance the
+                # in-memory generation authority below.  Best-effort on
+                # platforms that disallow directory fsync (e.g. Windows).
+                try:
+                    _dir_fd = os.open(SESSION_DIR, os.O_RDONLY)
+                    try:
+                        os.fsync(_dir_fd)
+                    finally:
+                        os.close(_dir_fd)
+                except OSError:
+                    logger.debug(
+                        "Directory fsync unavailable for %s (best-effort)",
+                        SESSION_DIR,
+                        exc_info=True,
+                    )
             except Exception:
                 try:
                     tmp.unlink(missing_ok=True)

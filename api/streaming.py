@@ -2428,6 +2428,9 @@ def _finalize_cancelled_turn(
         return
     _persist_cancelled_turn(session, message=message)
     try:
+        # #6422 re-gate 2026-08-24: cancelled-turn finalization appends a
+        # terminal marker — establish append intent before persisting.
+        session._merge_concurrent_appends()
         session.save()
     except Exception:
         logger.debug("Failed to persist cancelled turn", exc_info=True)
@@ -5680,17 +5683,20 @@ def _assign_stable_message_ids(result_messages, *existing_arrays):
                     seed = mid
     stamped = 0
     for m in result_messages:
-        if isinstance(m, dict) and m.get('id') is None:
+        if not isinstance(m, dict):
+            continue
+        if m.get('id') is None:
             seed += 1
             m['id'] = seed
-            # #6422: durable, collision-safe row lineage.  The integer id is
-            # ``max(existing id) + 1``, so two clients loaded from the same
-            # base can mint the SAME id for different rows; the uuid is minted
-            # once at row creation and persisted, giving the cross-client
-            # merge an authoritative identity that can never collide across
-            # processes (even for identical content).
-            if m.get('uuid') is None:
-                m['uuid'] = uuid.uuid4().hex
+        # #6422 re-gate 2026-08-24: mint durable uuid lineage for EVERY row
+        # that lacks it — including genuinely new rows whose integer id was
+        # supplied by the provider.  Previously the uuid was only minted when
+        # the integer id was absent, so a provider-supplied integer id left
+        # the row without cross-writer lineage, and two clients loaded from
+        # the same base could mint the SAME integer id for different rows
+        # while neither carried a uuid the merge could disambiguate.
+        if m.get('uuid') is None:
+            m['uuid'] = uuid.uuid4().hex
             stamped += 1
     return stamped
 
