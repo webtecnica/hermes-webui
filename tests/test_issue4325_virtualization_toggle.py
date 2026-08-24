@@ -17,6 +17,8 @@ toggle and its contract changes:
 """
 import json
 from pathlib import Path
+import shutil
+import subprocess
 
 import pytest
 
@@ -31,11 +33,19 @@ CONFIG = REPO_ROOT / "api" / "config.py"
 
 def test_virtualize_transcript_setting_is_default_on_and_allowed():
     """#6151 default-ON contract: default True, bool-allowlisted, and the
-    #4343 opt-in marker is gone (no force-off migration anymore)."""
+    #4343 opt-in marker is demoted from a live default to a legacy key that is
+    dropped on load (so it can never be exposed or re-persisted)."""
     src = CONFIG.read_text(encoding="utf-8")
     assert '"virtualize_transcript": True' in src, "must default ON (#6151)"
     assert '"virtualize_transcript",' in src, "must be in _SETTINGS_BOOL_KEYS"
-    assert "virtualize_transcript_optin" not in src, "opt-in marker must be removed with the force-off migration"
+    # The opt-in marker is gone from the defaults and bool-key tables...
+    assert '"virtualize_transcript_optin":' not in src, "opt-in marker must not be a live default"
+    # ...but MUST be listed in _SETTINGS_LEGACY_DROP_KEYS so an existing
+    # marker from the #4343 era is dropped on load (review #6155).
+    legacy_start = src.index("_SETTINGS_LEGACY_DROP_KEYS = {")
+    legacy_end = src.index("_COMPOSER_CONTROL_ORDER_KEYS", legacy_start)
+    legacy_block = src[legacy_start:legacy_end]
+    assert '"virtualize_transcript_optin",' in legacy_block, "opt-in marker must be in _SETTINGS_LEGACY_DROP_KEYS"
 
 
 def test_settings_preferences_expose_virtualize_toggle_default_on():
@@ -53,8 +63,10 @@ def test_boot_applies_saved_virtualize_preference_default_on():
     js = BOOT.read_text(encoding="utf-8")
     # #6151 default-on semantics: !==false (only an explicit false disables it).
     assert "window._virtualizeTranscript=s.virtualize_transcript!==false" in js
-    # Settings-load-failed fallback mirrors the True config default.
-    assert "window._virtualizeTranscript=true" in js
+    # #6151 review: a settings-load failure must fail CLOSED — never enable the
+    # long-transcript renderer when the user's saved preference cannot be
+    # recovered (an explicit saved false is not fail-safe otherwise).
+    assert "window._virtualizeTranscript=false" in js
 
 
 def test_ui_gate_forces_full_render_when_disabled():
@@ -63,6 +75,54 @@ def test_ui_gate_forces_full_render_when_disabled():
     body = js[start:start + 900]
     assert "_virtualizeTranscript===false" in body
     assert "virtualized:false" in body
+
+
+def _ui_function(ui: str, name: str) -> str:
+    """Extract `function <name>(...) { ... }` from ui.js via brace matching."""
+    start = ui.index(f"function {name}(")
+    open_idx = ui.index("{", start)
+    depth = 0
+    i = open_idx
+    while i < len(ui):
+        if ui[i] == "{":
+            depth += 1
+        elif ui[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return ui[start:i + 1]
+        i += 1
+    raise AssertionError(f"could not extract function {name}")
+
+
+def test_boot_failure_fails_closed_and_returns_full_range():
+    """#6151 review: when the settings request fails, the broad boot catch must
+    fail CLOSED (window._virtualizeTranscript=false), and the UI gate must then
+    return virtualized:false with the complete range — never a partial window."""
+    node = shutil.which("node")
+    assert node is not None, "node is required for the frontend behavior harness"
+
+    boot = BOOT.read_text(encoding="utf-8")
+    # The catch path after a rejected settings load must fail closed.
+    assert "window._virtualizeTranscript=false" in boot
+
+    ui = UI.read_text(encoding="utf-8")
+    fn = _ui_function(ui, "_currentMessageVirtualWindow")
+    harness = """
+const vm=require('vm');
+const sandbox={
+  window:{_virtualizeTranscript:false},
+  $:()=>null,
+  _syncMessageVirtualHeightCache:()=>{},
+};
+vm.createContext(sandbox);
+vm.runInContext(__FN__,sandbox);
+const win=sandbox._currentMessageVirtualWindow([{},{},{}],0);
+if(win.virtualized!==false) throw new Error('fail-closed gate did not disable virtualization');
+if(win.start!==0||win.end!==3||win.total!==3) throw new Error('fail-closed gate did not return the complete range');
+if(win.topPad!==0||win.bottomPad!==0) throw new Error('fail-closed gate must not pad a full render');
+if(win.tailStart!==3) throw new Error('fail-closed gate tailStart mismatch');
+""".replace("__FN__", json.dumps(fn))
+    subprocess.run([node, "-e", harness], check=True, capture_output=True, text=True)
 
 
 def test_panels_round_trip_and_hot_apply_virtualize_toggle():
@@ -83,6 +143,29 @@ def test_virtualize_toggle_i18n_all_locales():
     js = I18N.read_text(encoding="utf-8")
     assert js.count("settings_label_virtualize_transcript:") == 15
     assert js.count("settings_desc_virtualize_transcript:") == 15
+    # #6151 review: the four bundles that previously described the old
+    # default-OFF/experimental contract (ja, fr, cs, vi) must now describe
+    # default-ON with opt-out/full-render behavior — the known old phrases
+    # are gone, not just the key counts satisfied.
+    for old_phrase in (
+        "（実験的）",  # ja label: experimental
+        "デフォルトではオフになっています",  # ja desc: off by default
+        "Virtualiser les longs historiques (expérimental)",  # fr label
+        "Désactivé par défaut",  # fr desc: disabled by default
+        "Virtualizovat dlouhé transcripty (experimentální)",  # cs label
+        "Standardně vypnuto",  # cs desc: off by default
+        "Ảo hóa transcript dài (thử nghiệm)",  # vi label
+        "Mặc định tắt",  # vi desc: off by default
+    ):
+        assert old_phrase not in js, f"stale default-OFF copy still present: {old_phrase!r}"
+    # ...and each of the four bundles now carries default-ON copy.
+    for new_phrase in (
+        "デフォルトではオンです",  # ja: on by default
+        "Activé par défaut",  # fr: enabled by default
+        "Standardně zapnuto",  # cs: enabled by default
+        "Bật theo mặc định",  # vi: on by default
+    ):
+        assert new_phrase in js, f"default-ON copy missing: {new_phrase!r}"
 
 
 # ── #6151 default-on load behavior (load_settings) ──────────────────────────
@@ -123,3 +206,23 @@ def test_migration_stored_false_optout_is_honored(_settings_env):
     config, sf = _settings_env
     _write(sf, {"onboarding_completed": True, "virtualize_transcript": False})
     assert config.load_settings()["virtualize_transcript"] is False
+
+
+def test_migration_legacy_optin_marker_dropped_and_optout_preserved(_settings_env):
+    """#6151 review: a settings.json that still carries the #4343 opt-in marker
+    (virtualize_transcript_optin) plus a stored explicit False must preserve the
+    opt-out and drop the marker from loaded, returned, and rewritten settings."""
+    config, sf = _settings_env
+    _write(sf, {
+        "onboarding_completed": True,
+        "virtualize_transcript": False,
+        "virtualize_transcript_optin": True,
+    })
+    loaded = config.load_settings()
+    assert loaded["virtualize_transcript"] is False, "explicit opt-out must be preserved"
+    assert "virtualize_transcript_optin" not in loaded, "legacy marker must be dropped from loaded settings"
+    saved = config.save_settings({"show_tps": True})
+    assert "virtualize_transcript_optin" not in saved, "legacy marker must be absent from the returned settings"
+    raw = json.loads(sf.read_text(encoding="utf-8"))
+    assert "virtualize_transcript_optin" not in raw, "legacy marker must not be re-persisted on save"
+    assert raw.get("virtualize_transcript") is False, "opt-out must survive a save"

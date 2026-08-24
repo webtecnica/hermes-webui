@@ -3459,7 +3459,7 @@ window._mirrorSpeechSettingsFromServer=_mirrorSpeechSettingsFromServer;
     applyEmptyStateSuggestionPref();
     window._hideEmptyStatePanel=false;
     applyEmptyStatePanelPref();
-    window._virtualizeTranscript=true;  // settings-load failed: mirror the True config default (#6151)
+    window._virtualizeTranscript=false;  // settings-load failed: fail CLOSED — never enable the long-transcript renderer when the user's saved preference cannot be recovered (#6151)
     window._showTps=false;
     window._fadeTextEffect=false;
     window._showCliSessions=true;  // settings-load failed: mirror the True config default (#3988)

@@ -9738,6 +9738,7 @@ _SETTINGS_LEGACY_DROP_KEYS = {
     "default_model",
     "activity_feed_expanded_default",
     "simplified_tool_calling",
+    "virtualize_transcript_optin",  # #4343 opt-in marker: superseded by the #6151 default-ON contract — drop on load so an existing marker is never exposed or re-persisted (a stored explicit False opt-out is still honored).
 }
 _COMPOSER_CONTROL_ORDER_KEYS = {
     key for key in _SETTINGS_DEFAULTS if key.startswith("hide_composer_")
@@ -9903,6 +9904,27 @@ def load_settings() -> dict:
         # and a stored True (matches the new default), so no reset is needed.
         # A stale `virtualize_transcript_optin` marker from the #4343 era is
         # dropped on load via _SETTINGS_LEGACY_DROP_KEYS (never re-persisted).
+    # Fall back to the DEFAULTS, not to None, when nothing is stored.
+    #
+    # `_read_raw_settings_file()` returns {} for a MISSING settings.json, and {}
+    # is a dict — so the `isinstance(stored, dict)` arms were always taken,
+    # `stored.get("theme")` was None, and `_normalize_appearance(None, None)`
+    # fell through to its unknown-theme branch and returned ("dark", "default").
+    # `_SETTINGS_DEFAULTS["theme"]` / `["skin"]` were therefore unreachable for
+    # the one case they exist to serve: a user with no settings file yet.
+    #
+    # This is invisible on stock defaults, because dark/default is exactly what
+    # the fallback produces — the two paths agree. It only surfaces once the
+    # defaults are changed, at which point the dict silently does nothing.
+    #
+    # Gate on the PAIR, not per field. A per-field `or settings.get(...)` looks
+    # equivalent and is not: with a stored legacy theme and no skin, `slate`
+    # normalises to ("dark", "slate"), but per-field fallback injects the
+    # default skin and yields ("dark", "default") — silently destroying the
+    # legacy migration. Same distinction the boot script draws in #6808.
+    _has_stored_appearance = isinstance(stored, dict) and (
+        "theme" in stored or "skin" in stored
+    )
     settings["theme"], settings["skin"] = _normalize_appearance(
         stored.get("theme") if _has_stored_appearance else settings.get("theme"),
         stored.get("skin") if _has_stored_appearance else settings.get("skin"),
