@@ -111,7 +111,13 @@ class _OIDCNetworkPolicy:
             or candidate.is_reserved
         ):
             return False
-        if candidate.is_loopback or candidate.is_private:
+        if candidate.is_loopback or candidate.is_private or not candidate.is_global:
+            # Loopback / private / shared (e.g. 100.64.0.0/10) and every
+            # other non-global class are reachable ONLY for the exact
+            # configured origin under the explicit opt-in.  CPython classifies
+            # 100.64.0.0/10 as neither private nor global, so the explicit
+            # `not is_global` discriminator is required to keep shared address
+            # space out of the default-allow path.
             return self.is_exact_configured_origin(host, port)
         return True
 
@@ -149,6 +155,14 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
     def connect(self):
         host = self.host
         port = self.port
+        if getattr(self, "_tunnel_host", None):
+            # urllib sets _tunnel_host when routing through an HTTP(S) proxy
+            # CONNECT.  The OIDC boundary must never tunnel: the connection
+            # authority would change and the pinned policy would be bypassed.
+            raise OIDCAuthError(
+                "OIDC connections must not be tunneled through a proxy",
+                status_code=502,
+            )
         try:
             infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
         except socket.gaierror as exc:
@@ -160,34 +174,45 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
                 f"OIDC endpoint hostname resolved to no addresses: {host}",
                 status_code=502,
             )
-        chosen = None
+        # Try approved addresses in resolver order.  A failed connect must not
+        # discard later approved answers; rejected addresses are never
+        # attempted, and every socket that failed is closed before the next
+        # attempt (or on TLS-wrap failure) so no descriptor leaks.
+        last_error = None
         for info in infos:
             family, socktype, proto, _canonname, sockaddr = info
             address = _parse_ip_address(sockaddr[0] if sockaddr else "")
-            if address is not None and self._oidc_policy.address_allowed(
+            if address is None or not self._oidc_policy.address_allowed(
                 host, port, address
             ):
-                chosen = (family, socktype, proto, sockaddr)
-                break
-        if chosen is None:
+                continue
+            sock = socket.socket(family, socktype, proto)
+            try:
+                timeout = self.timeout
+                if timeout is not None and not isinstance(timeout, (int, float)):
+                    timeout = None
+                sock.settimeout(timeout)
+                sock.connect(sockaddr)
+            except Exception as exc:
+                sock.close()
+                last_error = exc
+                continue
+            try:
+                # server_hostname keeps SNI + TLS hostname verification against
+                # the requested hostname; only the CONNECTED address is pinned.
+                self.sock = self._context.wrap_socket(sock, server_hostname=host)
+                return
+            except Exception:
+                sock.close()
+                raise
+        if last_error is not None:
             raise OIDCAuthError(
-                "OIDC endpoint resolved only to disallowed addresses",
-                status_code=502,
-            )
-        family, socktype, proto, sockaddr = chosen
-        sock = socket.socket(family, socktype, proto)
-        try:
-            timeout = self.timeout
-            if timeout is not None and not isinstance(timeout, (int, float)):
-                timeout = None
-            sock.settimeout(timeout)
-            sock.connect(sockaddr)
-        except Exception:
-            sock.close()
-            raise
-        # server_hostname keeps SNI + TLS hostname verification against the
-        # requested hostname; only the CONNECTED address is pinned.
-        self.sock = self._context.wrap_socket(sock, server_hostname=host)
+                "OIDC endpoint addresses failed to connect", status_code=502
+            ) from last_error
+        raise OIDCAuthError(
+            "OIDC endpoint resolved only to disallowed addresses",
+            status_code=502,
+        )
 
 
 class _OIDCHTTPSHandler(urllib.request.HTTPSHandler):
@@ -621,7 +646,16 @@ def _post_form_json(
 
 
 def _oidc_opener(policy: _OIDCNetworkPolicy) -> urllib.request.OpenerDirector:
-    return urllib.request.build_opener(_NoRedirect, _OIDCHTTPSHandler(policy=policy))
+    # Ambient HTTP(S)_PROXY settings must never redirect this security-
+    # sensitive flow: urllib's default ProxyHandler would change the
+    # connection authority and tunnel to the proxy instead of the pinned
+    # endpoint.  An explicit empty ProxyHandler disables proxy lookup; the
+    # pinned connection additionally fails closed on any tunnel request.
+    return urllib.request.build_opener(
+        _NoRedirect,
+        urllib.request.ProxyHandler({}),
+        _OIDCHTTPSHandler(policy=policy),
+    )
 
 
 def _validate_outbound_oidc_url(
@@ -694,6 +728,7 @@ def _is_disallowed_oidc_ip(address) -> bool:
         or candidate.is_multicast
         or candidate.is_unspecified
         or candidate.is_reserved
+        or not candidate.is_global
     )
 
 

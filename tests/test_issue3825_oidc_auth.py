@@ -763,16 +763,21 @@ class _FakeResponse:
         "224.0.0.1",
         "0.0.0.0",
         "240.0.0.1",
+        # Shared address space (100.64.0.0/10): neither private nor global,
+        # must still be rejected (CGNAT carrier-grade NAT range)
+        "100.64.0.1",
+        "100.127.255.254",
         # IPv6: loopback, ULA, link-local, multicast, unspecified
         "::1",
         "fc00::1",
         "fe80::1",
         "ff02::1",
         "::",
-        # IPv4-mapped IPv6 forms of loopback/private/link-local
+        # IPv4-mapped IPv6 forms of loopback/private/link-local/shared
         "::ffff:127.0.0.1",
         "::ffff:10.0.0.1",
         "::ffff:169.254.169.254",
+        "::ffff:100.64.0.1",
     ],
 )
 def test_validate_outbound_url_rejects_special_address_ranges(address):
@@ -1019,6 +1024,293 @@ def test_pinned_connection_fails_closed_on_dns_error(monkeypatch):
     conn = auth_oidc._PinnedHTTPSConnection("issuer.example", 443, policy=policy, timeout=10)
     with pytest.raises(OIDCAuthError, match="Failed to resolve OIDC endpoint host"):
         conn.connect()
+
+
+def test_pinned_connection_tries_next_approved_address_on_connect_failure(monkeypatch):
+    """If the first approved address cannot connect, later approved answers
+    from the SAME resolution are tried in resolver order; rejected addresses
+    are never attempted; failed sockets are closed."""
+    import api.auth_oidc as auth_oidc
+
+    attempted = []
+    closed = []
+
+    class FakeSocket:
+        def __init__(self, family, socktype, proto):
+            pass
+
+        def settimeout(self, timeout):
+            pass
+
+        def connect(self, sockaddr):
+            attempted.append(sockaddr)
+            if sockaddr[0] == "93.184.216.34":
+                raise OSError("connection refused")
+
+        def close(self):
+            closed.append(True)
+
+    def fake_wrap_socket(self, sock, *, server_hostname=None, **kwargs):
+        return sock
+
+    monkeypatch.setattr(
+        auth_oidc.socket,
+        "getaddrinfo",
+        lambda *a, **k: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.7", 443)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443)),
+        ],
+    )
+    monkeypatch.setattr(auth_oidc.socket, "socket", FakeSocket)
+    monkeypatch.setattr(ssl.SSLContext, "wrap_socket", fake_wrap_socket)
+
+    policy = auth_oidc._OIDCNetworkPolicy(
+        issuer="https://issuer.example", allow_private_endpoints=False
+    )
+    conn = auth_oidc._PinnedHTTPSConnection("issuer.example", 443, policy=policy, timeout=10)
+    conn.connect()
+
+    # First approved address failed to connect; the second approved address
+    # was tried and won.  The private (rejected) address was never attempted.
+    assert attempted == [("93.184.216.34", 443), ("8.8.8.8", 443)]
+    # Only the failed socket was closed; the successful one stays open.
+    assert len(closed) == 1
+    assert conn.sock is not None
+
+
+def test_pinned_connection_closes_socket_when_tls_wrap_fails(monkeypatch):
+    """If TLS wrapping fails, the raw socket is closed before the error
+    propagates — no descriptor leak."""
+    import api.auth_oidc as auth_oidc
+
+    closed = []
+
+    class FakeSocket:
+        def __init__(self, family, socktype, proto):
+            pass
+
+        def settimeout(self, timeout):
+            pass
+
+        def connect(self, sockaddr):
+            pass
+
+        def close(self):
+            closed.append(True)
+
+    def boom_wrap_socket(self, sock, *, server_hostname=None, **kwargs):
+        raise ssl.SSLError("TLS handshake failed")
+
+    monkeypatch.setattr(
+        auth_oidc.socket,
+        "getaddrinfo",
+        lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))],
+    )
+    monkeypatch.setattr(auth_oidc.socket, "socket", FakeSocket)
+    monkeypatch.setattr(ssl.SSLContext, "wrap_socket", boom_wrap_socket)
+
+    policy = auth_oidc._OIDCNetworkPolicy(
+        issuer="https://issuer.example", allow_private_endpoints=False
+    )
+    conn = auth_oidc._PinnedHTTPSConnection("issuer.example", 443, policy=policy, timeout=10)
+    with pytest.raises(ssl.SSLError):
+        conn.connect()
+    assert len(closed) == 1
+
+
+def test_pinned_connection_fails_closed_on_proxy_tunnel(monkeypatch):
+    """A proxy CONNECT tunnel is refused outright: urllib sets _tunnel_host
+    when routing through a proxy, and the pinned connection must never
+    change its connection authority."""
+    import api.auth_oidc as auth_oidc
+    from api.auth_oidc import OIDCAuthError
+
+    policy = auth_oidc._OIDCNetworkPolicy(
+        issuer="https://issuer.example", allow_private_endpoints=False
+    )
+    conn = auth_oidc._PinnedHTTPSConnection("issuer.example", 443, policy=policy, timeout=10)
+    conn._tunnel_host = "proxy.example"
+    with pytest.raises(OIDCAuthError, match="tunnel"):
+        conn.connect()
+
+
+def test_oidc_opener_disables_ambient_proxies(monkeypatch):
+    """Ambient HTTP(S)_PROXY settings must never redirect the OIDC flow: the
+    opener installs an explicit EMPTY ProxyHandler, so urllib cannot change
+    the connection authority to a proxy."""
+    import api.auth_oidc as auth_oidc
+    import urllib.request as urllib_request
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:3128")
+    monkeypatch.setenv("https_proxy", "http://127.0.0.1:3128")
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:3128")
+    monkeypatch.setenv("http_proxy", "http://127.0.0.1:3128")
+
+    policy = auth_oidc._OIDCNetworkPolicy(
+        issuer="https://issuer.example", allow_private_endpoints=False
+    )
+    opener = auth_oidc._oidc_opener(policy)
+    proxy_handlers = [
+        h for h in opener.handlers if isinstance(h, urllib_request.ProxyHandler)
+    ]
+    assert proxy_handlers
+    for handler in proxy_handlers:
+        assert handler.proxies == {}
+
+
+def test_token_form_body_never_delivered_to_ambient_proxy(monkeypatch):
+    """End-to-end guard: with an ambient HTTPS proxy configured, the token
+    form body still travels ONLY to the pinned endpoint socket — a proxy
+    that would receive the client_secret never sees a connection."""
+    import api.auth_oidc as auth_oidc
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:3128")
+    monkeypatch.setenv("https_proxy", "http://127.0.0.1:3128")
+
+    connected_to = []
+
+    class FakeSocket:
+        def __init__(self, family, socktype, proto):
+            pass
+
+        def settimeout(self, timeout):
+            pass
+
+        def connect(self, sockaddr):
+            connected_to.append(sockaddr)
+
+        def sendall(self, data):
+            pass
+
+        def makefile(self, *args, **kwargs):
+            return io.BytesIO(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                b"Content-Length: 2\r\nConnection: close\r\n\r\n{}"
+            )
+
+        def close(self):
+            pass
+
+    def fake_wrap_socket(self, sock, *, server_hostname=None, **kwargs):
+        return sock
+
+    monkeypatch.setattr(auth_oidc.socket, "socket", FakeSocket)
+    monkeypatch.setattr(
+        auth_oidc.socket,
+        "getaddrinfo",
+        lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))],
+    )
+    monkeypatch.setattr(ssl.SSLContext, "wrap_socket", fake_wrap_socket)
+
+    policy = auth_oidc._OIDCNetworkPolicy(
+        issuer="https://issuer.example", allow_private_endpoints=False
+    )
+    auth_oidc._post_form_json(
+        "https://issuer.example/token",
+        {
+            "grant_type": "authorization_code",
+            "client_id": "webui-client",
+            "code": "auth-code",
+            "client_secret": "super-secret",
+        },
+        policy=policy,
+    )
+
+    # The connection went straight to the endpoint — never to the ambient
+    # proxy (127.0.0.1:3128).  The proxy never had a chance to read the body.
+    assert connected_to == [("93.184.216.34", 443)]
+
+
+def test_fetch_json_rejects_dns_resolved_shared_space(monkeypatch):
+    """A discovery-controlled hostname resolving into shared address space
+    (100.64.0.0/10, CGNAT) is rejected even though CPython classifies it as
+    neither private nor global."""
+    import api.auth_oidc as auth_oidc
+    from api.auth_oidc import OIDCAuthError
+
+    monkeypatch.setattr(
+        auth_oidc.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("100.64.0.1", 443))
+        ],
+    )
+    policy = auth_oidc._OIDCNetworkPolicy(
+        issuer="https://issuer.example", allow_private_endpoints=False
+    )
+    with pytest.raises(OIDCAuthError, match="private or local addresses"):
+        auth_oidc._fetch_json(
+            "https://issuer.example/.well-known/openid-configuration",
+            policy=policy,
+        )
+
+
+def test_fetch_json_rejects_foreign_origin_resolving_to_shared_space(monkeypatch):
+    """Even with the private opt-in enabled, a FOREIGN origin resolving to
+    shared address space stays blocked — the grant is exact-origin scoped."""
+    import api.auth_oidc as auth_oidc
+    from api.auth_oidc import OIDCAuthError
+
+    monkeypatch.setattr(
+        auth_oidc.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("100.64.0.1", 443))
+        ],
+    )
+    policy = auth_oidc._OIDCNetworkPolicy(
+        issuer="https://issuer.example", allow_private_endpoints=True
+    )
+    with pytest.raises(OIDCAuthError, match="private or local addresses"):
+        auth_oidc._fetch_json(
+            "https://evil.example/.well-known/openid-configuration",
+            policy=policy,
+        )
+
+
+def test_exact_origin_shared_space_allowed_under_optin(monkeypatch):
+    """The self-hosted use case survives: with the explicit opt-in, the EXACT
+    configured origin in shared address space is still reachable."""
+    import api.auth_oidc as auth_oidc
+
+    monkeypatch.setattr(
+        auth_oidc.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("100.64.0.1", 443))
+        ],
+    )
+    policy = auth_oidc._OIDCNetworkPolicy(
+        issuer="https://100.64.0.1", allow_private_endpoints=True
+    )
+    auth_oidc._validate_outbound_oidc_url(
+        "https://100.64.0.1/.well-known/openid-configuration", policy=policy
+    )
+
+
+def test_address_allowed_rejects_shared_space_without_exact_origin_optin():
+    """Both classifiers must treat shared address space as restricted: the
+    connect-time policy only grants it to the EXACT configured origin under
+    the explicit opt-in."""
+    import ipaddress
+
+    import api.auth_oidc as auth_oidc
+
+    shared = ipaddress.ip_address("100.64.0.1")
+    policy = auth_oidc._OIDCNetworkPolicy(
+        issuer="https://issuer.example", allow_private_endpoints=False
+    )
+    assert policy.address_allowed("issuer.example", 443, shared) is False
+    assert policy.address_allowed("100.64.0.1", 443, shared) is False
+
+    optin = auth_oidc._OIDCNetworkPolicy(
+        issuer="https://100.64.0.1", allow_private_endpoints=True
+    )
+    # Exact configured origin under the opt-in → granted.
+    assert optin.address_allowed("100.64.0.1", 443, shared) is True
+    # Same address, different host → still denied.
+    assert optin.address_allowed("issuer.example", 443, shared) is False
 
 
 def test_no_redirect_handler_refuses_all_redirects():
