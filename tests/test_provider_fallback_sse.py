@@ -3,12 +3,20 @@
 Two proven producers feed the typed event (never string-inequality inference):
   1. Agent-side: the configured ``fallback_providers`` chain, detected from the
      agent's one-shot "Switched to fallback model: …" lifecycle notice.
-  2. Gateway-side: LLM-gateway failover metadata with an explicit failed
-     primary attempt followed by a selected route.
+  2. Gateway-side: LLM-gateway failover metadata with an ORDERED proof — a
+     failed attempt matching the REQUESTED primary route, followed (strictly
+     later in the list) by an explicit selected/success row matching the USED
+     route.  Unrelated / out-of-order / no-selected rows fail closed.
+
+Transition identity embeds an immutable per-stream/per-turn owner
+(``stream_id``), so the same from→to route in two different turns never
+collides (the per-request ``seq`` resets every turn).
 
 Frontend: the event renders a localized composer/turn indicator guarded by
-session/stream ownership, deduplicated by transition_id (replay-safe), and
-re-asserted once at ``done`` settlement.
+exact (session, stream) ownership — stale callbacks from a replaced
+same-session stream are dropped — deduplicated by transition_id (replay-safe),
+and re-asserted at ``done`` AFTER the generic idle cleanup so settlement cannot
+erase it.
 """
 
 from __future__ import annotations
@@ -25,6 +33,7 @@ from api.streaming import (
     _build_agent_fallback_payload,
     _build_provider_fallback_sse_event,
     _fallback_transition_id,
+    _is_fallback_switch_chatter,
     _is_fallback_switch_notice,
     _maybe_emit_agent_fallback_event,
 )
@@ -48,14 +57,22 @@ def _enable_fallback_sse(monkeypatch):
 class _FakeAgent:
     """Minimal agent double carrying the fields the producer reads."""
 
-    def __init__(self, provider="", model="", buffer=None):
+    def __init__(self, provider="", model="", buffer=None, fallback_cause=None):
         self.provider = provider
         self.model = model
         self._retry_status_buffer = buffer or []
+        if fallback_cause is not None:
+            self._fallback_cause = fallback_cause
 
 
 def _noticed_state(provider="openai", model="gpt-4"):
-    return {"seq": 0, "route_provider": provider, "route_model": model}
+    return {
+        "seq": 0,
+        "route_provider": provider,
+        "route_model": model,
+        "stream_id": "stream-1",
+        "agent_fired": False,
+    }
 
 
 # ── Agent-side producer (configured fallback_providers chain) ────────────
@@ -84,9 +101,11 @@ def test_agent_producer_emits_without_any_gateway_metadata():
         agent,
         "sess-1",
         state,
+        "stream-1",
     )
     assert payload is not None
     assert payload["session_id"] == "sess-1"
+    assert payload["stream_id"] == "stream-1"
     assert payload["source"] == "agent"
     assert payload["from_provider"] == "openai"
     assert payload["from_model"] == "gpt-4"
@@ -97,22 +116,22 @@ def test_agent_producer_emits_without_any_gateway_metadata():
 
 
 def test_agent_payload_accepts_provider_only_and_model_only():
-    provider_only = _build_agent_fallback_payload("s1", "openai", "gpt-4", "anthropic", "", "boom", 1)
+    provider_only = _build_agent_fallback_payload("s1", "stream-1", "openai", "gpt-4", "anthropic", "", "boom", 1)
     assert provider_only is not None
     assert provider_only["to_provider"] == "anthropic"
     assert provider_only["to_model"] == ""
 
-    model_only = _build_agent_fallback_payload("s1", "openai", "gpt-4", "", "opus", "boom", 2)
+    model_only = _build_agent_fallback_payload("s1", "stream-1", "openai", "gpt-4", "", "opus", "boom", 2)
     assert model_only is not None
     assert model_only["to_provider"] == ""
     assert model_only["to_model"] == "opus"
 
 
 def test_agent_payload_same_route_and_empty_destination_return_none():
-    assert _build_agent_fallback_payload("s1", "openai", "gpt-4", "openai", "gpt-4", "x", 1) is None
-    assert _build_agent_fallback_payload("s1", "openai", "gpt-4", "", "", "x", 1) is None
+    assert _build_agent_fallback_payload("s1", "stream-1", "openai", "gpt-4", "openai", "gpt-4", "x", 1) is None
+    assert _build_agent_fallback_payload("s1", "stream-1", "openai", "gpt-4", "", "", "x", 1) is None
     # Alias/no-op: case-only difference is not a fallback.
-    assert _build_agent_fallback_payload("s1", "OpenAI", "GPT-4", "openai", "gpt-4", "x", 1) is None
+    assert _build_agent_fallback_payload("s1", "stream-1", "OpenAI", "GPT-4", "openai", "gpt-4", "x", 1) is None
 
 
 def test_agent_fallback_cause_uses_last_buffered_status_line():
@@ -126,22 +145,54 @@ def test_agent_fallback_cause_uses_last_buffered_status_line():
     assert _agent_fallback_cause(_FakeAgent(buffer=[("vprint", "only debug")])) == ""
 
 
+def test_agent_fallback_cause_skips_switch_chatter_final_row():
+    """The real agent appends the generic ``Primary model failed — switching
+    to fallback …`` status LAST; that switch row must NOT win over the actual
+    preceding failure."""
+    agent = _FakeAgent(buffer=[
+        ("status", "⏳ Nous rate limit active — resets in 60s"),
+        ("warn", "primary attempt failed: HTTP 429"),
+        ("status", "🔄 Primary model failed — switching to fallback: opus via anthropic"),
+    ])
+    assert _agent_fallback_cause(agent) == "primary attempt failed: HTTP 429"
+    # A buffer of ONLY switch chatter yields no cause at all.
+    assert _agent_fallback_cause(_FakeAgent(buffer=[
+        ("status", "🔄 Switched to fallback model: x via y → a via b"),
+        ("status", "🔄 Primary model failed — switching to fallback: opus via anthropic"),
+    ])) == ""
+    assert _is_fallback_switch_chatter("🔄 Primary model failed — switching to fallback: opus via anthropic")
+    assert _is_fallback_switch_chatter("🔄 Switched to fallback model: x via y → a via b")
+    assert not _is_fallback_switch_chatter("⏳ Nous rate limit active — resets in 60s")
+    assert not _is_fallback_switch_chatter("primary attempt failed: HTTP 429")
+
+
+def test_agent_fallback_cause_prefers_structured_cause():
+    """A structured failed-primary cause on the agent is authoritative when
+    present — the buffered trace is only the fallback path."""
+    agent = _FakeAgent(
+        buffer=[("status", "🔄 Primary model failed — switching to fallback: opus via anthropic")],
+        fallback_cause="HTTP 503 upstream unavailable",
+    )
+    assert _agent_fallback_cause(agent) == "HTTP 503 upstream unavailable"
+
+
 def test_agent_producer_tracks_chain_switch_prior_route():
     agent = _FakeAgent("anthropic", "opus", [("status", "primary failed")])
     state = _noticed_state()
     first = _maybe_emit_agent_fallback_event(
         "lifecycle",
         "🔄 Switched to fallback model: gpt-4 via openai → opus via anthropic",
-        agent, "sess-1", state,
+        agent, "sess-1", state, "stream-1",
     )
     assert first["from_provider"] == "openai"
+    assert state["agent_fired"] is True
     # Chain switch: the agent falls back AGAIN within the same turn.
     agent.provider = "deepseek"
     agent.model = "deepseek-v3"
     second = _maybe_emit_agent_fallback_event(
         "lifecycle",
         "🔄 Switched to fallback model: opus via anthropic → deepseek-v3 via deepseek",
-        agent, "sess-1", state,
+        agent, "sess-1", state, "stream-1",
     )
     assert second is not None
     assert second["from_provider"] == "anthropic"  # tracked, not the original primary
@@ -151,8 +202,9 @@ def test_agent_producer_tracks_chain_switch_prior_route():
 
 def test_agent_producer_ignores_non_notice_status():
     state = _noticed_state()
-    assert _maybe_emit_agent_fallback_event("lifecycle", "Rate limited, trying fallback…", _FakeAgent("a", "b"), "s1", state) is None
+    assert _maybe_emit_agent_fallback_event("lifecycle", "Rate limited, trying fallback…", _FakeAgent("a", "b"), "s1", state, "stream-1") is None
     assert state["seq"] == 0  # nothing consumed
+    assert state["agent_fired"] is False
 
 
 def test_agent_producer_opt_out_env_var_suppresses_event(monkeypatch):
@@ -161,7 +213,7 @@ def test_agent_producer_opt_out_env_var_suppresses_event(monkeypatch):
     payload = _maybe_emit_agent_fallback_event(
         "lifecycle",
         "🔄 Switched to fallback model: gpt-4 via openai → opus via anthropic",
-        _FakeAgent("anthropic", "opus"), "s1", state,
+        _FakeAgent("anthropic", "opus"), "s1", state, "stream-1",
     )
     assert payload is None
 
@@ -175,7 +227,7 @@ def test_agent_event_exactly_once_and_ordered_before_terminal_events():
     payload = _maybe_emit_agent_fallback_event(
         "lifecycle",
         "🔄 Switched to fallback model: gpt-4 via openai → opus via anthropic",
-        agent, "sess-1", state,
+        agent, "sess-1", state, "stream-1",
     )
     assert payload is not None
     stream.append(("provider_fallback", payload))
@@ -184,6 +236,31 @@ def test_agent_event_exactly_once_and_ordered_before_terminal_events():
     names = [e[0] for e in stream]
     assert names == ["provider_fallback", "done"]
     assert names.count("provider_fallback") == 1
+
+
+def test_agent_producer_marks_agent_fired_for_dual_producer_guard():
+    """After an agent-side emit the gateway producer must skip (one physical
+    fallback visible in BOTH the agent chain and gateway metadata must not
+    double-notify the UI with two transition ids)."""
+    agent = _FakeAgent("anthropic", "opus", [("status", "primary failed: HTTP 429")])
+    state = _noticed_state()
+    payload = _maybe_emit_agent_fallback_event(
+        "lifecycle",
+        "🔄 Switched to fallback model: gpt-4 via openai → opus via anthropic",
+        agent, "sess-1", state, "stream-1",
+    )
+    assert payload is not None
+    assert state["agent_fired"] is True
+    # A second notice within the same turn (chain switch) still emits.
+    agent.provider = "deepseek"
+    agent.model = "deepseek-v3"
+    second = _maybe_emit_agent_fallback_event(
+        "lifecycle",
+        "🔄 Switched to fallback model: opus via anthropic → deepseek-v3 via deepseek",
+        agent, "sess-1", state, "stream-1",
+    )
+    assert second is not None
+    assert second["transition_id"] != payload["transition_id"]
 
 
 # ── Gateway-side producer (proven LLM-gateway failover) ──────────────────
@@ -205,81 +282,159 @@ def _gateway_metadata(used_provider="Alibaba Cloud", used_model="deepseek-v3.2",
     return meta
 
 
+def _build(meta, seq=1, session_id="s1", stream_id="stream-1"):
+    return _build_provider_fallback_sse_event(
+        meta,
+        session_id=session_id,
+        stream_id=stream_id,
+        seq=seq,
+    )
+
+
 def test_gateway_event_requires_explicit_failed_primary():
     # Plain requested-vs-used mismatch with no failed attempt = NOT a fallback.
     no_failure = _gateway_metadata(routing=[
         {"provider": "CanopyWave", "status": "selected"},
     ])
-    assert _build_provider_fallback_sse_event(no_failure, "s1", 1) is None
+    assert _build(no_failure) is None
     # has_failover flag alone (string-mismatch driven) is not sufficient.
     flagged = _gateway_metadata(extra={"has_failover": True})
-    assert _build_provider_fallback_sse_event(flagged, "s1", 1) is None
-    # Explicit failed primary followed by a selected route → proven failover.
+    assert _build(flagged) is None
+    # Ordered proof: failed requested primary → selected row matching the used
+    # route → proven failover.
     proven = _gateway_metadata(routing=[
         {"provider": "CanopyWave", "status": "failed", "error": "connection timeout"},
         {"provider": "Alibaba Cloud", "status": "selected"},
     ])
-    payload = _build_provider_fallback_sse_event(proven, "s1", 1)
+    payload = _build(proven)
     assert payload is not None
     assert payload["source"] == "gateway"
+    assert payload["stream_id"] == "stream-1"
     assert payload["from_provider"] == "CanopyWave"
     assert payload["to_provider"] == "Alibaba Cloud"
     assert payload["reason"] == "connection timeout"
+    assert payload["transition_id"] == _fallback_transition_id(
+        "s1", "stream-1", "CanopyWave", "deepseek-v3.2",
+        "Alibaba Cloud", "deepseek-v3.2", 1,
+    )
 
 
 def test_gateway_event_failed_primary_reason_selection():
-    """Reason comes from the FIRST failed primary attempt, not the last routing
+    """Reason comes from the PROVEN failed primary row, not the last routing
     entry (which may be the successful fallback's rationale)."""
     routing = [
         {"provider": "CanopyWave", "status": "failed", "error": "primary rejected: 401"},
         {"provider": "DeepInfra", "status": "failed", "error": "secondary also failed"},
         {"provider": "Alibaba Cloud", "status": "selected"},
     ]
-    payload = _build_provider_fallback_sse_event(_gateway_metadata(routing=routing), "s1", 1)
+    payload = _build(_gateway_metadata(routing=routing))
     assert payload["reason"] == "primary rejected: 401"
     # reason-only attempts (no error field) are honored too.
     routing2 = [
         {"provider": "CanopyWave", "status": "timeout", "reason": "upstream timeout"},
         {"provider": "Alibaba Cloud", "status": "selected"},
     ]
-    payload2 = _build_provider_fallback_sse_event(_gateway_metadata(routing=routing2), "s1", 1)
+    payload2 = _build(_gateway_metadata(routing=routing2))
     assert payload2["reason"] == "upstream timeout"
+
+
+def test_gateway_event_unrelated_failure_fails_closed():
+    """The failed row must be the REQUESTED primary — an unrelated failure
+    (different provider/model) is not proof of fallback even with a selected
+    row matching the used route."""
+    unrelated = _gateway_metadata(routing=[
+        {"provider": "SomeOtherProvider", "status": "failed", "error": "unrelated outage"},
+        {"provider": "Alibaba Cloud", "status": "selected"},
+    ])
+    assert _build(unrelated) is None
+    # A failed row with a DIFFERENT model than requested is not the primary.
+    wrong_model = _gateway_metadata(routing=[
+        {"provider": "CanopyWave", "model": "claude-3-5-sonnet", "status": "failed", "error": "x"},
+        {"provider": "Alibaba Cloud", "status": "selected"},
+    ])
+    assert _build(wrong_model) is None
+
+
+def test_gateway_event_out_of_order_selection_fails_closed():
+    """Selection must happen STRICTLY AFTER the proven primary failure — a
+    selected row listed before the failed row is not a fallback."""
+    out_of_order = _gateway_metadata(routing=[
+        {"provider": "Alibaba Cloud", "status": "selected"},
+        {"provider": "CanopyWave", "status": "failed", "error": "connection timeout"},
+    ])
+    assert _build(out_of_order) is None
+
+
+def test_gateway_event_no_selected_row_fails_closed():
+    """Failed primary with NO selected/success row matching the used route —
+    and a selected row that does NOT match the used route — are not proof."""
+    no_selected = _gateway_metadata(used_provider="Alibaba Cloud", routing=[
+        {"provider": "CanopyWave", "status": "failed", "error": "connection timeout"},
+        {"provider": "DeepInfra", "status": "failed", "error": "secondary failed"},
+    ])
+    assert _build(no_selected) is None
+    mismatched_selection = _gateway_metadata(used_provider="Alibaba Cloud", routing=[
+        {"provider": "CanopyWave", "status": "failed", "error": "x"},
+        {"provider": "SomeOtherProvider", "status": "selected"},
+    ])
+    assert _build(mismatched_selection) is None
+
+
+def test_gateway_event_selected_flag_counts_as_selection():
+    """A row marked with a truthy ``selected`` flag (no status) is a valid
+    selection proof when it matches the used route."""
+    meta = _gateway_metadata(routing=[
+        {"provider": "CanopyWave", "status": "failed", "error": "boom"},
+        {"provider": "Alibaba Cloud", "selected": True},
+    ])
+    payload = _build(meta)
+    assert payload is not None
+    assert payload["to_provider"] == "Alibaba Cloud"
+    assert payload["reason"] == "boom"
 
 
 def test_gateway_event_same_route_and_alias_are_no_fallback():
     failed = [{"provider": "CanopyWave", "status": "failed", "error": "x"}]
     # Same route after failure = recovery, not fallback.
     same = _gateway_metadata(used_provider="CanopyWave", used_model="deepseek-v3.2", routing=failed)
-    assert _build_provider_fallback_sse_event(same, "s1", 1) is None
+    assert _build(same) is None
     # Case-only alias difference is not a fallback.
     alias = _gateway_metadata(used_provider="canopywave", used_model="DeepSeek-V3.2", routing=failed)
-    assert _build_provider_fallback_sse_event(alias, "s1", 1) is None
+    assert _build(alias) is None
 
 
 def test_gateway_event_provider_only_and_model_only():
-    failed = [{"provider": "CanopyWave", "status": "failed", "error": "x"}]
-    provider_only = _gateway_metadata(used_provider="Alibaba Cloud", used_model="", routing=failed)
-    payload = _build_provider_fallback_sse_event(provider_only, "s1", 1)
+    failed_primary = {"provider": "CanopyWave", "status": "failed", "error": "x"}
+    provider_only = _gateway_metadata(used_provider="Alibaba Cloud", used_model="", routing=[
+        failed_primary,
+        {"provider": "Alibaba Cloud", "status": "selected"},
+    ])
+    payload = _build(provider_only)
     assert payload is not None and payload["to_model"] == ""
-    model_only = _gateway_metadata(used_provider="CanopyWave", used_model="other-model", routing=failed)
-    payload2 = _build_provider_fallback_sse_event(model_only, "s1", 1)
-    assert payload2 is not None and payload2["to_provider"] == "CanopyWave"
+    model_only = _gateway_metadata(used_provider="CanopyWave", used_model="other-model", routing=[
+        failed_primary,
+        {"provider": "CanopyWave", "model": "other-model", "status": "selected"},
+    ])
+    payload2 = _build(model_only)
+    assert payload2 is not None
+    assert payload2["to_provider"] == "CanopyWave"
+    assert payload2["to_model"] == "other-model"
 
 
 def test_gateway_event_malformed_metadata_returns_none():
-    assert _build_provider_fallback_sse_event(None, "s1", 1) is None
-    assert _build_provider_fallback_sse_event({}, "s1", 1) is None
-    assert _build_provider_fallback_sse_event("garbage", "s1", 1) is None
+    assert _build(None) is None
+    assert _build({}) is None
+    assert _build("garbage") is None
     # routing not a list / entries not dicts
     bad = _gateway_metadata(routing="not-a-list")
-    assert _build_provider_fallback_sse_event(bad, "s1", 1) is None
+    assert _build(bad) is None
     bad2 = _gateway_metadata(routing=["x", None, 42])
-    assert _build_provider_fallback_sse_event(bad2, "s1", 1) is None
-    # failed attempts but no selected route
+    assert _build(bad2) is None
+    # failed attempts but no used route at all
     no_route = _gateway_metadata(used_provider="", used_model="", routing=[
         {"provider": "CanopyWave", "status": "failed", "error": "x"},
     ])
-    assert _build_provider_fallback_sse_event(no_route, "s1", 1) is None
+    assert _build(no_route) is None
 
 
 # ── Shared payload hygiene ────────────────────────────────────────────────
@@ -297,12 +452,20 @@ def test_reason_is_bounded_cleaned_and_redacted():
 
 
 def test_transition_id_deterministic_and_per_occurrence():
-    a = _fallback_transition_id("s1", "openai", "gpt", "anthropic", "opus", 1)
-    b = _fallback_transition_id("s1", "openai", "gpt", "anthropic", "opus", 1)
+    a = _fallback_transition_id("s1", "stream-1", "openai", "gpt", "anthropic", "opus", 1)
+    b = _fallback_transition_id("s1", "stream-1", "openai", "gpt", "anthropic", "opus", 1)
     assert a == b and len(a) == 16
-    assert a != _fallback_transition_id("s1", "openai", "gpt", "anthropic", "opus", 2)  # next occurrence
-    assert a != _fallback_transition_id("s2", "openai", "gpt", "anthropic", "opus", 1)  # other session
-    assert a != _fallback_transition_id("s1", "openai", "gpt", "anthropic", "opus-2", 1)  # other route
+    assert a != _fallback_transition_id("s1", "stream-1", "openai", "gpt", "anthropic", "opus", 2)  # next occurrence
+    assert a != _fallback_transition_id("s2", "stream-1", "openai", "gpt", "anthropic", "opus", 1)  # other session
+    assert a != _fallback_transition_id("s1", "stream-1", "openai", "gpt", "anthropic", "opus-2", 1)  # other route
+
+
+def test_transition_id_embeds_per_stream_owner():
+    """Two turns with the SAME first from→to fallback must NOT collide: the
+    per-stream/per-turn owner is immutable while ``seq`` resets every turn."""
+    turn1 = _fallback_transition_id("s1", "stream-1", "openai", "gpt-4", "anthropic", "opus", 1)
+    turn2 = _fallback_transition_id("s1", "stream-2", "openai", "gpt-4", "anthropic", "opus", 1)
+    assert turn1 != turn2
 
 
 # ── Frontend: visible UI behavior (Node driver on the REAL functions) ─────
@@ -327,6 +490,7 @@ function extractFunc(name) {
 
 // Harness globals mirroring the production closure of attachLiveStream().
 let activeSid = 'sess-A';
+let streamId = 'stream-1';
 const S = { session: { session_id: 'sess-A' } };
 let _providerFallbackRenderedMap = {};
 let _providerFallbackReassertedMap = {};
@@ -345,33 +509,49 @@ eval(extractFunc('_reassertProviderFallbackIndicator'));
 function assert(c, m) { if (!c) throw new Error(m || 'assertion failed'); }
 const scenario = process.argv[3];
 
+function resetState() {
+  _providerFallbackRenderedMap = {};
+  _providerFallbackReassertedMap = {};
+  _providerFallbackRenderCount = 0;
+  _lastComposerStatus = '';
+  _lastToast = null;
+}
+
 if (scenario === 'render') {
-  _renderProviderFallbackIndicator({ session_id: 'sess-A', transition_id: 't1', from_provider: 'openai', from_model: 'gpt-4', to_provider: 'anthropic', to_model: 'opus', reason: 'rate limited' });
+  _renderProviderFallbackIndicator({ session_id: 'sess-A', stream_id: 'stream-1', transition_id: 't1', from_provider: 'openai', from_model: 'gpt-4', to_provider: 'anthropic', to_model: 'opus', reason: 'rate limited' });
   assert(_lastComposerStatus === '⚠️ Fell back to opus via anthropic', 'composer status: ' + _lastComposerStatus);
   assert(_lastToast && _lastToast.m === 'rate limited' && _lastToast.type === 'warning', 'toast not shown');
   assert(_providerFallbackRenderedMap['t1'], 'transition not recorded');
-  assert(_providerFallbackReassertedMap['sess-A'] === 't1', 'reassert record missing');
+  assert(_providerFallbackRenderedMap['t1'].streamId === 'stream-1', 'stream owner not recorded');
+  assert(_providerFallbackRenderedMap['t1'].source === 'agent', 'source not recorded');
+  assert(_providerFallbackReassertedMap['sess-A'].tid === 't1', 'reassert record missing');
+  assert(_providerFallbackReassertedMap['sess-A'].streamId === 'stream-1', 'reassert stream missing');
   process.stdout.write('PASS render\n');
 } else if (scenario === 'ownership') {
-  _renderProviderFallbackIndicator({ session_id: 'sess-B', transition_id: 't1', to_provider: 'anthropic' });
+  _renderProviderFallbackIndicator({ session_id: 'sess-B', stream_id: 'stream-1', transition_id: 't1', to_provider: 'anthropic' });
   assert(_lastComposerStatus === '', 'foreign session rendered');
   assert(Object.keys(_providerFallbackRenderedMap).length === 0, 'foreign session recorded');
+  // Same session, STALE stream (callback from a replaced same-session stream).
+  _renderProviderFallbackIndicator({ session_id: 'sess-A', stream_id: 'stream-OLD', transition_id: 't2', to_provider: 'anthropic' });
+  assert(_lastComposerStatus === '', 'stale stream rendered');
+  assert(Object.keys(_providerFallbackRenderedMap).length === 0, 'stale stream recorded');
   S.session = { session_id: 'sess-OTHER' };
-  _renderProviderFallbackIndicator({ session_id: 'sess-A', transition_id: 't2', to_provider: 'anthropic' });
+  _renderProviderFallbackIndicator({ session_id: 'sess-A', stream_id: 'stream-1', transition_id: 't3', to_provider: 'anthropic' });
   assert(_lastComposerStatus === '', 'S.session mismatch rendered');
   assert(Object.keys(_providerFallbackRenderedMap).length === 0, 'mismatch recorded');
+  S.session = { session_id: 'sess-A' };
   process.stdout.write('PASS ownership\n');
 } else if (scenario === 'model_only') {
-  _renderProviderFallbackIndicator({ session_id: 'sess-A', transition_id: 't2', from_model: 'gpt-4', to_model: 'opus', reason: 'model swapped' });
+  _renderProviderFallbackIndicator({ session_id: 'sess-A', stream_id: 'stream-1', transition_id: 't2', from_model: 'gpt-4', to_model: 'opus', reason: 'model swapped' });
   assert(_lastComposerStatus === '⚠️ Fell back to opus', 'model-only status: ' + _lastComposerStatus);
   assert(_lastToast && _lastToast.m === 'model swapped', 'model-only toast missing');
   process.stdout.write('PASS model_only\n');
 } else if (scenario === 'provider_only') {
-  _renderProviderFallbackIndicator({ session_id: 'sess-A', transition_id: 't3', from_provider: 'openai', to_provider: 'anthropic' });
+  _renderProviderFallbackIndicator({ session_id: 'sess-A', stream_id: 'stream-1', transition_id: 't3', from_provider: 'openai', to_provider: 'anthropic' });
   assert(_lastComposerStatus === '⚠️ Fell back to anthropic', 'provider-only status: ' + _lastComposerStatus);
   process.stdout.write('PASS provider_only\n');
 } else if (scenario === 'dedup_replay') {
-  const d = { session_id: 'sess-A', transition_id: 't1', to_provider: 'anthropic' };
+  const d = { session_id: 'sess-A', stream_id: 'stream-1', transition_id: 't1', to_provider: 'anthropic' };
   _renderProviderFallbackIndicator(d);
   assert(_lastComposerStatus === '⚠️ Fell back to anthropic', 'first render');
   _lastComposerStatus = '';
@@ -380,19 +560,61 @@ if (scenario === 'render') {
   assert(_lastComposerStatus === '', 'replay re-rendered');
   assert(Object.keys(_providerFallbackRenderedMap).length === 1, 'map grew on replay');
   // A NEW transition in a later turn still renders (map is keyed by id).
-  _renderProviderFallbackIndicator({ session_id: 'sess-A', transition_id: 't2', to_model: 'opus' });
+  _renderProviderFallbackIndicator({ session_id: 'sess-A', stream_id: 'stream-1', transition_id: 't2', to_model: 'opus' });
   assert(_lastComposerStatus === '⚠️ Fell back to opus', 'new transition suppressed');
   process.stdout.write('PASS dedup_replay\n');
 } else if (scenario === 'done_reassert') {
-  _renderProviderFallbackIndicator({ session_id: 'sess-A', transition_id: 't1', to_provider: 'anthropic' });
+  _renderProviderFallbackIndicator({ session_id: 'sess-A', stream_id: 'stream-1', transition_id: 't1', to_provider: 'anthropic' });
   _lastComposerStatus = '';
-  _reassertProviderFallbackIndicator('sess-A');
+  _reassertProviderFallbackIndicator('sess-A', 'stream-1');
   assert(_lastComposerStatus === '⚠️ Fell back to anthropic', 'done reassert failed: ' + _lastComposerStatus);
   assert(Object.keys(_providerFallbackRenderedMap).length === 1, 'reassert grew map');
   _lastComposerStatus = '';
-  _reassertProviderFallbackIndicator('sess-UNKNOWN');
+  _reassertProviderFallbackIndicator('sess-UNKNOWN', 'stream-1');
   assert(_lastComposerStatus === '', 'unknown session reasserted');
+  _reassertProviderFallbackIndicator('sess-A', 'stream-OLD');
+  assert(_lastComposerStatus === '', 'stale stream reasserted');
   process.stdout.write('PASS done_reassert\n');
+} else if (scenario === 'stale_stream') {
+  // Replacement stream for the SAME session: the old stream's callback must
+  // not render into the replacement, and the replacement's own reassert must
+  // not be poisoned by the stale record.
+  streamId = 'stream-2';
+  resetState();
+  _renderProviderFallbackIndicator({ session_id: 'sess-A', stream_id: 'stream-1', transition_id: 't-old', to_provider: 'anthropic' });
+  assert(_lastComposerStatus === '', 'stale replacement-stream callback rendered: ' + _lastComposerStatus);
+  assert(Object.keys(_providerFallbackRenderedMap).length === 0, 'stale callback recorded');
+  _renderProviderFallbackIndicator({ session_id: 'sess-A', stream_id: 'stream-2', transition_id: 't-new', to_provider: 'anthropic' });
+  assert(_lastComposerStatus === '⚠️ Fell back to anthropic', 'replacement stream event dropped');
+  _lastComposerStatus = '';
+  _reassertProviderFallbackIndicator('sess-A', 'stream-2');
+  assert(_lastComposerStatus === '⚠️ Fell back to anthropic', 'replacement reassert failed');
+  process.stdout.write('PASS stale_stream\n');
+} else if (scenario === 'done_cleanup_order') {
+  // Production `done` sequence: render → generic idle cleanup (what
+  // `_setActivePaneIdleIfOwner()` runs: setBusy(false)+setComposerStatus(''))
+  // → reassert AFTER the cleanup. The reassert must restore the indicator.
+  _renderProviderFallbackIndicator({ session_id: 'sess-A', stream_id: 'stream-1', transition_id: 't1', to_provider: 'anthropic' });
+  setComposerStatus('');                                    // _setActivePaneIdleIfOwner()
+  assert(_lastComposerStatus === '', 'precondition: idle cleanup cleared status');
+  _reassertProviderFallbackIndicator('sess-A', 'stream-1'); // done settlement, post-cleanup
+  assert(_lastComposerStatus === '⚠️ Fell back to anthropic', 'indicator wiped by idle cleanup: ' + _lastComposerStatus);
+  _reassertProviderFallbackIndicator('sess-A', 'stream-1');
+  assert(_lastComposerStatus === '⚠️ Fell back to anthropic', 'reassert changed text');
+  process.stdout.write('PASS done_cleanup_order\n');
+} else if (scenario === 'two_turns_same_route') {
+  // Two turns, SAME session and SAME from→to route, DIFFERENT streams: the
+  // per-stream owner in the transition id keeps the second turn visible
+  // (the per-request seq resets each turn and alone would collide).
+  resetState();
+  _renderProviderFallbackIndicator({ session_id: 'sess-A', stream_id: 'stream-1', transition_id: 'tid-turn-1', to_provider: 'anthropic' });
+  assert(_lastComposerStatus === '⚠️ Fell back to anthropic', 'turn 1 dropped');
+  _lastComposerStatus = '';
+  streamId = 'stream-2';
+  _renderProviderFallbackIndicator({ session_id: 'sess-A', stream_id: 'stream-2', transition_id: 'tid-turn-2', to_provider: 'anthropic' });
+  assert(_lastComposerStatus === '⚠️ Fell back to anthropic', 'turn 2 (same route) suppressed by dedup');
+  assert(Object.keys(_providerFallbackRenderedMap).length === 2, 'two transitions recorded');
+  process.stdout.write('PASS two_turns_same_route\n');
 } else {
   throw new Error('unknown scenario ' + scenario);
 }
@@ -429,7 +651,7 @@ def test_fe_renders_localized_composer_indicator(fe_driver_path):
 
 
 @pytestmark_fe
-def test_fe_ownership_guard_drops_foreign_and_mismatched_sessions(fe_driver_path):
+def test_fe_ownership_guard_drops_foreign_stale_and_mismatched(fe_driver_path):
     assert "PASS ownership" in _run_fe_scenario(fe_driver_path, "ownership")
 
 
@@ -453,6 +675,28 @@ def test_fe_done_settlement_reasserts_indicator_once(fe_driver_path):
     assert "PASS done_reassert" in _run_fe_scenario(fe_driver_path, "done_reassert")
 
 
+@pytestmark_fe
+def test_fe_stale_replacement_stream_callback_dropped(fe_driver_path):
+    """A stale callback from a replaced same-session stream never renders into
+    the replacement stream, and the replacement's reassert is not poisoned."""
+    assert "PASS stale_stream" in _run_fe_scenario(fe_driver_path, "stale_stream")
+
+
+@pytestmark_fe
+def test_fe_indicator_survives_done_idle_cleanup(fe_driver_path):
+    """The settled indicator is re-asserted AFTER the generic idle cleanup
+    (setBusy(false)/setComposerStatus('')) — the pre-fix order wiped it."""
+    assert "PASS done_cleanup_order" in _run_fe_scenario(fe_driver_path, "done_cleanup_order")
+
+
+@pytestmark_fe
+def test_fe_same_route_two_turns_both_render(fe_driver_path):
+    """Two turns with the same route (different streams) both render — the
+    per-stream owner in the transition id prevents the second from being
+    deduplicated away."""
+    assert "PASS two_turns_same_route" in _run_fe_scenario(fe_driver_path, "two_turns_same_route")
+
+
 # ── Frontend source contract + i18n ──────────────────────────────────────
 
 
@@ -462,8 +706,13 @@ def test_fe_listener_source_contract():
     assert "_renderProviderFallbackIndicator(d);" in MESSAGES_JS
     assert "if(!d.to_provider) return;" not in MESSAGES_JS
     assert "console.info('[provider_fallback]'" not in MESSAGES_JS
-    # `done` settlement re-asserts the indicator (survives settlement).
-    assert "_reassertProviderFallbackIndicator(completedSid)" in MESSAGES_JS
+    # `done` settlement re-asserts the indicator with the exact stream owner,
+    # and the reassert call sits AFTER the generic idle cleanup call inside
+    # the done handler (the cleanup would otherwise erase the notice).
+    assert "_reassertProviderFallbackIndicator(completedSid, streamId)" in MESSAGES_JS
+    reassert_pos = MESSAGES_JS.index("_reassertProviderFallbackIndicator(completedSid, streamId)")
+    idle_pos = MESSAGES_JS.rindex("_setActivePaneIdleIfOwner();", 0, reassert_pos)
+    assert idle_pos < reassert_pos
 
 
 def test_i18n_key_present_in_all_locale_blocks():

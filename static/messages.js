@@ -5705,12 +5705,16 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
 
   // ── Provider fallback indicator (#6267) ─────────────────────────────────
   // Renders a visible composer/turn indicator when the server emits the typed
-  // provider_fallback event.  Guarded by session/stream ownership, deduplicated
-  // by transition_id (module-scope map, so SSE snapshot replay cannot re-render
-  // the same transition), and re-asserted once at `done` so the settled render
-  // cannot wipe a just-shown notice.  The indicator is transient (live turn +
-  // short toast) and intentionally NOT persisted: reload/replay re-shows it only
-  // when the live event is delivered again.
+  // provider_fallback event.  Guarded by exact (session, stream) ownership —
+  // a stale callback from a replaced SAME-session stream carries the old
+  // stream_id and cannot render into the replacement stream — deduplicated by
+  // transition_id (module-scope map; the id embeds the per-stream owner, so
+  // SSE snapshot replay of the SAME transition cannot re-render, while the
+  // same route in a later turn yields a fresh id), and re-asserted once at
+  // `done` AFTER the generic idle cleanup so settlement cannot erase it.
+  // The indicator is transient (live turn + short toast) and intentionally
+  // NOT persisted: reload/replay re-shows it only when the live event is
+  // delivered again.
   function _providerFallbackLabel(d){
     const toModel=String(d.to_model||'').trim();
     const toProvider=String(d.to_provider||'').trim();
@@ -5721,7 +5725,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   function _renderProviderFallbackIndicator(d){
     if(!d||typeof d!=='object') return;
     const sid=String(d.session_id||'');
-    if(!sid||sid!==activeSid) return;                        // session/stream ownership
+    if(!sid||sid!==activeSid) return;                        // session ownership
+    if(String(d.stream_id||'')!==String(streamId||'')) return; // stream ownership (stale replacement-stream callback)
     if(!S.session||S.session.session_id!==activeSid) return;
     const tid=String(d.transition_id||'');
     if(!tid) return;
@@ -5729,30 +5734,41 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     const label=_providerFallbackLabel(d);
     if(!label) return;                                       // provider OR model accepted
     const statusText=(typeof t==='function')?t('provider_fallback_status',label):('⚠️ Fell back to '+label);
-    _providerFallbackRenderedMap[tid]={sid:sid,text:statusText,label:label};
-    _providerFallbackReassertedMap[sid]=tid;
+    _providerFallbackRenderedMap[tid]={sid:sid,streamId:String(streamId||''),source:String(d.source||''),text:statusText,label:label};
+    _providerFallbackReassertedMap[sid]={tid:tid,streamId:String(streamId||'')};
     if(typeof setComposerStatus==='function') setComposerStatus(statusText);
     const reason=String(d.reason||'').trim();
     if(reason&&typeof showToast==='function') showToast(reason,8000,'warning');
     _providerFallbackRenderCount++;
-    // Bound the dedup map so long-lived tabs don't grow it unboundedly.
+    // Bound the dedup maps so long-lived tabs don't grow them unboundedly.
     if(_providerFallbackRenderCount>200){
       const keys=Object.keys(_providerFallbackRenderedMap);
-      for(let i=0;i<keys.length-200;i++) delete _providerFallbackRenderedMap[keys[i]];
+      for(let i=0;i<keys.length-200;i++){
+        const pruned=keys[i];
+        delete _providerFallbackRenderedMap[pruned];
+        // Drop reassert records whose transition was pruned (stale streams).
+        for(const sKey of Object.keys(_providerFallbackReassertedMap)){
+          if(_providerFallbackReassertedMap[sKey]&&_providerFallbackReassertedMap[sKey].tid===pruned){
+            delete _providerFallbackReassertedMap[sKey];
+          }
+        }
+      }
       _providerFallbackRenderCount=200;
     }
   }
 
-  function _reassertProviderFallbackIndicator(sid){
-    // Called at `done` settlement: if this session recorded a fallback
-    // transition this stream, re-assert the composer indicator (dedup by
-    // transition_id keeps it exactly-once per transition).
+  function _reassertProviderFallbackIndicator(sid, streamId){
+    // Called at `done` settlement AFTER the generic idle cleanup: if this
+    // exact (session, stream) recorded a fallback transition, re-assert the
+    // composer indicator (dedup by transition_id keeps it exactly-once per
+    // transition; the stream fence drops stale same-session records).
     const key=String(sid||'');
-    const tid=_providerFallbackReassertedMap[key];
-    if(!tid) return;
-    const rec=_providerFallbackRenderedMap[tid];
+    const rec=_providerFallbackReassertedMap[key];
     if(!rec) return;
-    if(typeof setComposerStatus==='function') setComposerStatus(rec.text);
+    if(rec.streamId&&String(streamId||'')!==rec.streamId) return; // stale stream
+    const rendered=_providerFallbackRenderedMap[rec.tid];
+    if(!rendered) return;
+    if(typeof setComposerStatus==='function') setComposerStatus(rendered.text);
   }
 
   function _wireSSE(source){
@@ -6432,10 +6448,6 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
             _restoreMessageScrollSnapshotSameFrame(_doneLiveScrollSnapshot);
           }
           if(shouldFollowOnDone&&typeof scrollToBottom==='function') scrollToBottom();
-          // #6267: re-assert the provider-fallback composer indicator after the
-          // settled render so `done` settlement cannot wipe a just-shown notice
-          // (dedup by transition_id keeps it exactly-once per transition).
-          if(typeof _reassertProviderFallbackIndicator==='function') _reassertProviderFallbackIndicator(completedSid);
           if(typeof noteWorkspaceMutationsFromToolCalls==='function') noteWorkspaceMutationsFromToolCalls(S.toolCalls);
           loadDir('.', { preservePreview: true });
           // TTS auto-read: speak the last assistant response if enabled (#499)
@@ -6459,6 +6471,12 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         if(isActiveSession) _queueDrainSid=activeSid;
         renderSessionList();
         _setActivePaneIdleIfOwner();
+        // #6267: re-assert the provider-fallback composer indicator AFTER the
+        // generic idle cleanup — `_setActivePaneIdleIfOwner()` runs
+        // setBusy(false)/setComposerStatus('') which would otherwise erase the
+        // just-reasserted notice.  Fenced to this exact (session, stream) and
+        // deduped by transition_id (exactly-once per transition).
+        if(typeof _reassertProviderFallbackIndicator==='function') _reassertProviderFallbackIndicator(completedSid, streamId);
         _dispatchExtensionTurnLifecycle('turn:complete',activeSid,streamId,{
           status:d.status||'completed',
           endedAt:Date.now()/1000,

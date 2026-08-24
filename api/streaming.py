@@ -2567,17 +2567,20 @@ def _bounded_fallback_reason(text) -> str:
     return cleaned[:_FALLBACK_REASON_MAX_CHARS]
 
 
-def _fallback_transition_id(session_id, from_provider, from_model, to_provider, to_model, seq) -> str:
+def _fallback_transition_id(session_id, stream_id, from_provider, from_model, to_provider, to_model, seq) -> str:
     """Deterministic per-occurrence transition id used for frontend dedup.
 
-    Includes the request session and a per-stream occurrence counter so the
-    same from→to route in two different turns yields distinct ids, while a
-    replayed duplicate of the SAME transition (SSE snapshot replay) maps to
-    the same id and is deduplicated exactly once.
+    Includes the request session, an immutable per-stream/per-turn owner
+    (``stream_id``), and a per-stream occurrence counter, so the same from→to
+    route in two different turns yields distinct ids (the per-request ``seq``
+    resets every turn and alone would collide), while a replayed duplicate of
+    the SAME transition (SSE snapshot replay) maps to the same id and is
+    deduplicated exactly once.
     """
     raw = '|'.join([
-        str(session_id or ''), str(from_provider or ''), str(from_model or ''),
-        str(to_provider or ''), str(to_model or ''), str(int(seq or 0)),
+        str(session_id or ''), str(stream_id or ''), str(from_provider or ''),
+        str(from_model or ''), str(to_provider or ''), str(to_model or ''),
+        str(int(seq or 0)),
     ])
     return hashlib.sha1(raw.encode('utf-8')).hexdigest()[:16]
 
@@ -2597,36 +2600,77 @@ def _is_fallback_switch_notice(kind: str, message: str) -> bool:
     return k == 'lifecycle' and 'switched to fallback model' in m
 
 
+def _is_fallback_switch_chatter(message) -> bool:
+    """True for generic switch/selection chatter (NOT a failure cause).
+
+    On a successful fallback the agent appends a generic ``Primary model
+    failed — switching to fallback …`` status as the LAST buffered row.  That
+    row announces the switch instead of explaining the failure, so it must
+    never be selected as the displayed cause.  The one-shot success notice
+    (``Switched to fallback model: …``) is excluded for the same reason.
+    """
+    m = str(message or '').strip().lower()
+    return (
+        'switching to fallback' in m
+        or 'switched to fallback model' in m
+        or 'primary model failed' in m
+        or 'falling back to' in m
+        or 'fallback selected' in m
+        or 'selected fallback' in m
+    )
+
+
 def _agent_fallback_cause(agent) -> str:
     """Derive the failed-primary cause from the agent's buffered retry trace.
 
-    On a successful fallback the agent buffers the failure that triggered the
-    switch (e.g. a rate-limit line) and drops the buffer right after the
-    switch notice, so the last buffered status/warning line is the closest
-    user-facing record of the failed primary attempt.
+    Prefers a structured failed-primary cause when the agent exposes one
+    (``_fallback_cause`` / ``fallback_cause`` / ``_fallback_error`` /
+    ``_fallback_reason``).  Otherwise scans the buffered status/warning trace
+    in reverse, SKIPPING switch/selection chatter — the generic ``Primary
+    model failed — switching to fallback …`` row the agent appends at the end
+    of a successful switch — so the actual preceding failure is selected.
     """
+    # Structured failed-primary cause is authoritative when present.
+    try:
+        for attr in (
+            '_fallback_cause', 'fallback_cause', '_fallback_error',
+            '_fallback_reason',
+        ):
+            value = getattr(agent, attr, None)
+            if value:
+                bounded = _bounded_fallback_reason(value)
+                if bounded:
+                    return bounded
+    except Exception:
+        pass
     try:
         buf = getattr(agent, '_retry_status_buffer', None)
         if not isinstance(buf, list):
             return ''
         for kind, text in reversed(buf):
-            if str(kind or '').strip().lower() in {'status', 'warn'}:
-                bounded = _bounded_fallback_reason(text)
-                if bounded:
-                    return bounded
+            if str(kind or '').strip().lower() not in {'status', 'warn'}:
+                continue
+            message = str(text or '')
+            if _is_fallback_switch_chatter(message):
+                continue
+            bounded = _bounded_fallback_reason(message)
+            if bounded:
+                return bounded
     except Exception:
         pass
     return ''
 
 
-def _build_agent_fallback_payload(session_id, from_provider, from_model, to_provider, to_model, reason, seq):
+def _build_agent_fallback_payload(session_id, stream_id, from_provider, from_model, to_provider, to_model, reason, seq):
     """Build the ``provider_fallback`` SSE payload for an agent-side transition.
 
     Sourced from the agent's one-shot ``Switched to fallback model`` lifecycle
     notice, with the prior route tracked per request.  Accepts a destination
     provider OR model (either may be empty — model-only fallbacks are valid);
     returns None for same-route no-op transitions.  Sends only the routing
-    fields the UI needs.
+    fields the UI needs.  ``stream_id`` is the immutable per-stream/per-turn
+    owner baked into ``transition_id`` so the same route in a later turn never
+    collides with an earlier occurrence.
     """
     from_provider = str(from_provider or '').strip()
     from_model = str(from_model or '').strip()
@@ -2641,6 +2685,7 @@ def _build_agent_fallback_payload(session_id, from_provider, from_model, to_prov
         return None
     return {
         'session_id': str(session_id or ''),
+        'stream_id': str(stream_id or ''),
         'source': 'agent',
         'from_provider': from_provider,
         'from_model': from_model,
@@ -2648,19 +2693,22 @@ def _build_agent_fallback_payload(session_id, from_provider, from_model, to_prov
         'to_model': to_model,
         'reason': _bounded_fallback_reason(reason),
         'transition_id': _fallback_transition_id(
-            session_id, from_provider, from_model, to_provider, to_model, seq,
+            session_id, stream_id, from_provider, from_model, to_provider,
+            to_model, seq,
         ),
     }
 
 
-def _maybe_emit_agent_fallback_event(kind, message, agent, session_id, fallback_state):
+def _maybe_emit_agent_fallback_event(kind, message, agent, session_id, fallback_state, stream_id):
     """Bridge an agent fallback-switch notice into a ``provider_fallback`` payload.
 
     Authoritative, request-scoped producer for the configured
     ``fallback_providers`` chain.  Returns the payload to emit (or None); the
     caller owns the SSE ``put``.  Tracks the prior route and a per-stream
     occurrence counter on ``fallback_state`` so chain switches within an
-    already-fallback turn produce their own distinct transition ids.
+    already-fallback turn produce their own distinct transition ids, and sets
+    ``agent_fired`` so the gateway-side producer skips a redundant second
+    event when the same physical fallback is also visible in gateway metadata.
     """
     if not _provider_fallback_sse_enabled():
         return None
@@ -2669,6 +2717,7 @@ def _maybe_emit_agent_fallback_event(kind, message, agent, session_id, fallback_
     seq = int(fallback_state.get('seq') or 0) + 1
     payload = _build_agent_fallback_payload(
         session_id,
+        stream_id,
         fallback_state.get('route_provider') or '',
         fallback_state.get('route_model') or '',
         getattr(agent, 'provider', '') or '',
@@ -2679,25 +2728,52 @@ def _maybe_emit_agent_fallback_event(kind, message, agent, session_id, fallback_
     if payload is None:
         return None
     fallback_state['seq'] = seq
+    fallback_state['agent_fired'] = True
     fallback_state['route_provider'] = payload['to_provider']
     fallback_state['route_model'] = payload['to_model']
     return payload
 
 
+_FAILED_ROUTING_STATUSES = {'failed', 'error', 'timeout', 'rejected', 'unavailable'}
+_SELECTED_ROUTING_STATUSES = {'selected', 'success', 'ok'}
+
+
+def _routing_attempt_matches(attempt, provider, model) -> bool:
+    """Case-insensitive route match between a routing row and a reference route.
+
+    Either field suffices (rows may carry provider only, model only, or both);
+    a row with NO provider/model fields never matches a non-empty reference.
+    """
+    if not isinstance(attempt, dict):
+        return False
+    if provider:
+        if str(attempt.get('provider') or '').strip().lower() == str(provider).strip().lower():
+            return True
+    if model:
+        if str(attempt.get('model') or '').strip().lower() == str(model).strip().lower():
+            return True
+    return False
+
+
 def _build_provider_fallback_sse_event(
     gateway_routing: dict,
     session_id: str | None = None,
+    stream_id: str | None = None,
     seq: int = 0,
     requested_model: str | None = None,
     requested_provider: str | None = None,
 ) -> dict | None:
     """Build a ``provider_fallback`` SSE payload from PROVEN gateway failover.
 
-    Fires only when the LLM-gateway routing list contains an explicit failed
-    primary attempt followed by a selected route — never from requested-vs-used
-    string inequality alone.  The displayed reason is derived from the FIRST
-    failed primary attempt (bounded/redacted), not from the successful
-    fallback attempt's rationale.
+    Fires only when the LLM-gateway routing list contains an ORDERED proof:
+    a failed attempt matching the REQUESTED primary route, followed (strictly
+    later in the list) by an explicit selected/success row matching the USED
+    route.  An unrelated failure (different provider/model than requested),
+    an out-of-order selection (selected row before the failure), or a
+    failure with no matching selected row all fail closed — the event is
+    never inferred from requested-vs-used string inequality alone.  The
+    displayed reason is derived from the proven failed PRIMARY row only
+    (bounded/redacted), not from a later attempt's rationale.
     """
     if not isinstance(gateway_routing, dict):
         return None
@@ -2711,16 +2787,6 @@ def _build_provider_fallback_sse_event(
     if not isinstance(routing, list):
         routing = []
 
-    failed_attempts = [
-        a for a in routing
-        if isinstance(a, dict)
-        and str(a.get('status') or '').strip().lower() in {'failed', 'error', 'timeout', 'rejected'}
-    ]
-    # Proven failover: an explicit failed primary followed by a selected route.
-    # ``has_failover`` alone (which can flip on a plain string mismatch) is
-    # deliberately not sufficient.
-    if not failed_attempts:
-        return None
     if not (used_provider or used_model):
         return None
     # Same-route "failover" (primary failed but the selected route matches the
@@ -2731,16 +2797,47 @@ def _build_provider_fallback_sse_event(
     ):
         return None
 
-    # Reason: FIRST failed primary attempt's error, not the last routing
-    # entry (which may be the successful fallback attempt's rationale).
-    reason = ''
-    for attempt in failed_attempts:
-        reason = _bounded_fallback_reason(attempt.get('error') or attempt.get('reason') or '')
-        if reason:
-            break
+    # Ordered proof: the failed row must be the REQUESTED primary (not an
+    # unrelated provider/model), and a LATER selected/success row must match
+    # the USED route.  Without a reference requested route we cannot prove the
+    # failed row is the primary → fail closed.
+    if not (req_provider or req_model):
+        return None
+    proven_primary = None
+    proven_selection = None
+    for attempt in routing:
+        if not isinstance(attempt, dict):
+            continue
+        status = str(attempt.get('status') or '').strip().lower()
+        if proven_primary is None and status in _FAILED_ROUTING_STATUSES:
+            if _routing_attempt_matches(attempt, req_provider, req_model):
+                proven_primary = attempt
+            # An unrelated failed row is NOT the requested primary; keep
+            # scanning for the real one (and never let it stand in).
+            continue
+        if (
+            proven_primary is not None
+            and proven_selection is None
+            and (
+                status in _SELECTED_ROUTING_STATUSES
+                or bool(attempt.get('selected'))
+            )
+        ):
+            if _routing_attempt_matches(attempt, used_provider, used_model):
+                proven_selection = attempt
+                break
+    if proven_primary is None or proven_selection is None:
+        return None
+
+    # Reason: the proven failed PRIMARY row's error, never the successful
+    # fallback attempt's rationale.
+    reason = _bounded_fallback_reason(
+        proven_primary.get('error') or proven_primary.get('reason') or ''
+    )
 
     return {
         'session_id': str(session_id or ''),
+        'stream_id': str(stream_id or ''),
         'source': 'gateway',
         'from_provider': req_provider,
         'from_model': req_model,
@@ -2750,7 +2847,8 @@ def _build_provider_fallback_sse_event(
             f'Fell back from {req_provider}/{req_model} to {used_provider}/{used_model}'
         ),
         'transition_id': _fallback_transition_id(
-            session_id, req_provider, req_model, used_provider, used_model, seq,
+            session_id, stream_id, req_provider, req_model, used_provider,
+            used_model, seq,
         ),
     }
 
@@ -9333,7 +9431,16 @@ def _run_agent_streaming(
     # Seeded from the agent's route right before run_conversation() and shared
     # by the status callback (agent-side producer) and the turn-end block
     # (gateway-side producer).  Mutable dict = closure write without nonlocal.
-    _fallback_state = {'seq': 0, 'route_provider': '', 'route_model': ''}
+    # ``stream_id`` is the immutable per-stream/per-turn owner baked into the
+    # transition id; ``agent_fired`` lets the gateway producer skip a
+    # redundant second event for the same physical fallback.
+    _fallback_state = {
+        'seq': 0,
+        'route_provider': '',
+        'route_model': '',
+        'stream_id': str(stream_id or ''),
+        'agent_fired': False,
+    }
 
     def _agent_status_callback(kind, message):
         """Bridge Agent lifecycle status into WebUI SSE.
@@ -9378,7 +9485,7 @@ def _run_agent_streaming(
         # from the agent at notice time.
         if _is_fallback_switch_notice(_kind, _message):
             _fb_payload = _maybe_emit_agent_fallback_event(
-                _kind, _message, agent, session_id, _fallback_state,
+                _kind, _message, agent, session_id, _fallback_state, stream_id,
             )
             if _fb_payload is not None:
                 put('provider_fallback', _fb_payload)
@@ -11930,15 +12037,20 @@ def _run_agent_streaming(
                     s.gateway_routing_history = _history[-50:]
                     # ── Provider fallback SSE event (#6267) ─────────────────────
                     # Gateway-side producer: emit a typed SSE event only for
-                    # PROVEN LLM-gateway failover (explicit failed primary
-                    # attempt followed by a selected route).  The agent-side
-                    # producer already fired mid-turn from the status callback
-                    # when the configured fallback_providers chain was used.
-                    if _provider_fallback_sse_enabled():
+                    # PROVEN LLM-gateway failover (an ordered failed requested
+                    # primary followed by a selected route matching the used
+                    # route).  Skipped when the agent-side producer already
+                    # fired this turn (the same physical fallback would
+                    # otherwise double-notify the UI with two transition ids).
+                    if (
+                        _provider_fallback_sse_enabled()
+                        and not _fallback_state.get('agent_fired')
+                    ):
                         _fallback_seq = int(_fallback_state.get('seq') or 0) + 1
                         _fallback_event = _build_provider_fallback_sse_event(
                             _gateway_routing,
                             session_id=session_id,
+                            stream_id=stream_id,
                             seq=_fallback_seq,
                             requested_model=resolved_model or model,
                             requested_provider=resolved_provider,
