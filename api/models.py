@@ -3577,7 +3577,13 @@ def _apply_core_sync_or_error_marker(
         _stream_id = stream_id_for_recheck or session.active_stream_id
         _pending_started_at = session.pending_started_at
         if _run_journal_terminal_state(session, _stream_id) == 'completed':
-            if not (_already_checkpointed or _latest_user_matches_pending_text(session.messages, session.pending_user_message)):
+            if not (
+                _already_checkpointed
+                or (
+                    not _pending_turn_id
+                    and _latest_user_matches_pending_text(session.messages, session.pending_user_message)
+                )
+            ):
                 _append_recovered_pending_turn(session, timestamp=_recovered_ts)
             _append_journaled_partial_output(
                 session,

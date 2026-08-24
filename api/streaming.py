@@ -7870,6 +7870,11 @@ def _materialize_pending_user_turn_before_error(
                 and message.get('_active_turn_token') == active_turn_token
             ):
                 continue
+            # #6407 re-gate: pending_turn_id is the sole authority. A tokened
+            # row that lacks (or mismatches) the current per-turn ID is never a
+            # match — text/token identity alone must not suppress materialization.
+            if pending_turn_id and message.get('_turn_id') != pending_turn_id:
+                continue
             normalized_user = _normalize_user_text(
                 _message_text(message.get('content'))
             )
