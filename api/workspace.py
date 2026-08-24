@@ -1067,7 +1067,7 @@ def _leaf_flags(*, want_directory: bool) -> int:
     callers that read/scan it (file bytes, os.scandir), and an O_PATH fd
     cannot be read.
     """
-    return os.O_RDONLY | _O_NOFOLLOW | (_O_DIRECTORY if want_directory else 0) | _O_BINARY
+    return os.O_RDONLY | _O_NOFOLLOW | (_O_DIRECTORY if want_directory else 0) | (_O_BINARY if not want_directory else 0)
 
 
 def open_anchored_fd(workspace: Path, target: Path, *, want_dir: bool) -> int:
@@ -1090,7 +1090,7 @@ def open_anchored_fd(workspace: Path, target: Path, *, want_dir: bool) -> int:
         # protection, but no regression vs the prior path-based behaviour, and
         # symlink creation needs admin on Windows anyway. O_BINARY is required
         # so the returned leaf fd reads raw bytes (no CRLF translation).
-        flags = os.O_RDONLY | (_O_DIRECTORY if want_dir else 0) | _O_NOFOLLOW | _O_BINARY
+        flags = os.O_RDONLY | (_O_DIRECTORY if want_dir else 0) | _O_NOFOLLOW | (_O_BINARY if not want_dir else 0)
         try:
             return os.open(str(target), flags)
         except OSError:
