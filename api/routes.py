@@ -25847,6 +25847,11 @@ def _resolve_approval_legacy(sid: str, approval_id: str, choice: str, run_id: st
     Slice 3b keeps the RuntimeAdapter as a protocol translator: it delegates to
     this legacy helper rather than owning approval queues or callback state.
     """
+    if approval_id and str(approval_id).startswith("__read_only_child__:"):
+        # Read-only child projection — never resolvable through the parent's
+        # legacy FIFO resolver (#6961 r3 MUST-FIX 1). The child stays pending;
+        # signalling here would resolve the PARENT's approval instead.
+        return False
     # Pop the targeted entry from the pending queue by approval_id. Old clients
     # that omit approval_id still resolve the oldest entry for compatibility.
     pending = None

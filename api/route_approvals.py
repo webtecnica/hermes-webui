@@ -944,6 +944,11 @@ def submit_pending(session_key: str, approval: dict) -> None:
     """
     entry = dict(approval)
     entry.setdefault("approval_id", uuid.uuid4().hex)
+    if _is_child_approval_key(session_key):
+        # Bind the queue entry to the profile/state-db that enqueued it so a
+        # cross-profile process-global queue can never surface profile A's
+        # pending command under profile B's parent (#6961 r3 MUST-FIX 2).
+        entry["_child_provenance"] = _child_provenance_current()
     with _lock:
         queue_list = _normalize_pending_queue_locked(session_key)
         queue_list.append(entry)
@@ -977,6 +982,13 @@ def submit_pending(session_key: str, approval: dict) -> None:
 # the parent session's UI and resolve them back under the child's key.
 _CHILD_APPROVAL_KEY_PREFIX = "subagent:"
 
+# Read-only marker for child approvals surfaced under a parent session
+# (#6961 r3 MUST-FIX 1): child projections get this non-empty sentinel as
+# their approval_id so they are never mistaken for an actionable parent
+# approval. The legacy resolver rejects it and the frontend renders the
+# card inert.
+_READ_ONLY_CHILD_SENTINEL = "__read_only_child__:"
+
 # child id -> parent session key, scoped by canonical state-db/profile path.
 # Populated lazily on first sight of a child approval key (state.db fallback
 # below); seeded directly by tests via seed_child_parent().
@@ -992,12 +1004,27 @@ _child_approval_parents: dict[tuple[str, str], str] = {}
 def _child_parent_cache_key(child_session_id: str) -> tuple[str, str]:
     """Canonical cache key: (state-db/profile path, child session id)."""
     from api.models import _active_state_db_path
-
     try:
         db_path = _active_state_db_path()
     except Exception:
         db_path = None
     return (str(db_path or ""), child_session_id)
+
+
+def _child_provenance_current() -> str:
+    """Canonical identity of the currently-active profile's state DB.
+
+    Child queue entries are bound to this identity when enqueued
+    (``submit_pending``), and ``pending_head_for_session_locked`` filters the
+    projection by it, so a process-global queue shared across profiles can
+    never surface profile A's pending command under profile B's parent
+    (#6961 r3 MUST-FIX 2).
+    """
+    try:
+        from api.models import _active_state_db_path
+        return str(_active_state_db_path() or "").strip()
+    except Exception:
+        return ""
 
 
 def seed_child_parent(child_session_id: str, parent_session_id: str) -> None:
@@ -1061,17 +1088,30 @@ def _child_parent_session_id(child_session_id: str) -> str | None:
             if row:
                 parent_session_id, raw_model_config, source = row
                 model_config = {}
-                if isinstance(raw_model_config, str) and raw_model_config.strip():
-                    try:
-                        parsed = json.loads(raw_model_config)
-                        if isinstance(parsed, dict):
-                            model_config = parsed
-                    except (TypeError, ValueError):
-                        pass
+                config_authoritative = False
+                if raw_model_config is None:
+                    # Absence of config is authoritative: nothing to parse.
+                    config_authoritative = True
+                elif isinstance(raw_model_config, str):
+                    if raw_model_config.strip():
+                        try:
+                            parsed = json.loads(raw_model_config)
+                            if isinstance(parsed, dict):
+                                model_config = parsed
+                                config_authoritative = True
+                        except (TypeError, ValueError):
+                            # Malformed JSON: never fall through to the
+                            # physical-parent branch (#6961 r3 MUST-FIX 3).
+                            config_authoritative = False
+                    else:
+                        config_authoritative = True
+                elif isinstance(raw_model_config, dict):
+                    model_config = raw_model_config
+                    config_authoritative = True
                 delegate_from = str(model_config.get("_delegate_from") or "").strip()
                 if delegate_from:
                     parent = delegate_from
-                elif str(source or "").strip().lower() == "subagent":
+                elif config_authoritative and str(source or "").strip().lower() == "subagent":
                     parent = str(parent_session_id or "").strip() or None
     except Exception:
         logger.debug("child approval parent lookup failed", exc_info=True)
@@ -1170,10 +1210,27 @@ def pending_head_for_session_locked(session_key: str) -> tuple[dict | None, int]
     CALLER MUST HOLD `_lock`.
     """
     entries = _queue_entries_locked(session_key)
+    current_prov = _child_provenance_current()
     for child_key in child_approval_keys_for_session_locked(session_key):
         if child_key == session_key:
             continue
-        entries.extend(_queue_entries_locked(child_key))
+        for entry in _queue_entries_locked(child_key):
+            entry_prov = str(entry.get("_child_provenance") or "").strip()
+            if entry_prov != current_prov:
+                # Cross-profile guard (#6961 r3 MUST-FIX 2): a child entry
+                # parked under the same key by another profile's process-global
+                # queue must never be projected here. Unknown provenance fails
+                # closed too — child approvals only arrive via submit_pending,
+                # which now binds provenance on enqueue.
+                continue
+            # Mark child projections explicitly read-only (#6961 r3
+            # MUST-FIX 1): non-empty sentinel identity (never null/absent), so
+            # the frontend renders the card inert and the legacy resolver
+            # rejects it instead of signalling the PARENT's approval.
+            marked = dict(entry)
+            marked["approval_id"] = f"{_READ_ONLY_CHILD_SENTINEL}{child_key}"
+            marked["read_only"] = True
+            entries.append(marked)
     if not entries:
         return None, 0
     return dict(entries[0]), len(entries)

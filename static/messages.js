@@ -7395,6 +7395,10 @@ function hideApprovalCard(force=false) {
 // Track session_id of the active approval so respond goes to the right session
 let _approvalSessionId = null;
 let _approvalCurrentId = null;  // approval_id of the card currently shown
+// Read-only child-approval projections carry this non-empty sentinel as their
+// approval_id (#6961 r3): the card must render inert — every approval control
+// disabled — so it can never be answered through the parent's resolver.
+const _READ_ONLY_APPROVAL_PREFIX = "__read_only_child__:";
 let _approvalPendingBySession = new Map();
 let _approvalResponding = null;
 let _approvalClearedOwner = null;
@@ -7651,9 +7655,13 @@ function showApprovalCard(pending, pendingCount) {
     card.classList.remove("collapsed");
   }
   const responding = _approvalResponseMatches(sid, _approvalCurrentId);
+  // Read-only child projections (#6961 r3): render the card inert — every
+  // approval control disabled — so it can never be answered through the
+  // parent's resolver. Never focus the "Allow once" button either.
+  const readOnly = !!(_approvalCurrentId && _approvalCurrentId.indexOf(_READ_ONLY_APPROVAL_PREFIX) === 0);
   _setApprovalControlsDisabled(
-    responding ? (_approvalResponding.controlChoice || _approvalResponding.choice) : null,
-    responding,
+    readOnly ? null : (responding ? (_approvalResponding.controlChoice || _approvalResponding.choice) : null),
+    readOnly || responding,
   );
   _setPromptFlyoutHidden(card, false);
   card.classList.add("visible");
@@ -7661,7 +7669,7 @@ function showApprovalCard(pending, pendingCount) {
   _syncApprovalTranscriptSpace(card, {immediate: true});
   if (typeof applyLocaleToDOM === "function") applyLocaleToDOM();
   const onceBtn = $("approvalBtnOnce");
-  if (onceBtn && document.activeElement !== $('msg')) {
+  if (onceBtn && !readOnly && document.activeElement !== $('msg')) {
     setTimeout(() => onceBtn.focus({preventScroll: true}), 50);
   }
   if (typeof syncTopbar === 'function') syncTopbar();
@@ -7750,6 +7758,11 @@ function toggleApprovalCardCollapsed(forceCollapsed) {
 }
 
 async function respondApproval(choice, options = {}) {
+  if (_approvalCurrentId && _approvalCurrentId.indexOf(_READ_ONLY_APPROVAL_PREFIX) === 0) {
+    // Read-only child projection — never resolvable from the frontend
+    // (#6961 r3 MUST-FIX 1). Belt-and-braces alongside the disabled controls.
+    return;
+  }
   const owner = options.owner || _captureApprovalResponseOwner();
   if (!_approvalResponseOwnerIsCurrent(owner)) return false;
   const {sid, approvalId} = owner;
