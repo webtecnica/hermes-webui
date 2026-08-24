@@ -182,6 +182,19 @@ def _safe_replace(src: Path, dst: Path) -> None:
             delay *= 2  # 50 -> 100 -> 200 -> 400 -> 800 ms
 
 
+class SidecarLockError(RuntimeError):
+    """Raised when the per-session cross-process sidecar lock cannot be
+    established (lock-file open failure, OS lock acquisition failure, or no
+    lock primitive available on this platform).
+
+    PR #6422 re-gate (2026-08-06 review): every lock branch FAILS CLOSED.
+    ``Session.save()`` and ``api.session_recovery.recover_session()`` must
+    stop without publication when cross-process serialization cannot be
+    established — a best-effort unlocked write could interleave with another
+    process and lose a concurrent append.
+    """
+
+
 @contextmanager
 def _session_sidecar_cross_process_lock(sid: str):
     """Serialize read-merge-validate-replace of ONE session sidecar across processes.
@@ -198,8 +211,9 @@ def _session_sidecar_cross_process_lock(sid: str):
     ``msvcrt.locking`` (mirroring ``_cleanup_manifest_process_lock``).  The lock
     file is kept in place permanently — unlinking it while another process is
     waiting can split later callers across different inodes and defeat the
-    lock.  If neither primitive exists (exotic platform), degrade to a no-op
-    rather than block every save.
+    lock.  If neither primitive exists (exotic platform), raise
+    ``SidecarLockError`` rather than degrade to an unlocked write: save and
+    recovery must FAIL CLOSED when serialization cannot be established.
     """
     if not is_safe_session_id(sid):
         yield
@@ -208,10 +222,12 @@ def _session_sidecar_cross_process_lock(sid: str):
     try:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-    except OSError:
-        logger.debug("sidecar lock open failed for %s", sid, exc_info=True)
-        yield
-        return
+    except OSError as exc:
+        # Re-gate 2026-08-06: fail CLOSED — an unlocked save can clobber a
+        # concurrent append from another process.
+        raise SidecarLockError(
+            f"sidecar lock open failed for session {sid}: {exc}"
+        ) from exc
     with os.fdopen(fd, 'r+b', buffering=0) as lock_file:
         if _fcntl is not None:
             _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_EX)
@@ -228,10 +244,12 @@ def _session_sidecar_cross_process_lock(sid: str):
                 _msvcrt.locking(  # type: ignore[attr-defined]
                     lock_file.fileno(), _msvcrt.LK_LOCK, 1  # type: ignore[attr-defined]
                 )
-            except OSError:
-                logger.debug("sidecar msvcrt lock failed for %s", sid, exc_info=True)
-                yield
-                return
+            except OSError as exc:
+                # Fail CLOSED (re-gate 2026-08-06): the lock could not be
+                # acquired — never continue unlocked.
+                raise SidecarLockError(
+                    f"sidecar msvcrt lock failed for session {sid}: {exc}"
+                ) from exc
             try:
                 yield
             finally:
@@ -243,9 +261,12 @@ def _session_sidecar_cross_process_lock(sid: str):
                 except OSError:
                     logger.debug("sidecar msvcrt unlock failed for %s", sid, exc_info=True)
             return
-        # No cross-process primitive available: best-effort no-op.
-        logger.debug("cross-process sidecar locking unavailable for %s", sid)
-        yield
+        # No cross-process primitive available: fail CLOSED instead of
+        # degrading to an unlocked write (re-gate 2026-08-06).
+        raise SidecarLockError(
+            f"no cross-process lock primitive available for session {sid}; "
+            f"refusing to write without cross-process serialization"
+        )
 
 
 
@@ -1258,6 +1279,99 @@ def model_explicit_pick_signature(model, model_provider) -> str:
     return f"{_m}\x1f{_p}"
 
 
+def _merge_concurrent_message_arrays(disk_msgs, our_msgs, allow_zero_prefix_merge: bool = False):
+    """Merge two sibling message arrays that diverge only by concurrent appends.
+
+    Used for BOTH the display transcript (``messages``) and the model-context
+    array (``context_messages``) so a plain concurrent append can never
+    discard the other writer's rows in either array (PR #6422 re-gate
+    2026-08-06 finding #2).
+
+    Finds the longest prefix where every position matches, using the durable
+    ``uuid`` lineage first (minted once at row creation by
+    ``_assign_stable_message_ids``), then ``id``/``role``+``content`` as
+    fallback for legacy rows.  Returns the merged list:
+
+    * common prefix preserved;
+    * rows another writer appended beyond the prefix (``disk_tail``) are
+      inserted BEFORE our own tail;
+    * our rows always survive.
+
+    ``allow_zero_prefix_merge`` permits the one valid zero-prefix shape: two
+    first turns appended from the same EMPTY base (absent sidecar or an empty
+    one).  A divergent NON-empty base is corruption — keep our rows unchanged
+    rather than concatenate unrelated transcripts.
+    """
+    disk_msgs = list(disk_msgs or [])
+    our_msgs = list(our_msgs or [])
+    if not disk_msgs or not our_msgs:
+        return list(our_msgs) if our_msgs else list(disk_msgs)
+
+    # Find the longest prefix where every position matches.  When both rows
+    # carry the durable ``uuid`` lineage (minted once at row creation),
+    # compare THAT: ``_assign_stable_message_ids()`` uses
+    # ``max(existing id) + 1``, so two clients loaded from the same base can
+    # assign the same next integer id to different messages — equal ids, even
+    # with identical content, are NOT proof the rows are the same.  Rows
+    # without a uuid (legacy writers) fall back to id-then-content.
+    prefix_len = 0
+    min_len = min(len(disk_msgs), len(our_msgs))
+    for i in range(min_len):
+        our_msg = our_msgs[i]
+        disk_msg = disk_msgs[i]
+        if not isinstance(our_msg, dict) or not isinstance(disk_msg, dict):
+            break
+        our_uuid = our_msg.get('uuid')
+        disk_uuid = disk_msg.get('uuid')
+        if our_uuid is not None and disk_uuid is not None:
+            if our_uuid != disk_uuid:
+                # Distinct rows — divergence, even on equal id/content.
+                break
+            # Same uuid = same logical row; content differences are
+            # partial-update artifacts of a shared row, keep matching.
+        else:
+            our_id = our_msg.get('id')
+            disk_id = disk_msg.get('id')
+            if our_id is not None and disk_id is not None:
+                if our_id != disk_id:
+                    break
+                # Equal N+1 integer ids with different content = two
+                # distinct concurrent appends — treat as a divergence.
+                if (our_msg.get('role'), our_msg.get('content')) != (disk_msg.get('role'), disk_msg.get('content')):
+                    break
+            elif (our_msg.get('role'), our_msg.get('content')) != (disk_msg.get('role'), disk_msg.get('content')):
+                break
+        prefix_len += 1
+
+    if prefix_len == 0:
+        # No shared prefix.  Valid ONLY when our base was empty (two first
+        # turns from a brand-new session): every disk row is a concurrent
+        # append from the same empty base, so concatenate disk rows first,
+        # then ours.  A divergent NON-empty base is corruption — bail
+        # rather than concatenate unrelated transcripts.
+        if allow_zero_prefix_merge:
+            return list(disk_msgs) + list(our_msgs)
+        return list(our_msgs)
+
+    # Rows on disk beyond the common prefix.
+    disk_tail = disk_msgs[prefix_len:]
+    if not disk_tail:
+        # Disk has nothing we don't already have.  A shorter on-disk array at
+        # the SAME generation is a pre-turn checkpoint (or stale copy), NOT a
+        # truncation — keep our completed rows.
+        return list(our_msgs)
+
+    # Case 1: our rows are a prefix of disk (append race).
+    if prefix_len == len(our_msgs):
+        return list(our_msgs) + list(disk_tail)
+
+    # Case 2: divergent tails (concurrent equal-length append, or disk
+    # shorter at the same generation with a divergent boundary).
+    # Merge: keep the common prefix, insert disk's extras, then our extras.
+    our_tail = our_msgs[prefix_len:]
+    return list(our_msgs[:prefix_len]) + list(disk_tail) + list(our_tail)
+
+
 class Session:
     def __init__(self, session_id: str=None, title: str='Untitled',
                  workspace=str(DEFAULT_WORKSPACE), created_workspace=None,
@@ -1450,9 +1564,12 @@ class Session:
         # an EMPTY base (loaded with zero rows): when disk and our transcript
         # share no prefix but our base was empty, every disk row is a
         # concurrent append from the same empty base and is merged by
-        # concatenation instead of bailing.  None = never loaded (fresh
-        # construction) — full divergence then stays a bail-to-safe case.
-        self._loaded_message_count = None
+        # concatenation instead of bailing.  Default is 0, NOT None: a freshly
+        # constructed session (never loaded) has an ABSENT sidecar, which is a
+        # VALID empty base — two first turns from a brand-new chat must both
+        # survive instead of the second save clobbering the first (re-gate
+        # 2026-08-06 finding #1: the absent-sidecar schedule).
+        self._loaded_message_count = 0
         # #6422: set by the truncation entry points (truncate_session_at_keep,
         # undo_last, retry_last) so save() can stamp a generation strictly
         # greater than anything on disk even when this object is a stale cache
@@ -1570,97 +1687,36 @@ class Session:
             # active for both shapes.
             return
 
-        # Find the longest prefix where every position matches.  When both
-        # rows carry the durable ``uuid`` lineage (minted once at row
-        # creation), compare THAT: ``_assign_stable_message_ids()`` uses
-        # ``max(existing id) + 1``, so two clients loaded from the same base
-        # can assign the same next integer id to different messages — equal
-        # ids, even with identical content, are NOT proof the rows are the
-        # same.  Rows without a uuid (legacy writers) fall back to the
-        # id-then-content comparison.
-        prefix_len = 0
-        min_len = min(len(existing_msgs), len(our_msgs))
-        for i in range(min_len):
-            our_msg = our_msgs[i]
-            disk_msg = existing_msgs[i]
-            if not isinstance(our_msg, dict) or not isinstance(disk_msg, dict):
-                break
-            our_uuid = our_msg.get('uuid')
-            disk_uuid = disk_msg.get('uuid')
-            if our_uuid is not None and disk_uuid is not None:
-                if our_uuid != disk_uuid:
-                    # Distinct rows — divergence, even on equal id/content.
-                    break
-                # Same uuid = same logical row; content differences are
-                # partial-update artifacts of a shared row, keep matching.
-            else:
-                our_id = our_msg.get('id')
-                disk_id = disk_msg.get('id')
-                if our_id is not None and disk_id is not None:
-                    if our_id != disk_id:
-                        break
-                    # Equal N+1 integer ids with different content = two
-                    # distinct concurrent appends — treat as a divergence.
-                    if (our_msg.get('role'), our_msg.get('content')) != (disk_msg.get('role'), disk_msg.get('content')):
-                        break
-                elif (our_msg.get('role'), our_msg.get('content')) != (disk_msg.get('role'), disk_msg.get('content')):
-                    break
-            prefix_len += 1
-
-        if prefix_len == 0:
-            # No shared prefix.  Valid ONLY when our base was empty (two first
-            # turns from a brand-new session): every disk row is a concurrent
-            # append from the same empty base, so concatenate disk rows first,
-            # then ours.  A divergent NON-empty base is corruption — bail
-            # rather than concatenate unrelated transcripts.
-            loaded_count = getattr(self, '_loaded_message_count', None)
-            if loaded_count == 0:
-                self.messages = list(existing_msgs) + list(our_msgs)
-            return
-
-        # Messages on disk beyond the common prefix.
-        disk_tail = existing_msgs[prefix_len:]
-        if not disk_tail:
-            # Disk has nothing we don't already have.  A shorter on-disk
-            # transcript at the SAME generation is a pre-turn checkpoint (or
-            # stale copy), NOT a truncation — keep our completed transcript.
-            # The base identity recorded above keeps save()'s CAS re-validation
-            # active for this zero-tail shape (re-gate finding #1).
-            return
-
-        # Case 1: our messages are a prefix of disk (append race).
-        if prefix_len == len(our_msgs):
-            self.messages = list(our_msgs) + list(disk_tail)
-            return
-
-        # Case 2: divergent tails (concurrent equal-length append, or disk
-        # shorter at the same generation with a divergent boundary).
-        # Merge: keep the common prefix, insert disk's extras, then our extras.
-        our_tail = our_msgs[prefix_len:]
-        self.messages = list(our_msgs[:prefix_len]) + list(disk_tail) + list(our_tail)
-
-    def save(self, touch_updated_at: bool = True, skip_index: bool = False) -> None:
-        if not is_safe_session_id(self.session_id):
-            raise ValueError(f"Unsafe session_id {self.session_id!r}; refusing to write outside session store")
-        # ── #1558 P0 guard ──────────────────────────────────────────────
-        # Refuse to save a session that was loaded with metadata_only=True.
-        # Such sessions have messages=[] (it's the whole point of the partial
-        # load), and save() unconditionally writes self.messages to disk via
-        # an atomic os.replace(). Saving a metadata-only stub thus wipes the
-        # full conversation history — which is exactly the v0.50.279
-        # _clear_stale_stream_state() regression that lost users 1000+
-        # message conversations. Any caller that needs to mutate persisted
-        # fields on a metadata-only session must reload with
-        # metadata_only=False first.
-        if getattr(self, '_loaded_metadata_only', False):
-            raise RuntimeError(
-                f"Refusing to save metadata-only session {self.session_id!r}: "
-                f"would atomically overwrite on-disk messages with []. "
-                f"Reload with metadata_only=False before mutating state. "
-                f"See #1558."
+        # Reconcile BOTH the display transcript (``messages``) and the
+        # model-context array (``context_messages``) against concurrent
+        # appends (re-gate 2026-08-06 finding #2: plain concurrent
+        # ``context_messages`` were previously discarded — the merge only
+        # reconciled ``self.messages``, so the losing writer's context rows
+        # were dropped from the durable reload while its display rows were
+        # kept, persisting a transcript the UI shows but the next model turn
+        # would not receive).
+        allow_zero = (int(getattr(self, '_loaded_message_count', 0) or 0) == 0)
+        self.messages = _merge_concurrent_message_arrays(
+            existing_msgs, our_msgs, allow_zero_prefix_merge=allow_zero
+        )
+        existing_ctx = existing.get('context_messages') or []
+        our_ctx = self.context_messages or []
+        if existing_ctx and our_ctx:
+            self.context_messages = _merge_concurrent_message_arrays(
+                existing_ctx, our_ctx, allow_zero_prefix_merge=allow_zero
             )
-        if touch_updated_at:
-            self.updated_at = time.time()
+
+    def _sidecar_payload(self) -> str:
+        """Serialize the COMPLETE sidecar payload from the current in-memory state.
+
+        Called INSIDE the per-session cross-process lock, AFTER the
+        truncate-generation decision and any CAS re-merge, so the bytes that
+        hit disk always reflect the authoritative in-lock state — including
+        display rows and ``context_messages`` adopted from a concurrent writer
+        (re-gate 2026-08-06 finding #2: the previous pre-lock build retained a
+        stale ``extra['context_messages']`` after a CAS movement, so the UI
+        transcript and the next model turn's context could diverge).
+        """
         # Write metadata fields first so load_metadata_only() can read them
         # without parsing the full messages array (which may be 400KB+).
         # Fields are listed in the order they should appear in the JSON file.
@@ -1710,23 +1766,50 @@ class Session:
         meta['messages'] = self.messages
         meta['tool_calls'] = self.tool_calls
         meta['anchor_activity_scenes'] = self.anchor_activity_scenes if isinstance(self.anchor_activity_scenes, dict) else {}
-        # Fields not in METADATA_FIELDS (e.g. last_usage) go at the end. Exclude
-        # the keys we placed explicitly above so they aren't emitted twice.
+        # Fields not in METADATA_FIELDS (e.g. last_usage, context_messages)
+        # go at the end. Exclude the keys we placed explicitly above so they
+        # aren't emitted twice.
         _placed = {'message_count', 'anchor_scene_index', 'messages', 'tool_calls', 'anchor_activity_scenes'}
         extra = {k: v for k, v in self.__dict__.items()
                  if k not in METADATA_FIELDS and k not in _placed
                  and not k.startswith('_')}
-        payload = json.dumps({**meta, **extra}, ensure_ascii=False, indent=2)
+        return json.dumps({**meta, **extra}, ensure_ascii=False, indent=2)
 
+    def save(self, touch_updated_at: bool = True, skip_index: bool = False) -> None:
+        if not is_safe_session_id(self.session_id):
+            raise ValueError(f"Unsafe session_id {self.session_id!r}; refusing to write outside session store")
+        # ── #1558 P0 guard ──────────────────────────────────────────────
+        # Refuse to save a session that was loaded with metadata_only=True.
+        # Such sessions have messages=[] (it's the whole point of the partial
+        # load), and save() unconditionally writes self.messages to disk via
+        # an atomic os.replace(). Saving a metadata-only stub thus wipes the
+        # full conversation history — which is exactly the v0.50.279
+        # _clear_stale_stream_state() regression that lost users 1000+
+        # message conversations. Any caller that needs to mutate persisted
+        # fields on a metadata-only session must reload with
+        # metadata_only=False first.
+        if getattr(self, '_loaded_metadata_only', False):
+            raise RuntimeError(
+                f"Refusing to save metadata-only session {self.session_id!r}: "
+                f"would atomically overwrite on-disk messages with []. "
+                f"Reload with metadata_only=False before mutating state. "
+                f"See #1558."
+            )
+        if touch_updated_at:
+            self.updated_at = time.time()
         # ── #6422 per-session cross-process transaction ─────────────────
-        # The entire read-modify-write of the sidecar — backup safeguard,
+        # The ENTIRE read-modify-write of the sidecar — authoritative read,
         # monotonic truncate-generation stamping, CAS fingerprint validation,
-        # (re-)merge, and the atomic replace — runs under ONE per-session
-        # cross-process lock.  This closes the final read-to-replace TOCTOU
-        # window the re-gate flagged: no other process can interleave a write
-        # between our validation read and our os.replace, and the /undo,
-        # /retry, /truncate, /clear handlers serialize against the streaming
-        # completion merge instead of racing it.
+        # (re-)merge of BOTH messages and context_messages, the full payload
+        # build from the in-lock state, and the atomic replace — runs under
+        # ONE per-session cross-process lock.  This closes the final
+        # read-to-replace TOCTOU window the re-gate flagged: no other process
+        # can interleave a write between our validation read and our
+        # os.replace, and the /undo, /retry, /truncate, /clear handlers
+        # serialize against the streaming completion merge instead of racing
+        # it.  The payload is serialized ONLY here, from the post-merge
+        # in-lock state, so a CAS movement that adopted another writer's rows
+        # is always fully reflected on disk (re-gate 2026-08-06 finding #2).
         with _session_sidecar_cross_process_lock(self.session_id):
             existing_text = None
             existing = None
@@ -1747,9 +1830,9 @@ class Session:
             # undo_last / retry_last) must stamp a generation STRICTLY greater
             # than anything on disk, so even a stale-cache truncate can never
             # regress the counter.  A plain save just carries the max forward
-            # (adopting generations stamped by other processes).  Rebuild the
-            # payload if the stamped value differs from what was serialized
-            # above.
+            # (adopting generations stamped by other processes).  The payload
+            # is serialized below, AFTER this decision and the CAS re-merge,
+            # so it always carries the final generation.
             existing_gen = int((existing or {}).get('truncate_generation') or 0)
             if self._truncation_pending:
                 self.truncate_generation = max(int(self.truncate_generation or 0), existing_gen + 1)
@@ -1760,9 +1843,6 @@ class Session:
                 # save to a plain (non-truncating) one (re-gate finding #2).
             else:
                 self.truncate_generation = max(int(self.truncate_generation or 0), existing_gen)
-            if meta.get('truncate_generation') != self.truncate_generation:
-                meta['truncate_generation'] = self.truncate_generation
-                payload = json.dumps({**meta, **extra}, ensure_ascii=False, indent=2)
 
             # ── #1558 backup safeguard ──────────────────────────────────
             # Before overwriting the session file, copy the previous version
