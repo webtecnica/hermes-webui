@@ -17,6 +17,7 @@ toggle and its contract changes:
 """
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 
@@ -94,6 +95,23 @@ def _ui_function(ui: str, name: str) -> str:
     raise AssertionError(f"could not extract function {name}")
 
 
+def _locale_bundle(js: str, locale: str) -> str:
+    """Extract the `locale: { ... }` block from i18n.js via brace matching."""
+    start = js.index(f"\n  {locale}: {{")
+    open_idx = js.index("{", start)
+    depth = 0
+    i = open_idx
+    while i < len(js):
+        if js[i] == "{":
+            depth += 1
+        elif js[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return js[start:i + 1]
+        i += 1
+    raise AssertionError(f"could not extract locale bundle {locale!r} from i18n.js")
+
+
 def test_boot_failure_fails_closed_and_returns_full_range():
     """#6151 review: when the settings request fails, the broad boot catch must
     fail CLOSED (window._virtualizeTranscript=false), and the UI gate must then
@@ -143,21 +161,27 @@ def test_virtualize_toggle_i18n_all_locales():
     js = I18N.read_text(encoding="utf-8")
     assert js.count("settings_label_virtualize_transcript:") == 15
     assert js.count("settings_desc_virtualize_transcript:") == 15
-    # #6151 review: the four bundles that previously described the old
-    # default-OFF/experimental contract (ja, fr, cs, vi) must now describe
-    # default-ON with opt-out/full-render behavior — the known old phrases
-    # are gone, not just the key counts satisfied.
-    for old_phrase in (
-        "（実験的）",  # ja label: experimental
-        "デフォルトではオフになっています",  # ja desc: off by default
-        "Virtualiser les longs historiques (expérimental)",  # fr label
-        "Désactivé par défaut",  # fr desc: disabled by default
-        "Virtualizovat dlouhé transcripty (experimentální)",  # cs label
-        "Standardně vypnuto",  # cs desc: off by default
-        "Ảo hóa transcript dài (thử nghiệm)",  # vi label
-        "Mặc định tắt",  # vi desc: off by default
-    ):
-        assert old_phrase not in js, f"stale default-OFF copy still present: {old_phrase!r}"
+    # #6151 review (#6155): the stale-copy negatives are scoped to the
+    # virtualization label/description entries ONLY. A whole-catalog negative
+    # is invalid: the generic "off by default" phrases legitimately occur in
+    # unrelated settings that genuinely default to off (e.g. French
+    # settings_desc_conversation_outline, Czech/Vietnamese quota/outline
+    # descriptions), so `assert old_phrase not in js` is guaranteed-red.
+    stale_by_locale = {
+        "ja": ("（実験的）", "デフォルトではオフになっています"),
+        "fr": ("Virtualiser les longs historiques (expérimental)", "Désactivé par défaut"),
+        "cs": ("Virtualizovat dlouhé transcripty (experimentální)", "Standardně vypnuto"),
+        "vi": ("Ảo hóa transcript dài (thử nghiệm)", "Mặc định tắt"),
+    }
+    for locale, stale_phrases in stale_by_locale.items():
+        bundle = _locale_bundle(js, locale)
+        for key in ("settings_label_virtualize_transcript", "settings_desc_virtualize_transcript"):
+            m = re.search(rf"{key}:\s*'((?:[^'\\]|\\.)*)'", bundle)
+            assert m is not None, f"{locale}: missing {key} entry"
+            for old_phrase in stale_phrases:
+                assert old_phrase not in m.group(1), (
+                    f"{locale} {key} still carries stale default-OFF copy: {old_phrase!r}"
+                )
     # ...and each of the four bundles now carries default-ON copy.
     for new_phrase in (
         "デフォルトではオンです",  # ja: on by default
