@@ -1151,10 +1151,20 @@ def test_oidc_opener_disables_ambient_proxies(monkeypatch):
         issuer="https://issuer.example", allow_private_endpoints=False
     )
     opener = auth_oidc._oidc_opener(policy)
+    # The ambient proxy configuration above must be visible to the process
+    # (otherwise this test would be vacuous).
+    assert urllib_request.getproxies(), "ambient proxy env must be configured"
     proxy_handlers = [
         h for h in opener.handlers if isinstance(h, urllib_request.ProxyHandler)
     ]
-    assert proxy_handlers
+    # CPython >= 3.11 registers a ProxyHandler only when it exposes protocol
+    # methods, so the empty ProxyHandler({}) the opener installs never appears
+    # in the handler chain. The guarantee is that no handler carries the
+    # ambient proxy map (an absent or empty handler cannot redirect the flow);
+    # the functional no-proxy property is enforced end-to-end by
+    # test_token_form_body_never_delivered_to_ambient_proxy, and a tunnel
+    # attempt fails closed via test_pinned_connection_fails_closed_on_proxy_tunnel.
+    assert not any(h.proxies for h in proxy_handlers)
     for handler in proxy_handlers:
         assert handler.proxies == {}
 
