@@ -7324,7 +7324,37 @@ function getModelLabel(modelId){
   //   @custom:qwen397b-64k               -> qwen397b-64k
   if(rawId.startsWith('@custom:')){
     const rest=rawId.slice('@custom:'.length);
-    if(rest.includes(':')) return rest.slice(rest.lastIndexOf(':')+1)||rawId;
+    // @custom:<provider-slug>:<model-tail> — the model tail may itself carry
+    // tag/variant colons (`:free`, `:31b`, `:397b`), so it must be preserved
+    // verbatim instead of cutting at the last colon (#7240). Mirrors the
+    // backend grammar in _parse_provider_qualified_model_id (api/config.py):
+    // only an endpoint-style host:port slug keeps the last colon as provider
+    // plumbing; a named slug means the last colon belongs to the model.
+    const _isHostPortSlug=(s)=>{
+      if(typeof s!=='string'||!s.includes(':')) return false;
+      const _ci=s.lastIndexOf(':');
+      const _host=s.slice(0,_ci), _port=s.slice(_ci+1);
+      if(!_host||_host.includes(':')||!/^\d+$/.test(_port)) return false;
+      const _p=parseInt(_port,10);
+      if(!(_p>=1&&_p<=65535)) return false;
+      if(/^\d{1,3}(\.\d{1,3}){3}$/.test(_host)){
+        return _host.split('.').every(_o=>parseInt(_o,10)<=255);
+      }
+      const _hl=_host.toLowerCase();
+      return _hl==='localhost'||_host.includes('.');
+    };
+    const _lastColon=rest.lastIndexOf(':');
+    if(_lastColon!==-1){
+      const _providerPart=rest.slice(0,_lastColon);
+      const _tail=rest.slice(_lastColon+1);
+      if(_providerPart.includes(':')&&!_isHostPortSlug(_providerPart)){
+        // Named provider with a tagged model: re-split at the second-to-last
+        // colon so the whole model tail (tags included) is displayed.
+        const _secondLast=_providerPart.lastIndexOf(':');
+        return _providerPart.slice(_secondLast+1)+':'+_tail;
+      }
+      return _tail;
+    }
     if(rest.includes('/')) return rest.slice(rest.indexOf('/')+1)||rawId;
     return rest||rawId;
   }
