@@ -2980,12 +2980,34 @@ function _getOptionProviderId(opt){
     return group.dataset.provider;
   }
   const value=String(opt.value||'');
-  if(value.startsWith('@') && value.includes(':')) return value.slice(1,value.lastIndexOf(':'));
+  if(value.startsWith('@') && value.includes(':')){
+    // Non-greedy parse for @custom:<slug>:<model> — provider is the slug only.
+    // For @custom:backup:model-a:free → provider="custom:backup", not "custom:backup:model-a"
+    if(value.startsWith('@custom:')){
+      const afterCustom=value.substring('@custom:'.length);
+      const firstColon=afterCustom.indexOf(':');
+      if(firstColon>=0) return 'custom:'+afterCustom.substring(0,firstColon);
+      return 'custom:'+afterCustom;
+    }
+    // Other @provider:model — provider is up to first colon
+    return value.slice(1,value.indexOf(':'));
+  }
   return '';
 }
 function _providerFromModelValue(modelId){
   const value=String(modelId||'').trim();
-  if(value.startsWith('@')&&value.includes(':')) return value.slice(1,value.lastIndexOf(':'));
+  if(value.startsWith('@')&&value.includes(':')){
+    // Non-greedy parse for @custom:<slug>:<model> — provider is the slug only.
+    // For @custom:backup:model-a:free → provider="custom:backup", not "custom:backup:model-a"
+    if(value.startsWith('@custom:')){
+      const afterCustom=value.substring('@custom:'.length);
+      const firstColon=afterCustom.indexOf(':');
+      if(firstColon>=0) return 'custom:'+afterCustom.substring(0,firstColon);
+      return 'custom:'+afterCustom;
+    }
+    // Other @provider:model — provider is up to first colon
+    return value.slice(1,value.indexOf(':'));
+  }
   return '';
 }
 function _modelPickerOptionIdentity(modelId, providerId){
