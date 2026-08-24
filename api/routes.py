@@ -7357,6 +7357,8 @@ def _repair_bare_custom_provider_model(
     only that object's ``custom_providers`` are scanned. Otherwise uses
     ``get_config()`` for the active global config (not the raw ``cfg`` alias).
     """
+    if not isinstance(config_obj, dict):
+        return None
     try:
         model = str(bare_model or "").strip()
         prov = _clean_session_model_provider(provider)
