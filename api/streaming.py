@@ -2601,23 +2601,31 @@ def _is_fallback_switch_notice(kind: str, message: str) -> bool:
 
 
 def _is_fallback_switch_chatter(message) -> bool:
-    """True for generic switch/selection chatter (NOT a failure cause).
+    """True ONLY for the agent's generic switch-success/control rows.
 
-    On a successful fallback the agent appends a generic ``Primary model
-    failed — switching to fallback …`` status as the LAST buffered row.  That
-    row announces the switch instead of explaining the failure, so it must
-    never be selected as the displayed cause.  The one-shot success notice
-    (``Switched to fallback model: …``) is excluded for the same reason.
+    The real agent appends a generic ``🔄 Primary model failed — switching
+    to fallback: …`` status as the LAST buffered row of a successful switch;
+    the one-shot ``Switched to fallback model: …`` success notice is excluded
+    for the same reason.  Both announce the switch without explaining the
+    failure, so they must never be selected as the displayed cause.
+
+    Crucially, the agent's CAUSE-BEARING rows also contain the switch phrase
+    (``⚠️ Empty/malformed response — switching to fallback...``, ``⚠️ Rate
+    limited — switching to fallback provider...``, billing / transport /
+    auth / upstream rate-limit rows) and MUST be preserved — they are the
+    actual failed-primary cause.  Only the generic control rows above are
+    suppressed; anything else (any cause prefix before the switch phrase) is
+    kept.
     """
     m = str(message or '').strip().lower()
-    return (
-        'switching to fallback' in m
-        or 'switched to fallback model' in m
-        or 'primary model failed' in m
-        or 'falling back to' in m
-        or 'fallback selected' in m
-        or 'selected fallback' in m
-    )
+    # Drop the leading emoji/whitespace prefix ("🔄", "⚠️", "⏳", "🔐", …)
+    # so the generic control row is recognized by its first word.
+    m = re.sub(r'^[^\w]+', '', m)
+    if m.startswith('primary model failed'):
+        return True
+    if m.startswith('switched to fallback model'):
+        return True
+    return False
 
 
 def _agent_fallback_cause(agent) -> str:
@@ -2741,18 +2749,33 @@ _SELECTED_ROUTING_STATUSES = {'selected', 'success', 'ok'}
 def _routing_attempt_matches(attempt, provider, model) -> bool:
     """Case-insensitive route match between a routing row and a reference route.
 
-    Either field suffices (rows may carry provider only, model only, or both);
-    a row with NO provider/model fields never matches a non-empty reference.
+    BOTH identity dimensions must agree whenever BOTH the row and the
+    reference carry them: a row with the requested provider but a DIFFERENT
+    model (or vice versa) is a contradictory identity and never matches, so
+    an unrelated failure can never stand in for the failed primary or the
+    used route.  Provider-only / model-only rows are preserved — when the
+    other dimension is genuinely absent on either side, the shared dimension
+    decides.  A row with NO provider/model fields never matches a non-empty
+    reference.
     """
     if not isinstance(attempt, dict):
         return False
-    if provider:
-        if str(attempt.get('provider') or '').strip().lower() == str(provider).strip().lower():
-            return True
-    if model:
-        if str(attempt.get('model') or '').strip().lower() == str(model).strip().lower():
-            return True
-    return False
+    row_provider = str(attempt.get('provider') or '').strip().lower()
+    row_model = str(attempt.get('model') or '').strip().lower()
+    ref_provider = str(provider or '').strip().lower()
+    ref_model = str(model or '').strip().lower()
+    # A row with no identity fields never matches a non-empty reference.
+    if not (row_provider or row_model):
+        return False
+    # Contradictory identities never match: a dimension present on BOTH sides
+    # must agree.
+    if row_provider and ref_provider and row_provider != ref_provider:
+        return False
+    if row_model and ref_model and row_model != ref_model:
+        return False
+    # At least one dimension must actually be shared (the other dimension is
+    # genuinely absent on the row, on the reference, or both).
+    return (row_provider and ref_provider) or (row_model and ref_model)
 
 
 def _build_provider_fallback_sse_event(

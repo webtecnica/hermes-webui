@@ -5726,8 +5726,15 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     if(!d||typeof d!=='object') return;
     const sid=String(d.session_id||'');
     if(!sid||sid!==activeSid) return;                        // session ownership
-    if(String(d.stream_id||'')!==String(streamId||'')) return; // stream ownership (stale replacement-stream callback)
     if(!S.session||S.session.session_id!==activeSid) return;
+    // Current-stream ownership: the event must match the stream that OWNS the
+    // live connection RIGHT NOW (LIVE_STREAMS[activeSid].streamId), not the
+    // closure that happened to deliver it.  A queued callback from a replaced
+    // EventSource carries the OLD closure's streamId, so an event-vs-closure
+    // comparison would still match after a replacement stream owns the same
+    // session; fencing against the shared current owner drops it.
+    const _liveOwner=LIVE_STREAMS[activeSid];
+    if(!_liveOwner||String(_liveOwner.streamId||'')!==String(d.stream_id||'')) return;
     const tid=String(d.transition_id||'');
     if(!tid) return;
     if(_providerFallbackRenderedMap[tid]) return;            // exactly-once per transition

@@ -164,6 +164,36 @@ def test_agent_fallback_cause_skips_switch_chatter_final_row():
     assert _is_fallback_switch_chatter("🔄 Switched to fallback model: x via y → a via b")
     assert not _is_fallback_switch_chatter("⏳ Nous rate limit active — resets in 60s")
     assert not _is_fallback_switch_chatter("primary attempt failed: HTTP 429")
+    # CAUSE-BEARING rows also contain the switch phrase but are the actual
+    # failed-primary cause — they must be preserved, not suppressed.
+    assert not _is_fallback_switch_chatter("⚠️ Empty/malformed response — switching to fallback...")
+    assert not _is_fallback_switch_chatter("⚠️ Upstream openai rate-limited — switching to fallback model...")
+    assert not _is_fallback_switch_chatter("⚠️ Billing or credits exhausted — switching to fallback provider...")
+    assert not _is_fallback_switch_chatter("⚠️ Provider unreachable — switching to fallback provider...")
+    assert not _is_fallback_switch_chatter("⚠️ Primary auth failed — switching to fallback: deepseek / deepseek-v3")
+    assert not _is_fallback_switch_chatter("⚠️ Model returning empty responses — switching to fallback provider...")
+    assert not _is_fallback_switch_chatter("Content filter terminated stream; switching to fallback...")
+
+
+def test_agent_fallback_cause_real_buffer_cause_rows_win():
+    """Exact current-Agent buffer shapes: the cause-bearing row precedes the
+    generic final switch row and MUST win — only the generic control row is
+    suppressed, never the cause that explains the failed primary."""
+    cases = [
+        "⚠️ Empty/malformed response — switching to fallback...",
+        "⚠️ Upstream openai rate-limited — switching to fallback model...",
+        "⚠️ Billing or credits exhausted — switching to fallback provider...",
+        "⚠️ Provider unreachable — switching to fallback provider...",
+        "⚠️ Primary auth failed — switching to fallback: deepseek / deepseek-v3",
+        "⚠️ Model returning empty responses — switching to fallback provider...",
+        "Content filter terminated stream; switching to fallback...",
+    ]
+    for cause in cases:
+        agent = _FakeAgent(buffer=[
+            ("status", cause),
+            ("status", "🔄 Primary model failed — switching to fallback: opus via anthropic"),
+        ])
+        assert _agent_fallback_cause(agent) == cause, cause
 
 
 def test_agent_fallback_cause_prefers_structured_cause():
@@ -488,13 +518,14 @@ function extractFunc(name) {
   return src.slice(start, i);
 }
 
-// Harness globals mirroring the production closure of attachLiveStream().
-let activeSid = 'sess-A';
-let streamId = 'stream-1';
-const S = { session: { session_id: 'sess-A' } };
+// Harness globals mirroring the production MODULE scope of messages.js:
+// LIVE_STREAMS and the dedup maps are SHARED across all live-stream
+// closures; only the activeSid/streamId bindings are per-closure.
+const LIVE_STREAMS = {};
 let _providerFallbackRenderedMap = {};
 let _providerFallbackReassertedMap = {};
 let _providerFallbackRenderCount = 0;
+const S = { session: { session_id: 'sess-A' } };
 let _lastComposerStatus = '';
 let _lastToast = null;
 function setComposerStatus(x) { _lastComposerStatus = x; }
@@ -502,9 +533,25 @@ function showToast(m, ms, type) { _lastToast = { m: m, ms: ms, type: type }; }
 function t(k, ...a) { return k === 'provider_fallback_status' ? ('⚠️ Fell back to ' + a[0]) : k; }
 
 // Production functions extracted LIVE from messages.js — not test stand-ins.
-eval(extractFunc('_providerFallbackLabel'));
-eval(extractFunc('_renderProviderFallbackIndicator'));
-eval(extractFunc('_reassertProviderFallbackIndicator'));
+const _labelSrc = extractFunc('_providerFallbackLabel');
+const _renderSrc = extractFunc('_renderProviderFallbackIndicator');
+const _reassertSrc = extractFunc('_reassertProviderFallbackIndicator');
+
+// Production-shaped closure: attachLiveStream(activeSid, streamId) captures
+// per-stream bindings while LIVE_STREAMS + dedup maps stay shared module
+// state.  Two makeEnv() calls model two live EventSource closures (an old
+// stream and its same-session replacement).
+function makeEnv(activeSidVal, streamIdVal) {
+  const activeSid = activeSidVal;
+  const streamId = streamIdVal;
+  eval(_labelSrc);
+  eval(_renderSrc);
+  eval(_reassertSrc);
+  return {
+    render: _renderProviderFallbackIndicator,
+    reassert: _reassertProviderFallbackIndicator,
+  };
+}
 
 function assert(c, m) { if (!c) throw new Error(m || 'assertion failed'); }
 const scenario = process.argv[3];
@@ -515,10 +562,15 @@ function resetState() {
   _providerFallbackRenderCount = 0;
   _lastComposerStatus = '';
   _lastToast = null;
+  for (const k of Object.keys(LIVE_STREAMS)) delete LIVE_STREAMS[k];
 }
+function setLive(sid, streamId) { LIVE_STREAMS[sid] = { streamId: String(streamId) }; }
 
 if (scenario === 'render') {
-  _renderProviderFallbackIndicator({ session_id: 'sess-A', stream_id: 'stream-1', transition_id: 't1', from_provider: 'openai', from_model: 'gpt-4', to_provider: 'anthropic', to_model: 'opus', reason: 'rate limited' });
+  resetState();
+  setLive('sess-A', 'stream-1');
+  const env = makeEnv('sess-A', 'stream-1');
+  env.render({ session_id: 'sess-A', stream_id: 'stream-1', transition_id: 't1', source: 'agent', from_provider: 'openai', from_model: 'gpt-4', to_provider: 'anthropic', to_model: 'opus', reason: 'rate limited' });
   assert(_lastComposerStatus === '⚠️ Fell back to opus via anthropic', 'composer status: ' + _lastComposerStatus);
   assert(_lastToast && _lastToast.m === 'rate limited' && _lastToast.type === 'warning', 'toast not shown');
   assert(_providerFallbackRenderedMap['t1'], 'transition not recorded');
@@ -528,78 +580,103 @@ if (scenario === 'render') {
   assert(_providerFallbackReassertedMap['sess-A'].streamId === 'stream-1', 'reassert stream missing');
   process.stdout.write('PASS render\n');
 } else if (scenario === 'ownership') {
-  _renderProviderFallbackIndicator({ session_id: 'sess-B', stream_id: 'stream-1', transition_id: 't1', to_provider: 'anthropic' });
+  resetState();
+  setLive('sess-A', 'stream-1');
+  const env = makeEnv('sess-A', 'stream-1');
+  env.render({ session_id: 'sess-B', stream_id: 'stream-1', transition_id: 't1', to_provider: 'anthropic' });
   assert(_lastComposerStatus === '', 'foreign session rendered');
   assert(Object.keys(_providerFallbackRenderedMap).length === 0, 'foreign session recorded');
   // Same session, STALE stream (callback from a replaced same-session stream).
-  _renderProviderFallbackIndicator({ session_id: 'sess-A', stream_id: 'stream-OLD', transition_id: 't2', to_provider: 'anthropic' });
+  env.render({ session_id: 'sess-A', stream_id: 'stream-OLD', transition_id: 't2', to_provider: 'anthropic' });
   assert(_lastComposerStatus === '', 'stale stream rendered');
   assert(Object.keys(_providerFallbackRenderedMap).length === 0, 'stale stream recorded');
   S.session = { session_id: 'sess-OTHER' };
-  _renderProviderFallbackIndicator({ session_id: 'sess-A', stream_id: 'stream-1', transition_id: 't3', to_provider: 'anthropic' });
+  env.render({ session_id: 'sess-A', stream_id: 'stream-1', transition_id: 't3', to_provider: 'anthropic' });
   assert(_lastComposerStatus === '', 'S.session mismatch rendered');
   assert(Object.keys(_providerFallbackRenderedMap).length === 0, 'mismatch recorded');
   S.session = { session_id: 'sess-A' };
   process.stdout.write('PASS ownership\n');
 } else if (scenario === 'model_only') {
-  _renderProviderFallbackIndicator({ session_id: 'sess-A', stream_id: 'stream-1', transition_id: 't2', from_model: 'gpt-4', to_model: 'opus', reason: 'model swapped' });
+  resetState();
+  setLive('sess-A', 'stream-1');
+  const env = makeEnv('sess-A', 'stream-1');
+  env.render({ session_id: 'sess-A', stream_id: 'stream-1', transition_id: 't2', from_model: 'gpt-4', to_model: 'opus', reason: 'model swapped' });
   assert(_lastComposerStatus === '⚠️ Fell back to opus', 'model-only status: ' + _lastComposerStatus);
   assert(_lastToast && _lastToast.m === 'model swapped', 'model-only toast missing');
   process.stdout.write('PASS model_only\n');
 } else if (scenario === 'provider_only') {
-  _renderProviderFallbackIndicator({ session_id: 'sess-A', stream_id: 'stream-1', transition_id: 't3', from_provider: 'openai', to_provider: 'anthropic' });
+  resetState();
+  setLive('sess-A', 'stream-1');
+  const env = makeEnv('sess-A', 'stream-1');
+  env.render({ session_id: 'sess-A', stream_id: 'stream-1', transition_id: 't3', from_provider: 'openai', to_provider: 'anthropic' });
   assert(_lastComposerStatus === '⚠️ Fell back to anthropic', 'provider-only status: ' + _lastComposerStatus);
   process.stdout.write('PASS provider_only\n');
 } else if (scenario === 'dedup_replay') {
+  resetState();
+  setLive('sess-A', 'stream-1');
+  const env = makeEnv('sess-A', 'stream-1');
   const d = { session_id: 'sess-A', stream_id: 'stream-1', transition_id: 't1', to_provider: 'anthropic' };
-  _renderProviderFallbackIndicator(d);
+  env.render(d);
   assert(_lastComposerStatus === '⚠️ Fell back to anthropic', 'first render');
   _lastComposerStatus = '';
   // SSE snapshot replay re-delivers the SAME transition → must not re-render.
-  _renderProviderFallbackIndicator(d);
+  env.render(d);
   assert(_lastComposerStatus === '', 'replay re-rendered');
   assert(Object.keys(_providerFallbackRenderedMap).length === 1, 'map grew on replay');
   // A NEW transition in a later turn still renders (map is keyed by id).
-  _renderProviderFallbackIndicator({ session_id: 'sess-A', stream_id: 'stream-1', transition_id: 't2', to_model: 'opus' });
+  env.render({ session_id: 'sess-A', stream_id: 'stream-1', transition_id: 't2', to_model: 'opus' });
   assert(_lastComposerStatus === '⚠️ Fell back to opus', 'new transition suppressed');
   process.stdout.write('PASS dedup_replay\n');
 } else if (scenario === 'done_reassert') {
-  _renderProviderFallbackIndicator({ session_id: 'sess-A', stream_id: 'stream-1', transition_id: 't1', to_provider: 'anthropic' });
+  resetState();
+  setLive('sess-A', 'stream-1');
+  const env = makeEnv('sess-A', 'stream-1');
+  env.render({ session_id: 'sess-A', stream_id: 'stream-1', transition_id: 't1', to_provider: 'anthropic' });
   _lastComposerStatus = '';
-  _reassertProviderFallbackIndicator('sess-A', 'stream-1');
+  env.reassert('sess-A', 'stream-1');
   assert(_lastComposerStatus === '⚠️ Fell back to anthropic', 'done reassert failed: ' + _lastComposerStatus);
   assert(Object.keys(_providerFallbackRenderedMap).length === 1, 'reassert grew map');
   _lastComposerStatus = '';
-  _reassertProviderFallbackIndicator('sess-UNKNOWN', 'stream-1');
+  env.reassert('sess-UNKNOWN', 'stream-1');
   assert(_lastComposerStatus === '', 'unknown session reasserted');
-  _reassertProviderFallbackIndicator('sess-A', 'stream-OLD');
+  env.reassert('sess-A', 'stream-OLD');
   assert(_lastComposerStatus === '', 'stale stream reasserted');
   process.stdout.write('PASS done_reassert\n');
 } else if (scenario === 'stale_stream') {
-  // Replacement stream for the SAME session: the old stream's callback must
-  // not render into the replacement, and the replacement's own reassert must
-  // not be poisoned by the stale record.
-  streamId = 'stream-2';
+  // Production-shaped regression: replacement stream for the SAME session.
+  // TWO live closures (old EventSource → stream-1, replacement → stream-2)
+  // share the module-level LIVE_STREAMS owner map.  A delayed stream-1 event
+  // delivered through the OLD closure (whose own streamId is still 'stream-1')
+  // must NOT render into the replacement — an event-vs-closure comparison
+  // alone would false-green — and stream-2 must still render and reassert.
   resetState();
-  _renderProviderFallbackIndicator({ session_id: 'sess-A', stream_id: 'stream-1', transition_id: 't-old', to_provider: 'anthropic' });
-  assert(_lastComposerStatus === '', 'stale replacement-stream callback rendered: ' + _lastComposerStatus);
+  setLive('sess-A', 'stream-1');
+  const oldEnv = makeEnv('sess-A', 'stream-1');   // old EventSource closure
+  const newEnv = makeEnv('sess-A', 'stream-2');   // replacement closure
+  setLive('sess-A', 'stream-2');                  // attachLiveStream replaced the owner
+  oldEnv.render({ session_id: 'sess-A', stream_id: 'stream-1', transition_id: 't-old', to_provider: 'anthropic' });
+  assert(_lastComposerStatus === '', 'stale closure rendered into replacement: ' + _lastComposerStatus);
   assert(Object.keys(_providerFallbackRenderedMap).length === 0, 'stale callback recorded');
-  _renderProviderFallbackIndicator({ session_id: 'sess-A', stream_id: 'stream-2', transition_id: 't-new', to_provider: 'anthropic' });
+  assert(!_providerFallbackReassertedMap['sess-A'], 'stale callback poisoned reassert');
+  newEnv.render({ session_id: 'sess-A', stream_id: 'stream-2', transition_id: 't-new', to_provider: 'anthropic' });
   assert(_lastComposerStatus === '⚠️ Fell back to anthropic', 'replacement stream event dropped');
   _lastComposerStatus = '';
-  _reassertProviderFallbackIndicator('sess-A', 'stream-2');
+  newEnv.reassert('sess-A', 'stream-2');
   assert(_lastComposerStatus === '⚠️ Fell back to anthropic', 'replacement reassert failed');
   process.stdout.write('PASS stale_stream\n');
 } else if (scenario === 'done_cleanup_order') {
   // Production `done` sequence: render → generic idle cleanup (what
   // `_setActivePaneIdleIfOwner()` runs: setBusy(false)+setComposerStatus(''))
   // → reassert AFTER the cleanup. The reassert must restore the indicator.
-  _renderProviderFallbackIndicator({ session_id: 'sess-A', stream_id: 'stream-1', transition_id: 't1', to_provider: 'anthropic' });
+  resetState();
+  setLive('sess-A', 'stream-1');
+  const env = makeEnv('sess-A', 'stream-1');
+  env.render({ session_id: 'sess-A', stream_id: 'stream-1', transition_id: 't1', to_provider: 'anthropic' });
   setComposerStatus('');                                    // _setActivePaneIdleIfOwner()
   assert(_lastComposerStatus === '', 'precondition: idle cleanup cleared status');
-  _reassertProviderFallbackIndicator('sess-A', 'stream-1'); // done settlement, post-cleanup
+  env.reassert('sess-A', 'stream-1');                       // done settlement, post-cleanup
   assert(_lastComposerStatus === '⚠️ Fell back to anthropic', 'indicator wiped by idle cleanup: ' + _lastComposerStatus);
-  _reassertProviderFallbackIndicator('sess-A', 'stream-1');
+  env.reassert('sess-A', 'stream-1');
   assert(_lastComposerStatus === '⚠️ Fell back to anthropic', 'reassert changed text');
   process.stdout.write('PASS done_cleanup_order\n');
 } else if (scenario === 'two_turns_same_route') {
@@ -607,11 +684,14 @@ if (scenario === 'render') {
   // per-stream owner in the transition id keeps the second turn visible
   // (the per-request seq resets each turn and alone would collide).
   resetState();
-  _renderProviderFallbackIndicator({ session_id: 'sess-A', stream_id: 'stream-1', transition_id: 'tid-turn-1', to_provider: 'anthropic' });
+  setLive('sess-A', 'stream-1');
+  const envTurn1 = makeEnv('sess-A', 'stream-1');
+  envTurn1.render({ session_id: 'sess-A', stream_id: 'stream-1', transition_id: 'tid-turn-1', to_provider: 'anthropic' });
   assert(_lastComposerStatus === '⚠️ Fell back to anthropic', 'turn 1 dropped');
   _lastComposerStatus = '';
-  streamId = 'stream-2';
-  _renderProviderFallbackIndicator({ session_id: 'sess-A', stream_id: 'stream-2', transition_id: 'tid-turn-2', to_provider: 'anthropic' });
+  setLive('sess-A', 'stream-2');
+  const envTurn2 = makeEnv('sess-A', 'stream-2');
+  envTurn2.render({ session_id: 'sess-A', stream_id: 'stream-2', transition_id: 'tid-turn-2', to_provider: 'anthropic' });
   assert(_lastComposerStatus === '⚠️ Fell back to anthropic', 'turn 2 (same route) suppressed by dedup');
   assert(Object.keys(_providerFallbackRenderedMap).length === 2, 'two transitions recorded');
   process.stdout.write('PASS two_turns_same_route\n');
@@ -677,8 +757,12 @@ def test_fe_done_settlement_reasserts_indicator_once(fe_driver_path):
 
 @pytestmark_fe
 def test_fe_stale_replacement_stream_callback_dropped(fe_driver_path):
-    """A stale callback from a replaced same-session stream never renders into
-    the replacement stream, and the replacement's reassert is not poisoned."""
+    """Production-shaped two-closure regression: stream 1 is replaced by
+    stream 2 for the same session; a queued stream-1 event delivered through
+    the OLD EventSource closure (whose own streamId is still 'stream-1') must
+    not render into the replacement, and stream 2 must still render and
+    reassert — the render fence is the CURRENT owner in LIVE_STREAMS, not an
+    event-vs-closure comparison."""
     assert "PASS stale_stream" in _run_fe_scenario(fe_driver_path, "stale_stream")
 
 
