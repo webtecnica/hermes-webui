@@ -7888,19 +7888,31 @@ def _materialize_pending_user_turn_before_error(
             break
 
     def is_exact_checkpoint(messages):
-        # Route through the shared strict matcher (api.models) so the
-        # streaming error-materializer enforces the SAME one-sided turn-id
-        # rule as every other checkpoint consumer (#6407 re-gate: a one-sided
-        # missing row id is never a match). No second copy to drift.
         if not isinstance(messages, list) or not messages:
             return False
-        return _message_matches_pending_checkpoint(
-            messages[-1],
-            pending_text,
-            recovered_ts,
-            pending_source,
-            pending_attachments,
-            pending_turn_id=pending_turn_id,
+        # #6407 re-gate: the eager session-save checkpoint prefixes the user
+        # content with a workspace sentinel (`[Workspace::v1: …]`), so the
+        # strict matcher must compare with the workspace-stripped normalize
+        # (same one-sided turn-id rule as _message_matches_pending_checkpoint;
+        # a one-sided missing row id is never a match).
+        last = messages[-1]
+        if not (isinstance(last, dict) and last.get('role') == 'user'):
+            return False
+        msg_turn_id = last.get('_turn_id')
+        if pending_turn_id:
+            if not msg_turn_id or str(msg_turn_id) != str(pending_turn_id):
+                return False
+        try:
+            msg_ts = int(last.get('timestamp'))
+            exp_ts = int(recovered_ts)
+        except (TypeError, ValueError):
+            return False
+        return (
+            _normalize_user_text(_message_text(last.get('content')))
+            == _normalize_user_text(pending_text)
+            and msg_ts == exp_ts
+            and (last.get('_source') or 'webui') == (pending_source or 'webui')
+            and list(last.get('attachments') or []) == list(pending_attachments or [])
         )
 
     if is_exact_checkpoint(getattr(session, 'messages', None)):

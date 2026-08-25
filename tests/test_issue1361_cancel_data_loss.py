@@ -407,6 +407,10 @@ def test_stream_error_pending_materialization_does_not_duplicate_eager_checkpoin
                 "content": "[Workspace::v1: C:\\repo]\nplease   restart the WebUI",
                 "timestamp": 1778098700,
                 "attachments": [{"name": "screen.png"}],
+                # #6407: real producer-shaped identity — the eager session-save
+                # checkpoint stamps _turn_id = stream_id (routes.py), so a
+                # fixture checkpoint must carry the same id as the pending turn.
+                "_turn_id": "stream_1361",
             },
         ],
     )
@@ -593,7 +597,11 @@ class TestCancelStreamIdempotentWithWorkerFinalizer:
         _make_session(
             session_id=sid,
             messages=[
-                {'role': 'user', 'content': 'Help me debug this', 'timestamp': 100},
+                {'role': 'user', 'content': 'Help me debug this', 'timestamp': 100,
+                 # #6407: real producer-shaped identity — the cancelled turn's
+                 # user row carries _turn_id = stream_id, so the cancel
+                 # materializer recognizes it and never appends a second row.
+                 '_turn_id': 'stream_idempotent'},
                 {'role': 'assistant', 'content': '**Task cancelled:** Task cancelled.\n\n*The run was cancelled by the user before Hermes finished. No provider failure occurred.*', '_error': True, 'timestamp': 101},
             ],
         )
