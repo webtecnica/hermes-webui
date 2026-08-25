@@ -2436,6 +2436,40 @@ def _finalize_cancelled_turn(
         logger.debug("Failed to persist cancelled turn", exc_info=True)
 
 
+def _persist_with_append_intent(session):
+    """Persist a transcript mutation that APPENDS rows, with append intent.
+
+    #6422 re-gate 2026-08-25: every production writer that GROWS
+    ``session.messages`` (settled synchronous turns, terminal error rows,
+    cancel writebacks) must establish cross-process append intent before
+    saving — otherwise a row another client appended since this object was
+    loaded would be overwritten by the plain save (the same lost-update shape
+    the gateway/normal streaming paths already fixed).  The advisory pre-pass
+    records the on-disk base identity; ``save()`` re-validates it under the
+    per-session cross-process lock and re-merges if the file moved.
+    """
+    session._merge_concurrent_appends()
+    session.save()
+
+
+def _append_and_persist_terminal_error(session, error_message):
+    """Append a terminal error/interruption row and persist it with append
+    intent.
+
+    #6422 re-gate 2026-08-25: result-classified terminal errors and the outer
+    exception settlement in ``_run_agent_streaming`` are APPEND producers —
+    they grow the transcript with the error row, so they route through
+    ``_persist_with_append_intent()`` like every other terminal writer.  The
+    swallow-and-continue contract is preserved: a persistence failure must
+    never mask the error payload delivery (``put('apperror', ...)``).
+    """
+    session.messages.append(error_message)
+    try:
+        _persist_with_append_intent(session)
+    except Exception:
+        pass
+
+
 def _aiagent_import_error_detail() -> str:
     """Return a multi-line diagnostic string for the "AIAgent not available" path.
 
@@ -5668,7 +5702,9 @@ def _assign_stable_message_ids(result_messages, *existing_arrays):
     stays internally consistent. Rows whose historical id was carried forward by
     ``_restore_reasoning_metadata`` keep it; only genuinely new rows are minted.
 
-    Returns the number of rows newly stamped. Mutates ``result_messages`` in place.
+    Returns the number of rows whose stable INTEGER ``id`` was newly assigned.
+    UUID lineage minting (below) is a side effect and never counts toward the
+    return. Mutates ``result_messages`` in place.
     """
     if not result_messages:
         return 0
@@ -5688,6 +5724,7 @@ def _assign_stable_message_ids(result_messages, *existing_arrays):
         if m.get('id') is None:
             seed += 1
             m['id'] = seed
+            stamped += 1
         # #6422 re-gate 2026-08-24: mint durable uuid lineage for EVERY row
         # that lacks it — including genuinely new rows whose integer id was
         # supplied by the provider.  Previously the uuid was only minted when
@@ -5695,9 +5732,16 @@ def _assign_stable_message_ids(result_messages, *existing_arrays):
         # the row without cross-writer lineage, and two clients loaded from
         # the same base could mint the SAME integer id for different rows
         # while neither carried a uuid the merge could disambiguate.
+        #
+        # #6422 re-gate 2026-08-25: uuid minting does NOT contribute to the
+        # returned count — the documented contract counts rows whose stable
+        # INTEGER id was newly assigned.  A row that already carried an
+        # integer id (provider-supplied or previously minted) is not a
+        # newly-stamped row even when it just received a uuid; counting it
+        # broke the existing contract
+        # (test_assign_stable_ids_seeds_from_existing_max_and_skips_present).
         if m.get('uuid') is None:
             m['uuid'] = uuid.uuid4().hex
-            stamped += 1
     return stamped
 
 
@@ -11426,11 +11470,10 @@ def _run_agent_streaming(
                             _error_message['provider_details_label'] = 'Interruption details'
                         elif _err_type == 'tool_limit_reached':
                             _error_message['provider_details_label'] = 'Terminal state details'
-                        s.messages.append(_error_message)
-                        try:
-                            s.save()
-                        except Exception:
-                            pass
+                        # #6422 re-gate 2026-08-25: result-classified terminal
+                        # error settlement is an APPEND producer — persist the
+                        # error row with cross-process append intent.
+                        _append_and_persist_terminal_error(s, _error_message)
                         _error_payload['session'] = redact_session_data(
                             _session_payload_with_full_messages(s, tool_calls=s.tool_calls)
                         )
@@ -12612,7 +12655,12 @@ def _run_agent_streaming(
                                     s.pending_attachments = []
                                     s.pending_started_at = None
                                     s.pending_user_source = None
-                                    s.save()
+                                    # #6422 re-gate 2026-08-25: the synchronous
+                                    # credential self-heal success settles the
+                                    # turn's rows into the transcript — an
+                                    # APPEND producer that must persist with
+                                    # cross-process append intent.
+                                    _persist_with_append_intent(s)
                                     _done_session_payload = redact_session_data(
                                         _session_payload_with_full_messages(
                                             s, tool_calls=s.tool_calls
@@ -12765,11 +12813,10 @@ def _run_agent_streaming(
                     _error_message['provider_details_label'] = 'Cancellation details'
                 elif _exc_type == 'interrupted':
                     _error_message['provider_details_label'] = 'Interruption details'
-                s.messages.append(_error_message)
-                try:
-                    s.save()
-                except Exception:
-                    pass
+                # #6422 re-gate 2026-08-25: outer exception settlement is an
+                # APPEND producer — persist the error row with cross-process
+                # append intent.
+                _append_and_persist_terminal_error(s, _error_message)
                 if not ephemeral:
                     try:
                         append_turn_journal_event_for_stream(
@@ -13391,7 +13438,10 @@ def cancel_stream(stream_id: str) -> bool:
                         'provider_details_label': 'Cancellation details',
                         'timestamp': int(time.time()),
                     })
-                _cs.save()
+                # #6422 re-gate 2026-08-25: the cancel writeback appends the
+                # partial + cancel-marker rows — an APPEND producer that must
+                # establish cross-process append intent before persisting.
+                _persist_with_append_intent(_cs)
                 _cancel_session_payload = _redacted_session_payload_with_full_messages(_cs)
             except Exception:
                 logger.debug("Failed to clear session state on cancel for %s", _cancel_session_id)

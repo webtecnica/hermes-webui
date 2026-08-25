@@ -22,7 +22,11 @@ import pytest
 import api.models as models
 from api.models import Session
 from api.session_ops import truncate_session_at_keep
-from api.streaming import _assign_stable_message_ids
+from api.streaming import (
+    _assign_stable_message_ids,
+    _append_and_persist_terminal_error,
+    _persist_with_append_intent,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -823,7 +827,11 @@ class TestReGate20260824:
         stamped_a = _assign_stable_message_ids(rows_a)
         stamped_b = _assign_stable_message_ids(rows_b)
 
-        assert stamped_a == 1 and stamped_b == 1
+        # The return contract counts newly-assigned INTEGER ids only: both
+        # rows already carried id=7, so no integer id was minted (0) — even
+        # though the durable uuid lineage WAS minted below (re-gate
+        # 2026-08-25: uuid minting is a side effect, not part of the count).
+        assert stamped_a == 0 and stamped_b == 0
         assert rows_a[0]["uuid"] and rows_b[0]["uuid"]
         assert rows_a[0]["uuid"] != rows_b[0]["uuid"]
         assert rows_a[0]["id"] == 7 and rows_b[0]["id"] == 7
@@ -832,4 +840,162 @@ class TestReGate20260824:
         row = [{"id": 3, "uuid": "abc123", "role": "assistant"}]
         assert _assign_stable_message_ids(row) == 0
         assert row[0]["uuid"] == "abc123"
+
+
+class TestReGate20260825:
+    """Re-gate 2026-08-25 (maintainer CHANGES_REQUESTED on 7747479ca9ad):
+    production-composed coverage for the four terminal append producers that
+    still saved without ``_merge_concurrent_appends()``, plus the
+    append-intent-consumption regression for a reused cached Session.
+
+    Unlike the earlier gateway/synchronous tests (which manually called
+    ``_merge_concurrent_appends()`` on a Session), these execute the REAL
+    production callers: ``_append_and_persist_terminal_error`` (the
+    result-classified error + outer-settlement path),
+    ``_persist_with_append_intent`` (the synchronous self-heal success save),
+    and ``cancel_stream()`` (the direct cancel writeback).
+    """
+
+    def test_terminal_error_settlement_preserves_concurrent_rows(self, _isolate_session_dir):
+        """Result-classified / outer-exception settlement
+        (``_append_and_persist_terminal_error``) is an APPEND producer: a row
+        a concurrent writer persisted since this object loaded must survive
+        the terminal error save."""
+        session_dir, index_file = _isolate_session_dir
+        sid = "term_error_merge"
+        base = [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"}]
+
+        s1 = Session(session_id=sid, messages=[dict(m) for m in base])
+        s1.save()
+
+        # Stale settlement object loaded BEFORE the concurrent append.
+        stale = Session.load(sid)
+        concurrent = Session.load(sid)
+        concurrent.messages.append({"role": "assistant", "content": "other client row"})
+        concurrent._merge_concurrent_appends()
+        concurrent.save()
+
+        _append_and_persist_terminal_error(
+            stale, {"role": "assistant", "content": "terminal error", "_error": True}
+        )
+
+        assert _durable_contents(session_dir, sid) == [
+            "q1", "a1", "other client row", "terminal error",
+        ]
+
+    def test_synchronous_self_heal_writeback_preserves_concurrent_rows(self, _isolate_session_dir):
+        """The synchronous credential self-heal success save
+        (``_persist_with_append_intent``) is an APPEND producer: it settles
+        the turn's result rows into the transcript and must not clobber a
+        concurrent writer's rows."""
+        session_dir, index_file = _isolate_session_dir
+        sid = "self_heal_merge"
+        base = [{"role": "user", "content": "q1"}]
+
+        s1 = Session(session_id=sid, messages=[dict(m) for m in base])
+        s1.save()
+
+        stale = Session.load(sid)
+        stale.messages.append({"role": "assistant", "content": "healed answer"})
+
+        other = Session.load(sid)
+        other.messages.append({"role": "assistant", "content": "stream row"})
+        other._merge_concurrent_appends()
+        other.save()
+
+        _persist_with_append_intent(stale)
+
+        assert _durable_contents(session_dir, sid) == [
+            "q1", "stream row", "healed answer",
+        ]
+
+    def test_cancel_stream_writeback_preserves_concurrent_rows(self, _isolate_session_dir):
+        """The direct ``cancel_stream()`` partial/cancel writeback executes
+        the REAL production cancel path (not a manual helper sequence) and
+        must reconcile (merge) concurrent rows instead of overwriting them."""
+        import queue
+        import threading
+        from unittest.mock import patch
+
+        from api import config as live_config
+        from api.config import (
+            CANCEL_FLAGS,
+            STREAMS,
+            register_stream_owner,
+            unregister_stream_owner,
+        )
+        from api.streaming import cancel_stream
+
+        session_dir, index_file = _isolate_session_dir
+        sid = "cancel_merge"
+        stream_id = "stream_cancel_merge"
+        base = [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"}]
+
+        s1 = Session(session_id=sid, messages=[dict(m) for m in base])
+        s1.save()
+
+        # The session object the cancel path will write through — loaded
+        # BEFORE the concurrent append (the lost-update shape).
+        cached = Session.load(sid)
+        cached.active_stream_id = stream_id
+
+        other = Session.load(sid)
+        other.messages.append({"role": "assistant", "content": "concurrent row"})
+        other._merge_concurrent_appends()
+        other.save()
+
+        STREAMS[stream_id] = queue.Queue()
+        CANCEL_FLAGS[stream_id] = threading.Event()
+        register_stream_owner(stream_id, sid)
+        try:
+            with patch("api.streaming.get_session", return_value=cached):
+                assert cancel_stream(stream_id) is True
+        finally:
+            STREAMS.pop(stream_id, None)
+            CANCEL_FLAGS.pop(stream_id, None)
+            unregister_stream_owner(stream_id)
+            live_config.ACTIVE_RUNS.pop(stream_id, None)
+
+        durable = _durable_contents(session_dir, sid)
+        # The concurrent append survived the cancel writeback...
+        assert "concurrent row" in durable
+        # ...and the cancel marker was persisted on top of the merged tail.
+        reloaded = Session.load(sid)
+        assert any(
+            isinstance(m, dict) and "Task cancelled" in str(m.get("content") or "")
+            for m in reloaded.messages
+        )
+
+    def test_append_intent_consumed_after_save_truncation_same_object(self, _isolate_session_dir):
+        """Durable-reload regression (maintainer finding #3): append intent
+        must be CONSUMED by the successful append save.  Reusing ONE cached
+        Session — establish append intent and save, then truncate that same
+        object and save again — must NOT resurrect the deleted suffix via a
+        stale CAS reconciliation against the longer pre-truncation disk
+        transcript."""
+        session_dir, index_file = _isolate_session_dir
+        sid = "stale_append_intent"
+        base = [
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "a1"},
+        ]
+
+        s1 = Session(session_id=sid, messages=[dict(m) for m in base])
+        s1.save()
+
+        # ONE cached object reused across both transactions (the flagged shape).
+        cached = Session.load(sid)
+        cached.messages.append({"role": "assistant", "content": "a2"})
+        cached._merge_concurrent_appends()
+        cached.save()
+        assert _durable_contents(session_dir, sid) == ["q1", "a1", "a2"]
+
+        # Truncate the SAME object via the production entry point.
+        truncate_session_at_keep(cached, 1)
+        cached.save()
+
+        # The removed suffix stays deleted — no stale append reconciliation.
+        assert _durable_contents(session_dir, sid) == ["q1"]
+        persisted = json.loads((session_dir / f"{sid}.json").read_text(encoding="utf-8"))
+        assert persisted["truncate_generation"] == 1
 

@@ -1906,7 +1906,17 @@ class Session:
             # (locked variant — we already hold the per-session lock) and
             # rebuild the payload with bounded retry (3 attempts).
             _cas_fp = getattr(self, '_merge_snapshot_fingerprint', None)
-            if _cas_fp is not None:
+            # #6422 re-gate 2026-08-25: a pending truncation (/undo, /retry,
+            # /truncate, /clear) must NEVER run a stale append reconciliation.
+            # The fingerprint can only be armed by a previous
+            # _merge_concurrent_appends() preflight on this cached object, and
+            # the intent is consumed (cleared) once that append transaction's
+            # save succeeds.  If it ever survives to a truncating save,
+            # re-merging against the longer pre-truncation disk transcript
+            # would append the just-deleted suffix back before publishing the
+            # newer truncate generation.  Truncation is authoritative by
+            # generation (stamped above), so the CAS re-merge is skipped.
+            if _cas_fp is not None and not self._truncation_pending:
                 for _cas_attempt in range(3):
                     try:
                         _cas_text = self.path.read_text(encoding='utf-8')
@@ -1988,6 +1998,15 @@ class Session:
             # truncation intent for the retry.
             self._truncation_pending = False
             self._loaded_truncate_generation = int(self.truncate_generation or 0)
+            # #6422 re-gate 2026-08-25: CONSUME the append intent.  The
+            # preflight fingerprint armed by _merge_concurrent_appends() is
+            # only meaningful for the single append transaction it preceded;
+            # once this write succeeded the object's messages already include
+            # the reconciled rows.  Leaving it armed would make a LATER save on
+            # this same cached object (e.g. a truncation/undo/retry) re-run
+            # the stale merge against a disk transcript that has since grown,
+            # resurrecting rows the user just deleted.
+            self._merge_snapshot_fingerprint = None
         if not skip_index:
             _write_session_index(updates=[self])
 
