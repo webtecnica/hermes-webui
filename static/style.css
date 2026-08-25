@@ -7399,3 +7399,17 @@ html[dir="rtl"] input[type="password"]{
   text-align:left;
   unicode-bidi:isolate;
 }
+/* #6699 re-gate: remaining technical text controls stay LTR + bidi-isolated
+   in an RTL shell (base URLs, API keys, JSON textareas, task workspace/parent
+   IDs). Normal Persian form text remains RTL — these are scoped selectors. */
+html[dir="rtl"] #onboardingBaseUrlInput,
+html[dir="rtl"] #profileFormBaseUrl,
+html[dir="rtl"] #auxAdvancedBaseUrl,
+html[dir="rtl"] #settingsDashboardUrl,
+html[dir="rtl"] #auxAdvancedApiKey,
+html[dir="rtl"] #auxAdvancedExtraBody,
+html[dir="rtl"] #kanbanTaskModalWorkspacePath{
+  direction:ltr;
+  text-align:left;
+  unicode-bidi:isolate;
+}

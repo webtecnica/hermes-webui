@@ -215,42 +215,187 @@ def test_rtl_shell_css_mirrors_manual_tool_surface_rules():
 
 
 def test_rtl_four_case_behavior_matrix():
-    """Four-case behavior matrix for locale-driven vs manual RTL.
+    """Behavior matrix (behavioral, not source-only) for locale-driven vs manual RTL.
 
-    Case 1 — fa / manual-off: setLocale('fa') sets html dir=rtl; the
-      automatic shell rules (not .chat-content-rtl) must isolate tool
-      surfaces, since the manual class is absent.
-    Case 2 — fa / manual-on: html dir=rtl AND .chat-content-rtl are both
-      active; tool surfaces stay LTR under either rule set.
+    Drives the REAL setLocale() from static/i18n.js and the REAL manual RTL
+    class toggle (document.documentElement.classList.toggle('chat-content-rtl')),
+    mounts representative tool content (.tool-call-group-body / .tool-result and
+    descendants), and resolves the REAL style.css rules against the DOM to
+    compute direction/unicode-bidi for each of the four cases:
+
+    Case 1 — fa / manual-off: setLocale('fa') sets html dir=rtl; the automatic
+      html[dir="rtl"] rules must force tool surfaces LTR + bidi-isolated even
+      without the manual class.
+    Case 2 — fa / manual-on: html dir=rtl AND .chat-content-rtl; tool surfaces
+      stay LTR under either rule set.
     Case 3 — LTR / manual-on: html dir=ltr with the manual class; the legacy
       .chat-content-rtl rules still isolate tool surfaces.
-    Case 4 — fa -> LTR restoration: switching fa -> en restores dir=ltr so an
-      RTL selection never leaks into the next locale or session.
+    Case 4 — fa -> LTR restoration: switching fa -> en restores dir=ltr and no
+      RTL/LTR override leaks into the next locale (tool rows inherit shell LTR).
     """
+    import json
+    import shutil
+    import subprocess
+    import tempfile
+
     css = read(REPO / "static" / "style.css")
     src = read(REPO / "static" / "i18n.js")
 
-    # Case 1 + 2: automatic html[dir=rtl] rules must isolate tool surfaces
-    # even when the manual class is not applied.
-    rtl_block = css[css.index('html[dir="rtl"]'):]
-    assert 'html[dir="rtl"] .tool-call-group-body,' in rtl_block
-    assert 'html[dir="rtl"] .tool-result,' in rtl_block
-    assert 'html[dir="rtl"] .tool-call-group-body *,' in rtl_block
-    assert 'html[dir="rtl"] .tool-result *,' in rtl_block
+    # Small source-presence guard (explicitly allowed by the review) — the real
+    # behavior assertions follow below. Rule lists end either with ',' (mid-list)
+    # or '{' (last selector opening the declaration block).
+    for sel in (
+        'html[dir="rtl"] .tool-call-group-body,',
+        'html[dir="rtl"] .tool-call-group-body *,',
+        'html[dir="rtl"] .tool-result,',
+        'html[dir="rtl"] .tool-result *',
+        ".chat-content-rtl .tool-call-group-body,",
+        ".chat-content-rtl .tool-call-group-body *",
+        ".chat-content-rtl .tool-result,",
+        ".chat-content-rtl .tool-result *",
+    ):
+        assert sel in css, f"missing mirror selector {sel}"
 
-    # Case 2 + 3: the manual .chat-content-rtl rules must remain intact.
-    assert ".chat-content-rtl .tool-call-group-body," in css
-    assert ".chat-content-rtl .tool-call-group-body *," in css
-    assert ".chat-content-rtl .tool-result," in css
-    assert ".chat-content-rtl .tool-result *{" in css
-    tool_manual = css[css.index(".chat-content-rtl .tool-call-group-body,"):]
-    tool_manual = tool_manual[: tool_manual.index("}")]
-    assert "direction:ltr" in tool_manual
-    assert "text-align:left" in tool_manual
-    assert "unicode-bidi:isolate" in tool_manual
+    node = shutil.which("node")
+    if node is None:
+        import pytest
 
-    # Case 4: setLocale() must restore dir=ltr for non-RTL locales.
-    assert "document.documentElement.dir = _locale._dir === 'rtl' ? 'rtl' : 'ltr'" in src
+        pytest.skip("node not on PATH")
+
+    js = r"""
+const fs = require('fs');
+const docEl = { lang:'', dir:'', cls:new Set(), attrs:{},
+  setAttribute(k,v){this.attrs[k]=v;},
+  getAttribute(k){return this.attrs[k]??null;},
+  classList: { toggle(c,on){ on?docEl.cls.add(c):docEl.cls.delete(c); },
+               contains(c){ return docEl.cls.has(c); } } };
+global.document = { documentElement: docEl, querySelectorAll: () => [] };
+global.localStorage = { getItem: () => null, setItem: () => {}, removeItem: () => {} };
+global.window = global;
+eval(fs.readFileSync(process.argv[2], 'utf8'));
+
+function makeEl(classes, parent){
+  const el = { cls:new Set(classes), parent: parent||null };
+  el._matchTail = function(tail){
+    const parts = tail.trim().split(/\s+/);
+    const head = parts[0];
+    if (head === '*') return true;
+    if (!head.startsWith('.')) return false;
+    const name = head.slice(1);
+    if (parts.length === 1) return this.cls.has(name);
+    if (parts[parts.length-1] === '*') {
+      let p = this.parent;
+      while (p) { if (p.cls.has(name)) return true; p = p.parent; }
+      return false;
+    }
+    return false;
+  };
+  el.matches = function(sel){
+    sel = sel.trim();
+    let m = sel.match(/^html\[dir="([a-z]+)"\]\s+(.+)$/);
+    if (m) return docEl.dir === m[1] && this._matchTail(m[2]);
+    m = sel.match(/^\.chat-content-rtl\s+(.+)$/);
+    if (m) return docEl.cls.has('chat-content-rtl') && this._matchTail(m[1]);
+    return this._matchTail(sel);
+  };
+  return el;
+}
+// Representative tool content
+const body = makeEl(['msg-body']);
+const toolGroup = makeEl(['tool-call-group-body'], body);
+const toolGroupChild = makeEl(['tool-detail'], toolGroup);
+const toolResult = makeEl(['tool-result'], body);
+const toolResultChild = makeEl(['p'], toolResult);
+
+// Parse the REAL style.css: only rules whose selector targets tool surfaces.
+const css = fs.readFileSync(process.argv[3], 'utf8')
+  .replace(/\/\*[\s\S]*?\*\//g, '');           // strip comments
+const rules = [];
+const re = /([^{}@][^{}]*)\{([^{}]*)\}/g;
+let m;
+while ((m = re.exec(css))) {
+  const selGroup = m[1].trim().replace(/\s+/g,' ');
+  if (selGroup.includes('tool-call-group-body') || selGroup.includes('tool-result')) {
+    // a comma-separated selector group shares one declaration block
+    for (const one of selGroup.split(',')) {
+      const sel = one.trim();
+      if (sel) rules.push({ sel, decls: m[2] });
+    }
+  }
+}
+function computed(el){
+  let dir = null, bid = null;
+  for (const r of rules) {
+    if (el.matches(r.sel)) {
+      const d = r.decls.match(/direction\s*:\s*([^;]+);/);
+      if (d) dir = d[1].trim();
+      const b = r.decls.match(/unicode-bidi\s*:\s*([^;]+);/);
+      if (b) bid = b[1].trim();
+    }
+  }
+  return { dir: dir, bid: bid };
+}
+function caseRun(locale, manualOn){
+  setLocale(locale);
+  docEl.classList.toggle('chat-content-rtl', manualOn);
+  return {
+    dir: docEl.dir,
+    manual: docEl.cls.has('chat-content-rtl'),
+    group: computed(toolGroup),
+    groupChild: computed(toolGroupChild),
+    result: computed(toolResult),
+    resultChild: computed(toolResultChild),
+  };
+}
+const out = {};
+out.case1 = caseRun('fa', false);
+out.case2 = caseRun('fa', true);
+out.case3 = caseRun('en', true);
+out.case4 = caseRun('fa', false); out.case4_restored = caseRun('en', false);
+process.stdout.write(JSON.stringify(out));
+"""
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".js", delete=False, encoding="utf-8"
+    ) as tf:
+        tf.write(js)
+        script = tf.name
+    try:
+        result = subprocess.run(
+            [node, script, str(REPO / "static" / "i18n.js"), str(REPO / "static" / "style.css")],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, f"node error: {result.stderr[:500]}"
+        out = json.loads(result.stdout)
+    finally:
+        os.unlink(script)
+
+    # Case 1 — fa / manual off: automatic html[dir=rtl] rules isolate tool rows.
+    assert out["case1"]["dir"] == "rtl" and out["case1"]["manual"] is False, out["case1"]
+    for surf in ("group", "groupChild", "result", "resultChild"):
+        assert out["case1"][surf]["dir"] == "ltr", (surf, out["case1"][surf])
+        assert out["case1"][surf]["bid"] == "isolate", (surf, out["case1"][surf])
+
+    # Case 2 — fa / manual on: both rule sets active; still LTR + isolated.
+    assert out["case2"]["dir"] == "rtl" and out["case2"]["manual"] is True, out["case2"]
+    for surf in ("group", "groupChild", "result", "resultChild"):
+        assert out["case2"][surf]["dir"] == "ltr", (surf, out["case2"][surf])
+        assert out["case2"][surf]["bid"] == "isolate", (surf, out["case2"][surf])
+
+    # Case 3 — LTR / manual on: legacy .chat-content-rtl rules isolate tool rows.
+    assert out["case3"]["dir"] == "ltr" and out["case3"]["manual"] is True, out["case3"]
+    for surf in ("group", "groupChild", "result", "resultChild"):
+        assert out["case3"][surf]["dir"] == "ltr", (surf, out["case3"][surf])
+        assert out["case3"][surf]["bid"] == "isolate", (surf, out["case3"][surf])
+
+    # Case 4 — fa -> LTR restoration: dir restored, manual class off, and no
+    # forced-LTR rule leaks (tool rows inherit the LTR shell).
+    assert out["case4"]["dir"] == "rtl", out["case4"]
+    assert out["case4_restored"]["dir"] == "ltr", out["case4_restored"]
+    assert out["case4_restored"]["manual"] is False, out["case4_restored"]
+    for surf in ("group", "groupChild", "result", "resultChild"):
+        assert out["case4_restored"][surf]["dir"] is None, (surf, out["case4_restored"][surf])
 
 
 def test_set_locale_rtl_to_ltr_restoration_behavior():
