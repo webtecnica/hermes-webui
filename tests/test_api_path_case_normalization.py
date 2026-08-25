@@ -222,3 +222,120 @@ def test_sidecar_proxy_path_capture_preserved():
     assert args and args[0] == "Ext_A", f"extension id corrupted: {args!r}"
     assert args and args[1] == "Path/With/Case", f"proxy path corrupted: {args!r}"
     assert kwargs.get("query") == ""
+
+
+class TestDynamicCapturesPreserveCase:
+    """#6589 re-gate: every case-sensitive dynamic capture must come from the
+    ORIGINAL-case path, never the case-folded matching path."""
+
+    def _handler(self, raw_path):
+        h = _FakeHandler()
+        h._raw_api_path = raw_path
+        return h
+
+    def test_match_api_segments_session_id_preserves_case(self):
+        from api.routes import _match_api_segments
+        from urllib.parse import urlsplit
+
+        parsed = urlparse("/api/sessions/abc/events")
+        h = self._handler("/API/Sessions/AbC/events")
+        sid = _match_api_segments(h, parsed, ("api", "sessions", None, "events"))
+        assert sid == "AbC", f"session id corrupted: {sid!r}"
+
+    def test_match_api_segments_rejects_wrong_shape(self):
+        from api.routes import _match_api_segments
+        from urllib.parse import urlsplit
+
+        parsed = urlparse("/api/sessions/abc")
+        h = self._handler("/API/Sessions/AbC")
+        assert _match_api_segments(h, parsed, ("api", "sessions", None, "events")) is None
+
+    def test_session_events_dispatch_uses_original_case_sid(self):
+        import api.routes as routes
+        from urllib.parse import urlsplit
+
+        captured = {}
+        orig = routes._handle_session_sse_stream_for_session
+
+        def spy(handler, parsed, sid):
+            captured["sid"] = sid
+            return True
+
+        routes._handle_session_sse_stream_for_session = spy
+        try:
+            parsed = urlparse("/api/sessions/abc/events")
+            h = self._handler("/API/Sessions/AbC/events")
+            routes.handle_get(h, parsed)
+        finally:
+            routes._handle_session_sse_stream_for_session = orig
+        assert captured.get("sid") == "AbC", f"sid corrupted: {captured.get('sid')!r}"
+
+    def test_static_serves_case_sensitive_file_path(self):
+        from api.routes import _serve_static
+        from urllib.parse import urlsplit
+        from unittest.mock import patch
+
+        served = {}
+        orig = None
+        with patch("api.routes.api_config.get_static_root") as root:
+            root.return_value = root.return_value  # noqa: B018  (patched below)
+        import pathlib
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpd:
+            static_root = pathlib.Path(tmpd)
+            (static_root / "MyFile.PNG").write_bytes(b"PNGDATA")
+            parsed = urlparse("/api/static/myfile.png")
+            h = self._handler("/API/static/MyFile.PNG")
+            with patch("api.routes.api_config.get_static_root", return_value=static_root):
+                sent = {}
+                orig_wfile = h.wfile
+
+                class _W:
+                    def write(self, b):
+                        sent["body"] = b
+
+                h.wfile = _W()
+                result = _serve_static(h, parsed)
+            assert result is True, "case-sensitive static file must be served"
+            assert sent.get("body") == b"PNGDATA", f"wrong file served: {sent.get('body')!r}"
+
+    def test_kanban_task_id_preserves_case(self):
+        import api.kanban_bridge as kb
+        from urllib.parse import urlsplit
+
+        captured = {}
+        orig = kb._task_log_payload
+
+        def spy(parsed, task_id):
+            captured["task_id"] = task_id
+            return {"ok": True}
+
+        kb._task_log_payload = spy
+        try:
+            parsed = urlparse("/api/kanban/tasks/abcdef/log")
+            h = self._handler("/api/kanban/tasks/AbCdEf/log")
+            kb.handle_kanban_get(h, parsed)
+        finally:
+            kb._task_log_payload = orig
+        assert captured.get("task_id") == "AbCdEf", f"task id corrupted: {captured.get('task_id')!r}"
+
+    def test_kanban_board_slug_preserves_case(self):
+        import api.kanban_bridge as kb
+        from urllib.parse import urlsplit
+
+        captured = {}
+        orig = kb._update_board_payload
+
+        def spy(slug, body):
+            captured["slug"] = slug
+            return {"ok": True}
+
+        kb._update_board_payload = spy
+        try:
+            parsed = urlparse("/api/kanban/boards/myboard")
+            h = self._handler("/api/kanban/boards/MyBoard")
+            kb.handle_kanban_patch(h, parsed, {})
+        finally:
+            kb._update_board_payload = orig
+        assert captured.get("slug") == "MyBoard", f"slug corrupted: {captured.get('slug')!r}"

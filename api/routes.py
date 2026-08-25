@@ -5715,6 +5715,31 @@ def _original_api_path(handler, parsed):
     return raw if isinstance(raw, str) else parsed.path
 
 
+def _match_api_segments(handler, parsed, template):
+    """Match a fixed-shape /api/ route case-insensitively and return the
+    dynamic capture sliced from the ORIGINAL-case path (#6589 re-gate).
+
+    ``template`` lists every server-owned segment, with ``None`` marking the
+    single dynamic slot that is a case-sensitive capture (session id, board
+    id, …): e.g. ``("api", "sessions", None, "events")``. Static segments are
+    compared case-insensitively, so ``/API/Sessions/AbC/events`` matches the
+    template while still returning ``AbC`` (never the case-folded ``abc``).
+    Returns None when the path shape does not match.
+    """
+    raw = _original_api_path(handler, parsed) or ""
+    parts = raw.strip("/").split("/")
+    if len(parts) != len(template):
+        return None
+    capture = None
+    for i, expected in enumerate(template):
+        if expected is None:
+            capture = parts[i]
+            continue
+        if parts[i].casefold() != str(expected).casefold():
+            return None
+    return capture or None
+
+
 _HOP_BY_HOP_HEADERS = {
     "connection",
     "keep-alive",
@@ -14424,7 +14449,9 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path == '/api/sessions/events':
         return _handle_session_events_stream(handler)
 
-    session_events_session_id = _session_events_path_session_id(parsed.path)
+    session_events_session_id = _match_api_segments(
+        handler, parsed, ("api", "sessions", None, "events")
+    )
     if session_events_session_id is not None:
         return _handle_session_sse_stream_for_session(handler, parsed, session_events_session_id)
 
@@ -14770,7 +14797,11 @@ def handle_get(handler, parsed) -> bool:
 
     # ── Plugin static assets ──
     if parsed.path.startswith("/dashboard-plugins/"):
-        parts = parsed.path.split("/", 3)
+        # Plugin names and asset paths are case-sensitive (config keys + disk
+        # paths) — split the ORIGINAL-case path, not the folded matching path
+        # (#6589 re-gate).
+        raw_plugins = _original_api_path(handler, parsed) or parsed.path
+        parts = raw_plugins.split("/", 3)
         if len(parts) >= 3:
             plugin_name = parts[2]
             rel_path = parts[3] if len(parts) > 3 else ""
@@ -17773,8 +17804,14 @@ _STATIC_CACHE_LOCK = threading.Lock()
 
 def _serve_static(handler, parsed):
     static_root = api_config.get_static_root().resolve()
-    # Strip the leading '/static/' prefix, then resolve and sandbox
-    rel = parsed.path[len("/static/") :]
+    # Strip the leading '/static/' prefix, then resolve and sandbox. The
+    # server-owned prefix is matched case-insensitively but the file path is
+    # case-sensitive on disk — slice from the ORIGINAL-case path (#6589).
+    raw = _original_api_path(handler, parsed) or ""
+    if "/api/static/" in raw.casefold():
+        rel = raw[raw.casefold().index("/api/static/") + len("/api/static/"):]
+    else:
+        rel = parsed.path[len("/static/"):]
     static_file = (static_root / rel).resolve()
     try:
         static_file.relative_to(static_root)
