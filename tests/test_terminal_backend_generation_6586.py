@@ -1728,3 +1728,56 @@ def test_profile_terminal_mappings_cover_canonical_schema(fake_terminal_tool):
     finally:
         streaming._end_turn_generation()
     assert streaming._get_turn_backend_config() is None
+
+
+def test_docker_container_exists_fails_closed_on_nonzero_ps(monkeypatch):
+    """Blocker 3: a docker ps -a that exits nonzero with empty stdout must
+    raise (fail-closed), never report 'container absent' — a daemon outage or
+    permission failure must not permit a replacement that reattaches by
+    labels."""
+    import subprocess as _subprocess
+    import api.streaming as streaming
+
+    class _FakeCompleted:
+        returncode = 1
+        stdout = b""
+        stderr = b"daemon not running"
+
+    monkeypatch.setattr(
+        streaming.subprocess, "run",
+        lambda *_a, **_k: _FakeCompleted(),
+    )
+    with pytest.raises(RuntimeError, match="fail-closed"):
+        streaming._docker_container_exists("docker", "c0ffee1234567890")
+
+
+def test_docker_container_exists_empty_output_after_success_means_absent(monkeypatch):
+    """Blocker 3 happy path: returncode 0 with empty stdout = container absent."""
+    import api.streaming as streaming
+
+    class _FakeCompleted:
+        returncode = 0
+        stdout = b""
+        stderr = b""
+
+    monkeypatch.setattr(
+        streaming.subprocess, "run",
+        lambda *_a, **_k: _FakeCompleted(),
+    )
+    assert streaming._docker_container_exists("docker", "c0ffee1234567890") is False
+
+
+def test_docker_container_exists_stdout_id_means_present(monkeypatch):
+    """Blocker 3: returncode 0 with the container id on stdout = still present."""
+    import api.streaming as streaming
+
+    class _FakeCompleted:
+        returncode = 0
+        stdout = b"c0ffee1234567890\n"
+        stderr = b""
+
+    monkeypatch.setattr(
+        streaming.subprocess, "run",
+        lambda *_a, **_k: _FakeCompleted(),
+    )
+    assert streaming._docker_container_exists("docker", "c0ffee1234567890") is True

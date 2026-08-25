@@ -3259,6 +3259,16 @@ def _docker_container_exists(docker_exe: str, container_id: str) -> bool:
             f'Could not verify removal of Docker container '
             f'{container_id[:12]}: {exc} (fail-closed)'
         ) from exc
+    # Fail closed on ANY nonzero docker ps result: a daemon outage, permission
+    # failure, or bad CLI with empty stdout must never be read as "container
+    # absent" — that would permit a replacement that reattaches by labels.
+    if result.returncode != 0:
+        detail = (result.stderr or b'').decode('utf-8', 'replace').strip()
+        raise RuntimeError(
+            f'Could not verify removal of Docker container '
+            f'{container_id[:12]}: docker ps exited {result.returncode} '
+            f'({detail[:200]}) (fail-closed)'
+        )
     return bool((result.stdout or b'').strip())
 
 
