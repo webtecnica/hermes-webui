@@ -465,3 +465,148 @@ def test_frontend_disables_skip_all_for_read_only_card():
     )
     # Belt-and-braces: respondApproval also still refuses the sentinel.
     assert src.count("_READ_ONLY_APPROVAL_PREFIX) === 0") >= 2
+
+
+# ---------------------------------------------------------------------------
+# Round-5 regressions — unknown provenance fails closed + gateway initial
+# pending relay (#6961 r5)
+# ---------------------------------------------------------------------------
+
+def test_unknown_provenance_fails_closed_when_resolution_empty(monkeypatch):
+    """state-db resolution failing on BOTH sides (entry_prov == current_prov
+    == "") must fail closed: equality of two empty strings never authorizes a
+    child projection (#6961 r5 #2)."""
+    ta = _raw_tools_approval()
+    parent = "test-6961-empty-prov-parent"
+    child = "test-6961-empty-prov-child"
+    child_key = _seed(parent, child)
+    try:
+        monkeypatch.setattr(ra, "_child_provenance_current", lambda: "")
+        ta.submit_pending(
+            child_key,
+            {"command": "noprovcmd", "pattern_key": "np", "pattern_keys": ["np"], "description": "nd"},
+        )
+        # The raw entry really was stamped empty (resolution failed at enqueue).
+        with ra._lock:
+            raw = ra._pending[child_key]
+        assert isinstance(raw, dict)
+        assert not str(raw.get("_child_provenance") or "").strip(), (
+            "raw enqueue with failed resolution must stamp empty provenance"
+        )
+        # Empty == empty must NOT authorize the projection.
+        with ra._lock:
+            head, total = ra.pending_head_for_session_locked(parent)
+        assert head is None and total == 0, (
+            "unknown provenance (empty on both sides) must fail closed"
+        )
+    finally:
+        _clear(parent, child_key)
+
+
+def test_provenance_requires_both_sides_non_empty(monkeypatch):
+    """A child entry is only projected when BOTH the entry and the current
+    provenance are non-empty AND equal — an empty stamp on either side fails
+    closed even when the other side is known (#6961 r5 #2)."""
+    parent = "test-6961-both-side-parent"
+    child = "test-6961-both-side-child"
+    child_key = _seed(parent, child)
+    try:
+        # Entry has no provenance at all, current is known -> filtered.
+        with ra._lock:
+            ra._pending[child_key] = [
+                {"command": "stale", "pattern_key": "s", "pattern_keys": ["s"], "description": "sd"}
+            ]
+        monkeypatch.setattr(ra, "_child_provenance_current", lambda: "known-db")
+        with ra._lock:
+            head, total = ra.pending_head_for_session_locked(parent)
+        assert head is None and total == 0, (
+            "empty entry provenance must fail closed even with a known current side"
+        )
+        # Entry is known, current resolution returns empty -> filtered.
+        with ra._lock:
+            ra._pending[child_key] = [
+                {"command": "stale", "pattern_key": "s", "pattern_keys": ["s"], "description": "sd",
+                 "_child_provenance": "known-db"}
+            ]
+        monkeypatch.setattr(ra, "_child_provenance_current", lambda: "")
+        with ra._lock:
+            head, total = ra.pending_head_for_session_locked(parent)
+        assert head is None and total == 0, (
+            "empty current provenance (state-db resolution failure) must fail closed"
+        )
+        # Sanity: both known and equal still authorizes.
+        with ra._lock:
+            ra._pending[child_key] = [
+                {"command": "stale", "pattern_key": "s", "pattern_keys": ["s"], "description": "sd",
+                 "_child_provenance": "known-db"}
+            ]
+        monkeypatch.setattr(ra, "_child_provenance_current", lambda: "known-db")
+        with ra._lock:
+            head, total = ra.pending_head_for_session_locked(parent)
+        assert head is not None and total == 1
+    finally:
+        _clear(parent, child_key)
+
+
+def test_gateway_child_enqueue_relays_initial_pending_to_parent_sse():
+    """A child-key gateway enqueue must publish the parent's INITIAL aggregate
+    while the worker is still blocked (entry parked), not only the removal
+    after `_await_gateway_decision` returns (#6961 r5 #1)."""
+    import threading
+
+    ta = _raw_tools_approval()
+    parent = "test-6961-gw-sse-parent"
+    child = "test-6961-gw-sse-child"
+    child_key = _seed(parent, child)
+    q = ra._approval_sse_subscribe(parent)
+    notified = []
+    t = None
+    try:
+        def _worker():
+            ta._await_gateway_decision(
+                child_key,
+                notified.append,
+                {"command": "gwchild", "pattern_key": "gp", "pattern_keys": ["gp"], "description": "gd"},
+                surface="gateway",
+            )
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        # The worker parks the entry and invokes notify_cb BEFORE blocking; the
+        # wrapped callback must already have relayed the parent's aggregate.
+        payload = q.get(timeout=5)
+        assert payload["pending_count"] == 1, (
+            "parent must see the child pending while the gateway worker is blocked"
+        )
+        assert payload["pending"]["command"] == "gwchild"
+        assert payload["pending"]["read_only"] is True
+        assert str(payload["pending"].get("approval_id") or "").startswith(_SENTINEL)
+        # The original notify_cb still fires, with the stamped data.
+        assert notified and notified[0]["command"] == "gwchild"
+        assert str(notified[0].get("_child_provenance") or "").strip(), (
+            "gateway approval data must carry provenance"
+        )
+        # The worker is provably still blocked with the entry parked.
+        with ra._lock:
+            parked = list(ta._gateway_queues.get(child_key, []))
+        assert len(parked) == 1, "worker must still be blocked with the entry parked"
+        assert t.is_alive()
+
+        # Resolve the entry: the worker unblocks, drops the entry, and the
+        # retained finally relay publishes the removal to the parent.
+        parked[0].result = "once"
+        parked[0].event.set()
+        t.join(timeout=5)
+        assert not t.is_alive(), "resolving the gateway entry must unblock the worker"
+        removal = q.get(timeout=2)
+        assert removal["pending_count"] == 0 and removal["pending"] is None, (
+            "resolving the gateway entry must relay the removal to the parent"
+        )
+    finally:
+        if t is not None and t.is_alive():
+            with ra._lock:
+                for entry in ta._gateway_queues.get(child_key, []):
+                    entry.event.set()
+            t.join(timeout=2)
+        ra._approval_sse_unsubscribe(parent, q)
+        _clear(parent, child_key)

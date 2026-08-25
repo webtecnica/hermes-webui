@@ -1224,12 +1224,15 @@ def pending_head_for_session_locked(session_key: str) -> tuple[dict | None, int]
             continue
         for entry in _queue_entries_locked(child_key):
             entry_prov = str(entry.get("_child_provenance") or "").strip()
-            if entry_prov != current_prov:
+            if not entry_prov or not current_prov or entry_prov != current_prov:
                 # Cross-profile guard (#6961 r3 MUST-FIX 2): a child entry
                 # parked under the same key by another profile's process-global
                 # queue must never be projected here. Unknown provenance fails
-                # closed too — child approvals only arrive via submit_pending,
-                # which now binds provenance on enqueue.
+                # closed too (#6961 r5 #2): child approvals only arrive via
+                # submit_pending / the gateway wrap, which bind provenance on
+                # enqueue, so an empty stamp on EITHER side means state-db
+                # resolution failed — equality of two empty strings must never
+                # authorize a projection.
                 continue
             # Mark child projections explicitly read-only (#6961 r3
             # MUST-FIX 1): non-empty sentinel identity (never null/absent), so
@@ -1313,25 +1316,52 @@ def _wrap_raw_submit_pending(module) -> bool:
 
 
 def _wrap_raw_gateway_enqueue(module) -> bool:
-    """Stamp provenance on child-key gateway entries enqueued by the Agent.
+    """Stamp provenance on child-key gateway entries enqueued by the Agent and
+    publish the parent's aggregate while the entry is actually parked.
 
     The gateway path parks `_ApprovalEntry(approval_data)` in
     `_gateway_queues`; stamping the data dict before the original runs means
     the entry's `.data` (same object) carries provenance and every mirror that
     copies it preserves the identity.
+
+    The Agent's `_await_gateway_decision` invokes `notify_cb` AFTER the entry
+    is parked and only removes it right before returning, so a relay in
+    `finally` alone would fire after the pending entry was already gone — the
+    parent SSE subscriber would see the removal but never the pending state
+    (#6961 r5 #1). Wrapping `notify_cb` publishes the parent's initial
+    aggregate at the exact moment the child entry is visible, before the
+    worker blocks; the `finally` relay is retained for the removal.
     """
     original = getattr(module, "_await_gateway_decision", None)
     if original is None or getattr(original, _RAW_PRODUCER_BOUND_ATTR, False):
         return False
 
     def _raw_gateway_decision_bound(session_key, notify_cb, approval_data, *args, **kwargs):
-        if _is_child_approval_key(session_key) and isinstance(approval_data, dict):
+        child_path = _is_child_approval_key(session_key)
+        if child_path and isinstance(approval_data, dict):
             approval_data = dict(approval_data)
             approval_data.setdefault("_child_provenance", _child_provenance_current())
+            if callable(notify_cb):
+                orig_notify = notify_cb
+
+                def _relay_then_notify(payload):
+                    # The entry is parked RIGHT NOW (the Agent appends it to
+                    # _gateway_queues before invoking notify_cb): publish the
+                    # parent's initial aggregate, then forward the
+                    # notification unchanged.
+                    try:
+                        with _lock:
+                            _relay_child_change_to_parent_locked(session_key)
+                    except Exception:
+                        logger.debug("raw gateway child approval SSE relay failed", exc_info=True)
+                    return orig_notify(payload)
+
+                _relay_then_notify.__name__ = getattr(orig_notify, "__name__", "notify_cb")
+                notify_cb = _relay_then_notify
         try:
             return original(session_key, notify_cb, approval_data, *args, **kwargs)
         finally:
-            if _is_child_approval_key(session_key):
+            if child_path:
                 try:
                     with _lock:
                         _relay_child_change_to_parent_locked(session_key)
