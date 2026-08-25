@@ -5398,7 +5398,7 @@ def _strip_base64_data_urls(text: str) -> str:
     artifact, non-base64 data URIs and ordinary text pass through byte-for-byte.
     """
     return re.sub(
-        r'data:image/[a-zA-Z0-9][a-zA-Z0-9+.\-]*;base64,[A-Za-z0-9+/=]+',
+        r'data:image/[a-zA-Z0-9][a-zA-Z0-9!#$&^_+.\-]*;base64,[A-Za-z0-9+/=]+',
         '[base64 image]',
         text,
         flags=re.IGNORECASE,

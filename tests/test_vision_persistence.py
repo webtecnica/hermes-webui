@@ -489,15 +489,18 @@ def test_replay_run_journal_projects_pre_fix_payloads():
     from api.routes import _project_replay_tool_payload
 
     b64 = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABQ="
+    b64_xtest = "data:image/x_test;base64,AAABAAEAEBAAAAEAIABoBAAAFgAAACg="
     payload = {
         "event_type": "tool.started",
         "name": "read_file",
         "preview": b64,
-        "args": {"image": b64, "path": "/tmp/real.png"},
+        "args": {"image": b64, "path": "/tmp/real.png", "edge": b64_xtest},
     }
     projected = _project_replay_tool_payload("tool", payload)
     assert projected["preview"] == "[base64 image]"
     assert projected["args"]["image"] == "[base64 image]"
+    # RFC 6838 restricted-name subtype (x_test) through the replay schedule.
+    assert projected["args"]["edge"] == "[base64 image]"
     # Referências não-base64 preservadas.
     assert projected["args"]["path"] == "/tmp/real.png"
     # Eventos não-tool passam intactos.
@@ -514,6 +517,14 @@ def test_strip_base64_data_urls_valid_subtypes():
     assert _strip_base64_data_urls("data:image/x-icon;base64,AAABAAEAEBAAAAEAIABoBAAAFgAAACg=") == "[base64 image]"
     assert _strip_base64_data_urls("data:image/vnd.microsoft.icon;base64,AAABAAEAEBAAAAEAIABoBAAAFgAAACg=") == "[base64 image]"
     assert _strip_base64_data_urls("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABQ=") == "[base64 image]"
+    # RFC 6838 restricted-name characters after the leading alphanumeric:
+    # ! # $ & ^ _ (review #6328 — previously left byte-for-byte unstripped).
+    assert _strip_base64_data_urls("data:image/x_test;base64,AAABAAEAEBAAAAEAIABoBAAAFgAAACg=") == "[base64 image]"
+    assert _strip_base64_data_urls("data:image/x!test;base64,AAABAAEAEBAAAAEAIABoBAAAFgAAACg=") == "[base64 image]"
+    assert _strip_base64_data_urls("data:image/x#test;base64,AAABAAEAEBAAAAEAIABoBAAAFgAAACg=") == "[base64 image]"
+    assert _strip_base64_data_urls("data:image/x$test;base64,AAABAAEAEBAAAAEAIABoBAAAFgAAACg=") == "[base64 image]"
+    assert _strip_base64_data_urls("data:image/x&test;base64,AAABAAEAEBAAAAEAIABoBAAAFgAAACg=") == "[base64 image]"
+    assert _strip_base64_data_urls("data:image/x^test;base64,AAABAAEAEBAAAAEAIABoBAAAFgAAACg=") == "[base64 image]"
     # Case-variants (scheme/media type/base64 marker).
     assert _strip_base64_data_urls("DATA:IMAGE/SVG+XML;BASE64,PHN2Zz48L3N2Zz4=") == "[base64 image]"
     assert _strip_base64_data_urls("Data:Image/PNG;Base64,iVBORw0KGgo=") == "[base64 image]"
@@ -532,6 +543,7 @@ def test_replay_projector_shape_complete_and_non_mutating():
     b64_png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABQ="
     b64_svg = "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4="
     b64_icon = "data:image/x-icon;base64,AAABAAEAEBAAAAEAIABoBAAAFgAAACg="
+    b64_xtest = "data:image/x_test;base64,AAABAAEAEBAAAAEAIABoBAAAFgAAACg="
     payload = {
         "event_type": "tool.started",
         "name": "read_file",
@@ -542,6 +554,7 @@ def test_replay_projector_shape_complete_and_non_mutating():
             "nested": {"image": b64_png},
             "list": [b64_svg, "https://example.com/ok.png"],
             "pair": (b64_icon, "plain"),
+            "edge": b64_xtest,
         },
     }
     frozen = copy.deepcopy(payload)
@@ -554,6 +567,7 @@ def test_replay_projector_shape_complete_and_non_mutating():
     assert projected["args"]["list"][1] == "https://example.com/ok.png"
     assert projected["args"]["pair"][0] == "[base64 image]"
     assert projected["args"]["pair"][1] == "plain"
+    assert projected["args"]["edge"] == "[base64 image]"  # RFC 6838 x_test subtype
     assert projected["args"]["path"] == "/tmp/real.png"
     # A entrada armazenada não foi mutada (copy-on-write).
     assert payload == frozen
