@@ -16,14 +16,23 @@ The r3 review found three MUST-FIXes:
 """
 import json
 import pathlib
+import re
 import sqlite3
 import sys
+
+import pytest
 
 REPO_ROOT = pathlib.Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(REPO_ROOT))
 
-from api import route_approvals as ra  # noqa: E402
+# Import order matters: `api.routes` loads `api.config`, which appends the
+# discovered hermes-agent dir to sys.path (api/config.py). Importing it FIRST
+# means `api.route_approvals` binds the REAL `tools.approval` module
+# (`_pending`/`_lock`/`_gateway_queues` shared in-process) instead of the
+# no-agent stub fallback — the same binding the production server gets, and
+# the one the raw-producer regressions below must exercise.
 from api import routes as r  # noqa: E402
+from api import route_approvals as ra  # noqa: E402
 
 _SENTINEL = "__read_only_child__:"
 
@@ -203,3 +212,256 @@ def test_valid_delegate_from_still_resolves(tmp_path, monkeypatch):
     finally:
         with ra._lock:
             ra._child_approval_parents.clear()
+
+
+# ---------------------------------------------------------------------------
+# MUST-FIX 2 (r4) — explicit-empty/null lineage fails open → key presence
+# ---------------------------------------------------------------------------
+
+def _lineage_row(db_path, child_id, raw_config, source, physical_parent):
+    """Insert one lineage-matrix row into a fresh state.db."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, model_config TEXT, source TEXT)")
+        conn.execute(
+            "INSERT OR REPLACE INTO sessions VALUES (?, ?, ?, ?)",
+            (child_id, physical_parent, raw_config, source),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "raw_config,source,physical_parent,expected",
+    [
+        # Genuinely absent marker + legacy subagent signal → physical parent.
+        (None, "subagent", "physical-parent", "physical-parent"),
+        (json.dumps({"other": 1}), "subagent", "physical-parent", "physical-parent"),
+        # Present non-empty string marker wins.
+        (json.dumps({"_delegate_from": "logical-parent"}), "subagent", "physical-parent", "logical-parent"),
+        # Explicitly present EMPTY marker: authoritative fail-closed, never the
+        # physical-parent fallback (#6961 r4 #2).
+        (json.dumps({"_delegate_from": ""}), "subagent", "physical-parent", None),
+        # Explicitly present NULL marker: fail closed.
+        (json.dumps({"_delegate_from": None}), "subagent", "physical-parent", None),
+        # Explicitly present non-string marker: fail closed.
+        (json.dumps({"_delegate_from": 123}), "subagent", "physical-parent", None),
+        (json.dumps({"_delegate_from": []}), "subagent", "physical-parent", None),
+        # Malformed / non-dict config: fail closed (no physical-parent fallback).
+        ("{not-valid-json", "subagent", "physical-parent", None),
+        (json.dumps([1, 2]), "subagent", "physical-parent", None),
+        # Absent marker + non-subagent source: no parent.
+        (None, "api_server", "physical-parent", None),
+    ],
+)
+def test_lineage_matrix_fails_closed(tmp_path, monkeypatch, raw_config, source, physical_parent, expected):
+    """_delegate_from key PRESENCE must be distinguished from absence.
+
+    An explicitly present empty/null/non-string marker declares the child's
+    lineage and must never fall through to the physical-parent fallback; only
+    a genuinely absent marker may take the legacy `source='subagent'` path.
+    """
+    db_path = tmp_path / "state.db"
+    child_id = f"lineage-{abs(hash((str(raw_config), source)))}-{len(list(tmp_path.iterdir()))}"
+    _lineage_row(db_path, child_id, raw_config, source, physical_parent)
+    monkeypatch.setattr(ra, "_child_parent_cache_key", lambda child: ("test-lineage-db", child))
+    from api import models as api_models
+    monkeypatch.setattr(api_models, "_active_state_db_path", lambda: str(db_path))
+    with ra._lock:
+        ra._child_approval_parents.clear()
+    try:
+        parent = ra._child_parent_session_id(child_id)
+        assert parent == expected, (
+            f"raw_config={raw_config!r} source={source!r} -> {parent!r}, expected {expected!r}"
+        )
+    finally:
+        with ra._lock:
+            ra._child_approval_parents.clear()
+
+
+# ---------------------------------------------------------------------------
+# MUST-FIX 1 (r4) — real raw-producer provenance + raw SSE relay
+# ---------------------------------------------------------------------------
+
+def _raw_tools_approval():
+    """The installed Agent's raw `tools.approval` module, or skip."""
+    return pytest.importorskip("tools.approval")
+
+
+def test_raw_producer_child_enqueue_gets_provenance_and_surfaces():
+    """The REAL Agent `tools.approval.submit_pending()` must stamp canonical
+    provenance on child-key entries so the projector surfaces them.
+
+    The r3 projector filters child entries by `_child_provenance`; the raw
+    producer never called the WebUI wrapper, so the real child row was
+    filtered instead of surfaced. The import-time boundary hook must make the
+    raw path equivalent to the wrapper path (#6961 r4 #1).
+    """
+    ta = _raw_tools_approval()
+    parent = "test-6961-raw-parent"
+    child = "test-6961-raw-child"
+    child_key = _seed(parent, child)
+    try:
+        ta.submit_pending(
+            child_key,
+            {"command": "rawchildcmd", "pattern_key": "cp", "pattern_keys": ["cp"], "description": "cd"},
+        )
+        # The raw entry itself now carries the enqueuing profile's provenance.
+        with ra._lock:
+            raw = ra._pending[child_key]
+        assert isinstance(raw, dict), "raw producer stores a legacy single dict"
+        assert str(raw.get("_child_provenance") or "").strip(), (
+            "raw child enqueue must stamp _child_provenance (found empty)"
+        )
+        # And the projector now surfaces it instead of filtering it out.
+        with ra._lock:
+            head, total = ra.pending_head_for_session_locked(parent)
+        assert total == 1
+        assert head is not None and head["command"] == "rawchildcmd"
+        assert head["read_only"] is True
+        assert str(head.get("approval_id") or "").startswith(_SENTINEL)
+    finally:
+        _clear(parent, child_key)
+
+
+def test_raw_producer_relays_parent_sse_subscriber():
+    """A raw Agent child enqueue must push the aggregate to the parent SSE
+    subscriber — the relay was previously only wired into the WebUI wrapper
+    path (#6961 r4 #3)."""
+    ta = _raw_tools_approval()
+    parent = "test-6961-raw-sse-parent"
+    child = "test-6961-raw-sse-child"
+    child_key = _seed(parent, child)
+    q = ra._approval_sse_subscribe(parent)
+    try:
+        ta.submit_pending(
+            child_key,
+            {"command": "rawssechild", "pattern_key": "cp", "pattern_keys": ["cp"], "description": "cd"},
+        )
+        payload = q.get(timeout=2)
+        assert payload["pending_count"] == 1
+        assert payload["pending"]["command"] == "rawssechild"
+        assert str(payload["pending"].get("approval_id") or "").startswith(_SENTINEL)
+    finally:
+        ra._approval_sse_unsubscribe(parent, q)
+        _clear(parent, child_key)
+
+
+def test_raw_producer_two_profile_same_child_id(monkeypatch):
+    """Raw enqueue under profile A must never surface under profile B, even
+    with the same child id (process-global queue, raw producer path)."""
+    ta = _raw_tools_approval()
+    parent = "test-6961-raw-prov-parent"
+    child = "test-6961-raw-prov-child"
+    child_key = _seed(parent, child)
+    try:
+        monkeypatch.setattr(ra, "_child_provenance_current", lambda: "rawProfileA-db")
+        ta.submit_pending(
+            child_key,
+            {"command": "rawacmd", "pattern_key": "ap", "pattern_keys": ["ap"], "description": "ad"},
+        )
+        # Same process, profile B active: filtered from the projection.
+        monkeypatch.setattr(ra, "_child_provenance_current", lambda: "rawProfileB-db")
+        with ra._lock:
+            head_b, total_b = ra.pending_head_for_session_locked(parent)
+        assert head_b is None and total_b == 0, (
+            "raw cross-profile child entry must be filtered from the projection"
+        )
+        # Back on profile A the raw entry is visible again.
+        monkeypatch.setattr(ra, "_child_provenance_current", lambda: "rawProfileA-db")
+        with ra._lock:
+            head_a, total_a = ra.pending_head_for_session_locked(parent)
+        assert head_a is not None and total_a == 1
+    finally:
+        _clear(parent, child_key)
+
+
+# ---------------------------------------------------------------------------
+# MUST-FIX 1 (r4) — sentinel with a SIMULTANEOUS parent approval
+# ---------------------------------------------------------------------------
+
+def test_sentinel_does_not_resolve_simultaneous_parent_approval():
+    """Answering a surfaced child card (sentinel id) while the parent has its
+    OWN pending approval must resolve nothing — the parent approval stays
+    intact and the child stays pending (#6961 r4 #4)."""
+    parent = "test-6961-simul-parent"
+    child = "test-6961-simul-child"
+    child_key = _seed(parent, child)
+    try:
+        r.submit_pending(
+            parent,
+            {"command": "parentcmd", "pattern_key": "pp", "pattern_keys": ["pp"], "description": "pd"},
+        )
+        r.submit_pending(
+            child_key,
+            {"command": "childcmd", "pattern_key": "cp", "pattern_keys": ["cp"], "description": "cd"},
+        )
+        with ra._lock:
+            head, total = ra.pending_head_for_session_locked(parent)
+        assert total == 2, "parent-own + child must both be visible"
+        assert head["command"] == "parentcmd"
+        sentinel_id = f"{_SENTINEL}{child_key}"
+
+        # Legacy resolver: sentinel must fail closed and resolve NOTHING.
+        resolved = r._resolve_approval_legacy(parent, sentinel_id, "once")
+        assert resolved is False
+        with ra._lock:
+            assert len(r._pending[parent]) == 1, "parent approval must stay pending"
+            assert len(r._pending[child_key]) == 1, "child entry must stay pending"
+
+        # HTTP respond handler: sentinel rejected before any resolver side
+        # effect (409), parent approval still untouched.
+        import io
+        captured_status = {}
+        handler = type("H", (), {
+            "wfile": io.BytesIO(),
+            "send_response": lambda self, s: captured_status.__setitem__("status", s),
+            "send_header": lambda self, k, v: None,
+            "end_headers": lambda self: None,
+        })()
+        r._handle_approval_respond(
+            handler,
+            {"session_id": parent, "choice": "once", "approval_id": sentinel_id},
+        )
+        assert captured_status.get("status") == 409, (
+            "respond with a sentinel approval_id must be rejected with 409"
+        )
+        response_body = json.loads(handler.wfile.getvalue().decode("utf-8"))
+        assert response_body.get("ok") is False
+        with ra._lock:
+            assert len(r._pending[parent]) == 1, (
+                "respond with sentinel must not consume the parent approval"
+            )
+    finally:
+        _clear(parent, child_key)
+
+
+# ---------------------------------------------------------------------------
+# MUST-FIX 4 (r4) — full-control frontend regressions (Skip all / YOLO)
+# ---------------------------------------------------------------------------
+
+def test_frontend_disables_skip_all_for_read_only_card():
+    """Every card action must be inert on read-only cards — including Skip all
+    / YOLO, which previously stayed wired to toggleYoloFromApproval() and
+    mutated the parent session (#6961 r4 #4)."""
+    src = pathlib.Path(REPO_ROOT / "static" / "messages.js").read_text(encoding="utf-8")
+    # The disabled set must now include the Skip all / YOLO control.
+    assert '"approvalSkipAll"' in src, (
+        "_setApprovalControlsDisabled must reference the Skip all button"
+    )
+    assert "skipAll.disabled = !!disabled" in src, (
+        "the Skip all button must be disabled together with the other controls"
+    )
+    # toggleYoloFromApproval must refuse read-only sentinel cards outright.
+    assert "async function toggleYoloFromApproval()" in src
+    func_start = src.index("async function toggleYoloFromApproval()")
+    toggle_body = src[func_start:func_start + 700]
+    assert "_READ_ONLY_APPROVAL_PREFIX) === 0" in toggle_body, (
+        "toggleYoloFromApproval must early-return on read-only sentinel cards"
+    )
+    assert "return;" in toggle_body.split("const sid = S.session")[0], (
+        "the sentinel guard must return BEFORE the /api/session/yolo call"
+    )
+    # Belt-and-braces: respondApproval also still refuses the sentinel.
+    assert src.count("_READ_ONLY_APPROVAL_PREFIX) === 0") >= 2

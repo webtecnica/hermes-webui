@@ -26347,6 +26347,19 @@ def _handle_approval_respond(handler, body):
     if choice not in ("once", "session", "always", "deny"):
         return bad(handler, f"Invalid choice: {choice}")
     approval_id = body.get("approval_id", "")
+
+    if approval_id and str(approval_id).startswith("__read_only_child__:"):
+        # Read-only child projection — reject BEFORE any resolver side effect
+        # (#6961 r4 #4): the sentinel must never reach the gateway relay, the
+        # local no-run mirror resolver, or the legacy FIFO path. Frontend
+        # guards already make the card inert; this is the server-side
+        # belt-and-braces so a crafted/legacy client cannot resolve a parent
+        # approval by answering a surfaced child card.
+        return j(
+            handler,
+            {"ok": False, "choice": choice, "error": "read_only_child_not_resolvable"},
+            status=409,
+        )
     enable_yolo = body.get("yolo") is True
     requested_run_id = str(body.get("run_id") or "").strip()
     requested_mirror_token = str(body.get("mirror_token") or "").strip()

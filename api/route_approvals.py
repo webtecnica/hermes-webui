@@ -1108,9 +1108,17 @@ def _child_parent_session_id(child_session_id: str) -> str | None:
                 elif isinstance(raw_model_config, dict):
                     model_config = raw_model_config
                     config_authoritative = True
-                delegate_from = str(model_config.get("_delegate_from") or "").strip()
-                if delegate_from:
-                    parent = delegate_from
+                if "_delegate_from" in model_config:
+                    # Key PRESENCE is authoritative (#6961 r4 #2): an
+                    # explicitly present marker — even empty/null/non-string —
+                    # declares the child's lineage and must NEVER fall through
+                    # to the physical-parent fallback. Only a non-empty string
+                    # value yields a parent; everything else fails closed.
+                    delegate_from_value = model_config.get("_delegate_from")
+                    if isinstance(delegate_from_value, str) and delegate_from_value.strip():
+                        parent = delegate_from_value.strip()
+                    else:
+                        parent = None
                 elif config_authoritative and str(source or "").strip().lower() == "subagent":
                     parent = str(parent_session_id or "").strip() or None
     except Exception:
@@ -1259,4 +1267,96 @@ def _relay_child_change_to_parent_locked(child_key: str) -> None:
         return
     head, total = pending_head_for_session_locked(parent)
     _approval_sse_notify_locked(parent, head, total)
+
+
+# ── Raw producer provenance boundary (installed Agent enqueue path) ─────────
+# The installed Agent's own `tools.approval.submit_pending()` writes a no-ID
+# raw dict straight into process-global `_pending` without ever calling the
+# WebUI wrapper above, so child-key entries enqueued by the REAL producer
+# carried no `_child_provenance` and the projector filtered them out — the
+# child approval stayed invisible even though it was pending (#6961 r4 #1).
+# Because the WebUI shares the agent module in-process (`_pending`/`_lock`/
+# `_gateway_queues` are the same objects), the fix is to bind the boundary at
+# import time: wrap the raw producer so every child-key enqueue gets canonical
+# profile/state-db provenance stamped (the same identity the WebUI wrapper
+# injects) and the owning parent's aggregate SSE update is relayed — the exact
+# treatment the wrapper gives. Gateway entries get the same stamp so mirrors
+# preserve it. The wrap is a no-op when the agent module is not importable
+# (agent-less WebUI test environments fall back to the stub `_pending`).
+_RAW_PRODUCER_BOUND_ATTR = "_webui_raw_producer_provenance_bound"
+
+
+def _wrap_raw_submit_pending(module) -> bool:
+    """Stamp provenance + relay parent SSE on the raw Agent `submit_pending`."""
+    original = module.submit_pending
+    if getattr(original, _RAW_PRODUCER_BOUND_ATTR, False):
+        return False
+
+    def _raw_submit_pending_bound(session_key, approval):
+        if _is_child_approval_key(session_key) and isinstance(approval, dict):
+            entry = dict(approval)
+            entry["_child_provenance"] = _child_provenance_current()
+            original(session_key, entry)
+            try:
+                with _lock:
+                    _relay_child_change_to_parent_locked(session_key)
+            except Exception:
+                logger.debug("raw child approval SSE relay failed", exc_info=True)
+            return
+        return original(session_key, approval)
+
+    _raw_submit_pending_bound.__name__ = original.__name__
+    _raw_submit_pending_bound.__doc__ = original.__doc__
+    setattr(_raw_submit_pending_bound, _RAW_PRODUCER_BOUND_ATTR, True)
+    module.submit_pending = _raw_submit_pending_bound
+    return True
+
+
+def _wrap_raw_gateway_enqueue(module) -> bool:
+    """Stamp provenance on child-key gateway entries enqueued by the Agent.
+
+    The gateway path parks `_ApprovalEntry(approval_data)` in
+    `_gateway_queues`; stamping the data dict before the original runs means
+    the entry's `.data` (same object) carries provenance and every mirror that
+    copies it preserves the identity.
+    """
+    original = getattr(module, "_await_gateway_decision", None)
+    if original is None or getattr(original, _RAW_PRODUCER_BOUND_ATTR, False):
+        return False
+
+    def _raw_gateway_decision_bound(session_key, notify_cb, approval_data, *args, **kwargs):
+        if _is_child_approval_key(session_key) and isinstance(approval_data, dict):
+            approval_data = dict(approval_data)
+            approval_data.setdefault("_child_provenance", _child_provenance_current())
+        try:
+            return original(session_key, notify_cb, approval_data, *args, **kwargs)
+        finally:
+            if _is_child_approval_key(session_key):
+                try:
+                    with _lock:
+                        _relay_child_change_to_parent_locked(session_key)
+                except Exception:
+                    logger.debug("raw gateway child approval SSE relay failed", exc_info=True)
+
+    _raw_gateway_decision_bound.__name__ = original.__name__
+    _raw_gateway_decision_bound.__doc__ = original.__doc__
+    setattr(_raw_gateway_decision_bound, _RAW_PRODUCER_BOUND_ATTR, True)
+    module._await_gateway_decision = _raw_gateway_decision_bound
+    return True
+
+
+def _install_raw_producer_provenance_hook() -> bool:
+    """Bind canonical profile/state-db provenance at the installed Agent's raw
+    enqueue boundary (#6961 r4 #1). No-op when the agent module is absent.
+    """
+    try:
+        import tools.approval as _tools_approval
+    except Exception:
+        return False
+    bound = _wrap_raw_submit_pending(_tools_approval)
+    bound = _wrap_raw_gateway_enqueue(_tools_approval) or bound
+    return bound
+
+
+_install_raw_producer_provenance_hook()
 

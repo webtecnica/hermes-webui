@@ -7313,6 +7313,12 @@ function _updateYoloPill() {
 }
 
 async function toggleYoloFromApproval() {
+  // Read-only child projection — Skip all / YOLO must be inert (#6961 r4 #4):
+  // the card cannot be answered through the parent session, and YOLO would
+  // mutate the parent session without the user approving THIS command.
+  if (_approvalCurrentId && _approvalCurrentId.indexOf(_READ_ONLY_APPROVAL_PREFIX) === 0) {
+    return;
+  }
   const owner = _captureApprovalResponseOwner();
   if (!owner) return false;
   return !!(await respondApproval('once', {yolo: true, owner}));
@@ -7603,6 +7609,11 @@ function _setApprovalControlsDisabled(choice, disabled) {
       b.classList.remove("loading");
     }
   });
+  // #6961 r4 #4: the Skip all / YOLO control must be inert on read-only
+  // (surfaced-child) cards and while a response is in flight — it mutates the
+  // parent session and must never be reachable from an answered card.
+  const skipAll = $("approvalSkipAll");
+  if (skipAll) skipAll.disabled = !!disabled;
 }
 
 function showApprovalForSession(sid, pending, pendingCount) {
