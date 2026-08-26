@@ -3038,6 +3038,7 @@ def _build_env_config_from_snapshot(
     return {
         'env_type': env_type,
         'modal_mode': _modal_mode,
+        'sandbox_dir': str(snapshot.get('TERMINAL_SANDBOX_DIR') or ''),
         'docker_image': str(snapshot.get('TERMINAL_DOCKER_IMAGE', default_image)),
         'docker_forward_env': docker_forward_env,
         'singularity_image': str(snapshot.get(
@@ -4099,30 +4100,29 @@ def _install_terminal_env_generation_guard() -> None:
                 }, ensure_ascii=False)
             # Fail-closed pre-execution gate: the exact validated object must
             # still occupy the registry slot the original tool will reuse —
-            # execution must never begin against a replacement.
+            # execution must never begin against a replacement. The execution
+            # lease is published in the SAME lock transaction as the check, so
+            # a retirement between the check and the lease can never slip in
+            # (#6586 gap 1): once the lock is released, every retirement path
+            # sees the lease and defers removal until the command finishes.
             with tt._env_lock:
                 live = (
                     tt._active_environments.get(effective_task_id)
                     or (tt._active_environments.get(task_id) if task_id else None)
                 )
-            if live is not env:
-                raise RuntimeError(
-                    'Terminal backend environment changed after ownership '
-                    'validation; refusing to execute against a replacement '
-                    '(fail-closed)'
-                )
+                if live is not env:
+                    raise RuntimeError(
+                        'Terminal backend environment changed after ownership '
+                        'validation; refusing to execute against a replacement '
+                        '(fail-closed)'
+                    )
+                if env is not None:
+                    _acquire_env_execution_lease(env)
             # Lock released — only now does the command execute, against the
-            # exact validated environment.
-            #
-            # Execution lease: the installed terminal_tool re-reads the
-            # registry by key before env.execute(), so a retirement between
-            # this final check and that lookup would execute the command
-            # against a replacement.  The lease pins the validated object for
-            # the duration of the command: every WebUI retirement path defers
-            # removal while a lease is held, and the registry is re-checked
-            # on release.
-            if env is not None:
-                _acquire_env_execution_lease(env)
+            # exact validated environment. The lease (published above, under
+            # the same lock) pins the object: every WebUI retirement path
+            # defers removal while a lease is held, and the registry is
+            # re-checked on release.
             try:
                 return original_terminal_tool(
                     command, background=background, timeout=timeout,
