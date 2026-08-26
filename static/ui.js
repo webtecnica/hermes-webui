@@ -3077,14 +3077,20 @@ function _deduplicateModelPickerOptions(sel,selectedValue){
   // orphan so "one option remains" after reconcile (#6936 round-trip).
   const orphans=Array.from(sel.children||[]).filter(opt=>opt&&opt.tagName==='OPTION'&&opt.dataset&&opt.dataset.custom==='1');
   for(const orphan of orphans){
+    const orphanProvider=_getOptionProviderId(orphan)||'';
     const identity=typeof _modelPickerCanonicalIdentity==='function'
-      ?_modelPickerCanonicalIdentity(orphan.value,_getOptionProviderId(orphan)||'')
-      :_modelPickerOptionIdentity(orphan.value,_getOptionProviderId(orphan));
+      ?_modelPickerCanonicalIdentity(orphan.value,orphanProvider)
+      :_modelPickerOptionIdentity(orphan.value,orphanProvider);
     if(!identity) continue;
     const realTwin=(()=>{
       for(const group of sel.querySelectorAll('optgroup')){
         const twin=Array.from(group.children||[]).find(opt=>opt&&opt.tagName==='OPTION'
           &&!(opt.dataset&&opt.dataset.custom==='1')
+          // #6946 re-gate: the canonical identity is model-only, so a real
+          // option from ANOTHER provider must never retire a synthetic,
+          // routable selection owned by this provider (provider equality
+          // required before treating it as a twin).
+          &&(_getOptionProviderId(opt)||'')===orphanProvider
           &&_modelPickerOptionIdentity(opt.value,_getOptionProviderId(opt))===identity);
         if(twin) return twin;
       }
