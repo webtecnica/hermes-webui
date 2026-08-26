@@ -393,17 +393,19 @@ def test_generation_ownership_stale_token_cannot_clear_newer_freeze():
 
     token_a = upd.freeze_static_serving()
     upd._mark_freeze_acquired(token_a)
-    # A newer attempt takes over the freeze while A is still in flight.
-    token_b = upd.freeze_static_serving()
-    upd._mark_freeze_acquired(token_b)
 
-    # A settles with its own (now stale) token → unfreeze is a no-op.
-    upd._settle_update_lifecycle(token_a)
+    # #7005 hole 2: a nested freeze (update B arriving while A still holds the
+    # freeze with replacement ownership pending) must be REJECTED, not
+    # supersede A's freeze — otherwise B's no-op settle would unfreeze its own
+    # newer token while A's old process still serves mutated bytes.
+    with pytest.raises(upd.StaticFreezeAlreadyActiveError):
+        upd.freeze_static_serving()
+    # A's freeze persists untouched.
     assert upd.update_in_progress() is True
     assert _serve("/static/messages.js?v=v-test-new").status == 503
 
-    # B settles with the current generation → freeze clears.
-    upd._settle_update_lifecycle(token_b)
+    # A settles with the current generation → freeze clears.
+    upd._settle_update_lifecycle(token_a)
     assert upd.update_in_progress() is False
     assert _serve("/static/messages.js?v=v-test-new").status == 200
 
@@ -510,3 +512,67 @@ def test_apply_clear_lock_agent_retry_does_not_freeze(monkeypatch):
     assert resp["ok"] is True
     assert calls == [("agent", "stable")]
     assert upd.update_in_progress() is False
+
+
+def test_restart_worker_failure_forces_process_exit(monkeypatch):
+    """#7005 hole 1 (BRICK): a failure DURING the restart worker (e.g.
+    _wait_until_restart_safe raising before execv) must never leave the
+    process frozen with static serving 503 — the worker forces os._exit(1)
+    so the supervisor replaces the process."""
+    import api.updates as upd
+
+    exited = []
+
+    # Run the worker target synchronously (test injection seam).
+    monkeypatch.setattr(upd, "_start_restart_thread", lambda target: target())
+    # Make the pre-execv gate raise — the worker's non-returning path must
+    # catch it and force process replacement.
+    def boom():
+        raise RuntimeError("restart gate failed before execv")
+
+    monkeypatch.setattr(upd, "_wait_until_restart_safe", boom)
+    monkeypatch.setattr(upd.os, "_exit", lambda code: exited.append(code))
+
+    with pytest.raises(RuntimeError):
+        upd._schedule_restart(delay=0)
+
+    assert exited == [1], f"worker failure must force os._exit(1), got {exited}"
+
+
+def test_stash_failure_marks_mutation_possible_before_side_effect(monkeypatch):
+    """#7005 hole 3: a timed-out `git stash push` can still mutate the tree
+    before the timeout is observed, so the lifecycle must be marked
+    mutation-possible BEFORE the stash command runs — a failure return must
+    never unfreeze into a possibly-mutated tree."""
+    import api.updates as upd
+
+    events = []
+
+    def fake_run_git(args, cwd, timeout=10):
+        cmd = args[0] if isinstance(args, list) else str(args)
+        events.append(("git", cmd))
+        if cmd == "fetch":
+            return ("", True)
+        if cmd == "status":
+            return (" M modified.py", True)  # dirty tree → stash path
+        if cmd == "stash":
+            return ("timed out", False)  # stash push fails/times out
+        return ("", True)
+
+    monkeypatch.setattr(upd, "_run_git", fake_run_git)
+    monkeypatch.setattr(upd, "_select_apply_compare_ref", lambda *a, **k: "origin/main")
+    monkeypatch.setattr(upd, "_reset_mutation_lifecycle", lambda: None)
+    monkeypatch.setattr(
+        upd, "_mark_mutation_started", lambda: events.append(("mark", None))
+    )
+
+    result = upd._apply_update_inner("webui")
+
+    assert result.get("ok") is False
+    assert "Failed to stash local changes" in result.get("message", "")
+    stash_pos = next(i for i, e in enumerate(events) if e == ("git", "stash"))
+    mark_pos = next(i for i, e in enumerate(events) if e == ("mark", None))
+    assert mark_pos < stash_pos, (
+        "mutation must be marked BEFORE the stash push side effect "
+        "(a timed-out stash can still mutate the tree)"
+    )

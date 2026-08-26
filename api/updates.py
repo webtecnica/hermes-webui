@@ -455,6 +455,24 @@ def apply_clear_lock(target: str) -> dict:
                             'other_locks': inv['other_locks'],
                         }
                         return retry_result
+                    except StaticFreezeAlreadyActiveError as exc:
+                        # Another update holds the freeze with replacement
+                        # pending — do NOT unfreeze (it owns the freeze until
+                        # its execv) and do NOT mutate (#7005 hole 2).
+                        retry_result = {
+                            'ok': False,
+                            'message': str(exc),
+                            'target': target,
+                            'freeze_occupied': True,
+                            'retryable': True,
+                        }
+                        retry_result = dict(retry_result)
+                        retry_result['lock_recovery'] = {
+                            'action': 'no-lock-found',
+                            'manual_command': manual_command,
+                            'other_locks': inv['other_locks'],
+                        }
+                        return retry_result
                     retry_result = _apply_update_inner(target, _read_update_channel())
                     _settle_update_lifecycle(freeze_token, retry_result)
                 except Exception:
@@ -1957,16 +1975,30 @@ def _schedule_restart(delay: float = 2.0) -> None:
     def _do():
         import time
         time.sleep(delay)
-        # Hold _apply_lock through os.execv so no new update can start between
-        # the lock-release and the process replacement.  Any in-flight update
-        # finishes first (since it holds the lock), and then the process is
-        # replaced while still holding the lock — meaning no new update can
-        # sneak in during the brief TOCTOU window that existed with the
-        # original acquire-release-execv sequence.
-        # Threads die when execv replaces the process image, so the lock is
-        # released atomically by the kernel.
-        with _apply_lock:
-            _restart_now()
+        try:
+            # Hold _apply_lock through os.execv so no new update can start
+            # between the lock-release and the process replacement.  Any
+            # in-flight update finishes first (since it holds the lock), and
+            # then the process is replaced while still holding the lock —
+            # meaning no new update can sneak in during the brief TOCTOU
+            # window that existed with the original acquire-release-execv
+            # sequence.
+            # Threads die when execv replaces the process image, so the lock
+            # is released atomically by the kernel.
+            with _apply_lock:
+                _restart_now()
+        except BaseException:
+            # BRICK (#6992/#7005): a failure DURING the worker (e.g.
+            # _wait_until_restart_safe raised before execv) must never leave
+            # the process frozen with static serving 503 and no replacement
+            # pending. The tree may already be mutated — force the supervisor
+            # to replace us.
+            logger.exception('restart worker failed; forcing process replacement')
+            try:
+                os._exit(1)
+            except Exception:
+                pass
+            raise
 
     try:
         _start_restart_thread(_do)
@@ -2107,9 +2139,22 @@ class StaticFreezeDrainTimeoutError(Exception):
         self.token = token
 
 
+class StaticFreezeAlreadyActiveError(Exception):
+    """A freeze is already held by a pending update (replacement ownership).
+
+    Raised by :func:`freeze_static_serving` when a previous update attempt
+    already holds the freeze (its tree may be mutated and a restart is
+    scheduled, or it is mid-apply). A nested freeze must NOT supersede it:
+    the new caller would later settle by unfreezing its own (newer) token
+    while the old process still serves mutated bytes under the old version
+    token — the exact #6992 mixed-revision exposure. The caller must return a
+    retryable non-success WITHOUT unfreezing (the existing freeze persists
+    until the owning update's ``os.execv`` replaces the process).
+    """
+
+
 def freeze_static_serving(max_drain_wait_s: float | None = None) -> int:
     """Freeze /static/* serving and drain in-flight readers (issue #6992).
-
     Sets the freeze flag (new requests get 503 from _serve_static), bumps the
     generation and returns the new generation as an ownership token, then
     waits — bounded by *max_drain_wait_s* (default
@@ -2138,6 +2183,17 @@ def freeze_static_serving(max_drain_wait_s: float | None = None) -> int:
         max_drain_wait_s = _FREEZE_DRAIN_MAX_WAIT_S
     global _freeze_generation, _frozen
     with _UPDATE_FREEZE_LOCK:
+        if _frozen:
+            # A previous update already holds the freeze with replacement
+            # ownership pending (or its tree is mid-mutation). Never supersede
+            # it: the new caller would later settle by unfreezing its own
+            # newer token while the old process still serves mutated bytes
+            # under the old version token (#6992/#7005 hole 2).
+            raise StaticFreezeAlreadyActiveError(
+                'static serving already frozen by a pending update '
+                '(replacement ownership pending); refusing to supersede',
+                _freeze_generation,
+            )
         _freeze_generation += 1
         token = _freeze_generation
         _frozen = True
@@ -2514,6 +2570,17 @@ def apply_force_update(target: str, channel=None) -> dict:
                     'drain_timeout': True,
                     'retryable': True,
                 }
+            except StaticFreezeAlreadyActiveError as exc:
+                # A previous update already holds the freeze with replacement
+                # ownership pending — do NOT unfreeze (it owns the freeze until
+                # its execv) and do NOT mutate (#7005 hole 2).
+                return {
+                    'ok': False,
+                    'message': str(exc),
+                    'target': target,
+                    'freeze_occupied': True,
+                    'retryable': True,
+                }
         response = _locked(channel)
         # Lifecycle (issue #6992): on SUCCESS the freeze persists until the
         # scheduled restart replaces this process (static stays 503 through
@@ -2581,6 +2648,17 @@ def apply_update(target, channel=None):
                     'message': str(exc),
                     'target': target,
                     'drain_timeout': True,
+                    'retryable': True,
+                }
+            except StaticFreezeAlreadyActiveError as exc:
+                # A previous update already holds the freeze with replacement
+                # ownership pending — do NOT unfreeze (it owns the freeze until
+                # its execv) and do NOT mutate (#7005 hole 2).
+                return {
+                    'ok': False,
+                    'message': str(exc),
+                    'target': target,
+                    'freeze_occupied': True,
                     'retryable': True,
                 }
         response = _apply_update_inner(target, channel)
@@ -2722,18 +2800,20 @@ def _apply_update_inner(target, channel=DEFAULT_UPDATE_CHANNEL):
         }
     stashed = False
     if status_out:
+        # Mark mutation-as-possible BEFORE the stash push: a timed-out
+        # `stash push` can still create the stash and move the user's changes
+        # out of the served tree before the timeout is observed, so a failure
+        # return here must NOT unfreeze into a possibly-mutated tree
+        # (#7005 hole 3). From this point a failure must never unfreeze
+        # unless a rollback is verified (issue #6992).
+        _mark_mutation_started()
         _, ok = _run_git(['stash', 'push', '-m', 'hermes-update-autostash'], path)
         if not ok:
-            # git stash push is atomic: a failure leaves the served tree
-            # untouched, so this stays pre-mutation (FROZEN) and the wrapper
-            # may generation-unfreeze.
+            # The tree may have been mutated by a timed-out stash push — the
+            # lifecycle is already marked mutation-possible, so the wrapper
+            # keeps the freeze / bounded replacement instead of unfreezing.
             return {'ok': False, 'message': 'Failed to stash local changes'}
         stashed = True
-        # First tree-mutating command confirmed (stash push moved the user's
-        # changes out of the served tree) — from here on a failure must never
-        # unfreeze into a possibly-mixed tree unless a rollback is verified
-        # (issue #6992).
-        _mark_mutation_started()
 
     # Pull with ff-only (no merge commits).
     # Split tracking refs like 'origin/main' into separate remote + branch
