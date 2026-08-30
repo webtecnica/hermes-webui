@@ -5302,7 +5302,17 @@ function refreshProfileTransitionReasoningChip(model, provider, reasoningEffort)
   _currentReasoningToggleSupported=undefined;
   _lastReasoningFetchKey=null;
   ++_reasoningFetchSeq;
-  _applyReasoningChip('', {supported_efforts:[], supports_thinking_toggle:false});
+  // Seed the destination profile's EFFECTIVE effort (explicit contract of
+  // /api/profile/switch, coerced by the backend through the same authority as
+  // /api/reasoning) SYNCHRONOUSLY — the chip must never paint the stale source
+  // profile's effort, not even during the in-flight window of the
+  // destination-scoped GET below (#7206). The GET still refreshes the
+  // capability ladder (supported_efforts / supports_thinking_toggle) once it
+  // lands; its success AND failure paths re-apply the same override, so no
+  // response can repaint the seeded effort. Empty string means "model default"
+  // and keeps the chip in its hidden/reset state.
+  const seededEffort=(reasoningEffort!==undefined&&reasoningEffort!==null)?reasoningEffort:'';
+  _applyReasoningChip(seededEffort, {supported_efforts:[], supports_thinking_toggle:false});
   const params=new URLSearchParams();
   if(model) params.set('model',model);
   if(provider) params.set('provider',provider);
