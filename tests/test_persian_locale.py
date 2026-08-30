@@ -212,6 +212,27 @@ def test_rtl_shell_css_mirrors_manual_tool_surface_rules():
     # command palette file paths and model IDs are technical identifiers.
     assert 'html[dir="rtl"] .cmd-item-path-value,' in rtl_block
     assert 'html[dir="rtl"] .model-opt-id,' in rtl_block
+    # Remaining technical text controls named by the re-gate review (base
+    # URLs, paths/IDs, structured/credential text) get scoped LTR selectors;
+    # ordinary Persian form text is untouched (no blanket input/textarea rule).
+    for sel in (
+        'html[dir="rtl"] #onboardingBaseUrlInput,',
+        'html[dir="rtl"] #profileFormBaseUrl,',
+        'html[dir="rtl"] #auxAdvancedBaseUrl,',
+        'html[dir="rtl"] #settingsDashboardUrl,',
+        'html[dir="rtl"] #onboardingWorkspaceInput,',
+        'html[dir="rtl"] #workspaceFormPath,',
+        'html[dir="rtl"] .model-custom-input,',
+        'html[dir="rtl"] #onboardingModelInput,',
+        'html[dir="rtl"] #kanbanDependencyInput,',
+        'html[dir="rtl"] #kanbanTaskModalWorkspacePath,',
+        'html[dir="rtl"] #kanbanTaskModalParents,',
+        'html[dir="rtl"] #auxAdvancedApiKey,',
+        'html[dir="rtl"] #auxAdvancedExtraBody,',
+    ):
+        assert sel in rtl_block or sel.rstrip(",") + "{" in rtl_block, (
+            f"missing audit selector {sel}"
+        )
 
 
 def test_rtl_four_case_behavior_matrix():

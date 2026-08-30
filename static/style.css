@@ -7408,7 +7408,13 @@ html[dir="rtl"] #auxAdvancedBaseUrl,
 html[dir="rtl"] #settingsDashboardUrl,
 html[dir="rtl"] #auxAdvancedApiKey,
 html[dir="rtl"] #auxAdvancedExtraBody,
-html[dir="rtl"] #kanbanTaskModalWorkspacePath{
+html[dir="rtl"] #kanbanTaskModalWorkspacePath,
+html[dir="rtl"] #kanbanTaskModalParents,
+html[dir="rtl"] #kanbanDependencyInput,
+html[dir="rtl"] #onboardingWorkspaceInput,
+html[dir="rtl"] #workspaceFormPath,
+html[dir="rtl"] .model-custom-input,
+html[dir="rtl"] #onboardingModelInput{
   direction:ltr;
   text-align:left;
   unicode-bidi:isolate;
