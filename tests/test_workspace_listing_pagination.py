@@ -512,4 +512,3 @@ class TestWsLoadMoreNodeDOMLifecycle:
             "a.txt", "b.txt", "c.txt", "d.txt"
         ]
         assert out["afterFirstResolve"]["meta"]["loading"] is False
-
