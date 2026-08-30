@@ -24735,7 +24735,10 @@ def _handle_cron_update(handler, body):
                 updates[k] = v
     except ValueError as e:
         return bad(handler, str(e))
-    job = update_job(body["job_id"], updates)
+    try:
+        job = update_job(body["job_id"], updates)
+    except ValueError as exc:
+        return bad(handler, str(exc))
     if not job:
         return bad(handler, "Job not found", 404)
     return j(handler, {"ok": True, "job": _cron_job_for_api(job)})
