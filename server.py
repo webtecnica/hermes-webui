@@ -300,7 +300,16 @@ def _fold_api_path(handler, parsed):
     handlers can extract case-sensitive dynamic values — share tokens, MCP
     server names, opaque IDs — from the unmodified tail instead of from the
     folded path (see api/routes._original_api_path).
+
+    The handler instance is reused across HTTP/1.1 keep-alive requests, so the
+    retained path is reset for EVERY request: a non-API request must never see
+    an ``_raw_api_path`` left behind by an earlier /api/ request on the same
+    connection (#6589 re-gate).
     """
+    # Per-request state: clear the previous request's retained path up front.
+    # Only /api/* requests below retain a path; without this reset, a later
+    # non-API request on the same connection would read stale API state.
+    handler._raw_api_path = None
     raw_path = parsed.path
     if raw_path.casefold().startswith("/api/"):
         handler._raw_api_path = raw_path

@@ -14798,10 +14798,12 @@ def handle_get(handler, parsed) -> bool:
     # ── Plugin static assets ──
     if parsed.path.startswith("/dashboard-plugins/"):
         # Plugin names and asset paths are case-sensitive (config keys + disk
-        # paths) — split the ORIGINAL-case path, not the folded matching path
-        # (#6589 re-gate).
-        raw_plugins = _original_api_path(handler, parsed) or parsed.path
-        parts = raw_plugins.split("/", 3)
+        # paths). This route is NOT API-folded (server.py folds only /api/*),
+        # so parsed.path already carries the original case — and it must come
+        # from the CURRENT request: the handler is reused across keep-alive
+        # requests, so an API-only retained path (_raw_api_path) from an
+        # earlier request would be stale here (#6589 re-gate).
+        parts = parsed.path.split("/", 3)
         if len(parts) >= 3:
             plugin_name = parts[2]
             rel_path = parts[3] if len(parts) > 3 else ""
@@ -17805,13 +17807,12 @@ _STATIC_CACHE_LOCK = threading.Lock()
 def _serve_static(handler, parsed):
     static_root = api_config.get_static_root().resolve()
     # Strip the leading '/static/' prefix, then resolve and sandbox. The
-    # server-owned prefix is matched case-insensitively but the file path is
-    # case-sensitive on disk — slice from the ORIGINAL-case path (#6589).
-    raw = _original_api_path(handler, parsed) or ""
-    if "/api/static/" in raw.casefold():
-        rel = raw[raw.casefold().index("/api/static/") + len("/api/static/"):]
-    else:
-        rel = parsed.path[len("/static/"):]
+    # server-owned prefix is matched case-insensitively upstream, but the file
+    # path is case-sensitive on disk. This route is NOT API-folded (server.py
+    # folds only /api/*), so parsed.path is the CURRENT request's original-case
+    # path — never an API-only retained path left behind by an earlier
+    # keep-alive request (#6589 re-gate).
+    rel = parsed.path[len("/static/"):]
     static_file = (static_root / rel).resolve()
     try:
         static_file.relative_to(static_root)

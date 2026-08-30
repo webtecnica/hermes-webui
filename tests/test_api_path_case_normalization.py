@@ -271,32 +271,29 @@ class TestDynamicCapturesPreserveCase:
         assert captured.get("sid") == "AbC", f"sid corrupted: {captured.get('sid')!r}"
 
     def test_static_serves_case_sensitive_file_path(self):
-        from api.routes import _serve_static
-        from urllib.parse import urlsplit
-        from unittest.mock import patch
-
-        served = {}
-        orig = None
-        with patch("api.routes.api_config.get_static_root") as root:
-            root.return_value = root.return_value  # noqa: B018  (patched below)
+        """Production boundary: /static/* is NOT API-folded, so the original
+        case reaches _serve_static and the case-sensitive file is served
+        (the fabricated /api/static/* branch was removed as dead code)."""
         import pathlib
         import tempfile
 
         with tempfile.TemporaryDirectory() as tmpd:
             static_root = pathlib.Path(tmpd)
             (static_root / "MyFile.PNG").write_bytes(b"PNGDATA")
-            parsed = urlparse("/api/static/myfile.png")
-            h = self._handler("/API/static/MyFile.PNG")
+            h = _FakeHandler()
+            # Non-API path: _fold_api_path leaves it untouched (and resets any
+            # prior _raw_api_path), so parsed.path carries the original case.
+            parsed = _fold_api_path(h, urlparse("/static/MyFile.PNG"))
+            assert getattr(h, "_raw_api_path", None) is None
             with patch("api.routes.api_config.get_static_root", return_value=static_root):
                 sent = {}
-                orig_wfile = h.wfile
 
                 class _W:
                     def write(self, b):
                         sent["body"] = b
 
                 h.wfile = _W()
-                result = _serve_static(h, parsed)
+                result = handle_get(h, parsed)
             assert result is True, "case-sensitive static file must be served"
             assert sent.get("body") == b"PNGDATA", f"wrong file served: {sent.get('body')!r}"
 
@@ -339,3 +336,92 @@ class TestDynamicCapturesPreserveCase:
         finally:
             kb._update_board_payload = orig
         assert captured.get("slug") == "MyBoard", f"slug corrupted: {captured.get('slug')!r}"
+
+
+class TestHandlerReuseAcrossKeepAliveRequests:
+    """#6589 re-gate: the handler instance is reused across HTTP/1.1 keep-alive
+    requests. API-only retained state (``_raw_api_path``) from an earlier
+    request must never leak into a later non-API request (dashboard-plugins
+    assets, static files). Regression for the review's stale raw-path bug.
+    """
+
+    @staticmethod
+    def _static_through_handle_get(handler, static_root, path, out):
+        parsed = _fold_api_path(handler, urlparse(path))
+        with patch("api.routes.api_config.get_static_root", return_value=static_root):
+            class _W:
+                def write(self, b):
+                    out["body"] = b
+
+            handler.wfile = _W()
+            return handle_get(handler, parsed)
+
+    def test_dashboard_plugins_after_api_request_uses_current_path(self):
+        """API request then dashboard-plugin asset on one connection: the asset
+        must be parsed from the CURRENT path, not a stale API path."""
+        import api.plugins as plugins_mod
+
+        handler = _FakeHandler()
+        # Request 1: /api/ request on this connection (leaves _raw_api_path set).
+        parsed1 = _fold_api_path(handler, urlparse("/API/Auth/Status"))
+        assert handler._raw_api_path == "/API/Auth/Status"
+        handle_get(handler, parsed1)  # dispatched normally
+        # Request 2: dashboard-plugin asset on the SAME connection.
+        parsed2 = _fold_api_path(
+            handler, urlparse("/dashboard-plugins/MyPlugin/dist/index.js")
+        )
+        assert getattr(handler, "_raw_api_path", None) is None, (
+            "non-API request must clear API-only retained state"
+        )
+        with patch("api.routes._dashboard_plugin_enabled", return_value=True), patch.object(
+            plugins_mod, "serve_plugin_static"
+        ) as serve:
+            serve.return_value = (b"// plugin", "application/javascript")
+            result = handle_get(handler, parsed2)
+        assert result is True
+        assert serve.call_count == 1
+        args = serve.call_args.args
+        assert args == ("MyPlugin", "dist/index.js"), (
+            f"stale API path leaked into dashboard-plugins routing: {args!r}"
+        )
+
+    def test_static_after_api_request_uses_current_path(self):
+        """API request then static file on one connection: only the second
+        request's path may drive the response."""
+        import pathlib
+        import tempfile
+
+        handler = _FakeHandler()
+        _fold_api_path(handler, urlparse("/API/Sessions/AbC/events"))  # API first
+        assert handler._raw_api_path == "/API/Sessions/AbC/events"
+        with tempfile.TemporaryDirectory() as tmpd:
+            static_root = pathlib.Path(tmpd)
+            (static_root / "MyFile.PNG").write_bytes(b"PNGDATA")
+            out = {}
+            result = self._static_through_handle_get(
+                handler, static_root, "/static/MyFile.PNG", out
+            )
+        assert result is True
+        assert out.get("body") == b"PNGDATA", f"wrong file served: {out.get('body')!r}"
+
+    def test_stale_api_static_path_cannot_affect_next_static_response(self):
+        """Negative case: a prior /api/static/<other> request must NOT change
+        what the next /static/<Y> request serves."""
+        import pathlib
+        import tempfile
+
+        handler = _FakeHandler()
+        _fold_api_path(handler, urlparse("/api/static/Other.png"))  # API first
+        assert handler._raw_api_path == "/api/static/Other.png"
+        with tempfile.TemporaryDirectory() as tmpd:
+            static_root = pathlib.Path(tmpd)
+            (static_root / "MyFile.PNG").write_bytes(b"PNGDATA")
+            (static_root / "Other.png").write_bytes(b"EVIL")
+            out = {}
+            result = self._static_through_handle_get(
+                handler, static_root, "/static/MyFile.PNG", out
+            )
+        assert result is True
+        assert out.get("body") == b"PNGDATA", (
+            f"stale /api/static path changed the static response: {out.get('body')!r}"
+        )
