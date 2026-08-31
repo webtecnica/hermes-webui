@@ -455,9 +455,10 @@ function applyLocaleToDOM() {
 
 // Apply saved locale immediately so there's no flash of English on reload.
 // Locale bundles register on globalThis.I18N_BUNDLES either before this file
-// (original order) or after it (defer order) — wait for DOMContentLoaded so
-// every bundle is registered regardless of script order.
-if (typeof document !== 'undefined' && document.readyState === 'loading') {
+// (original order) or after it (defer order). Deferred scripts run with
+// readyState already 'interactive', so gate on the DOMContentLoaded event —
+// it always fires after every deferred script has executed.
+if (typeof document !== 'undefined' && document.readyState !== 'complete') {
   document.addEventListener('DOMContentLoaded', loadLocale);
 } else {
   loadLocale();
