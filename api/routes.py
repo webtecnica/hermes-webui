@@ -28136,9 +28136,6 @@ def _handle_memory_write(handler, body):
     elif section == "user":
         if not user_profile_enabled:
             return bad(handler, "User profile is disabled by configuration (user_profile_enabled: false)", 403)
-    elif section == "soul":
-        if not memory_enabled:
-            return bad(handler, "Memory is disabled", 403)
     try:
         from api.profiles import get_active_hermes_home
 
