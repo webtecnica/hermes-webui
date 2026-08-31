@@ -323,7 +323,9 @@ function _i18nToolSummaryJoinCs(parts) {
 
 
 // Active locale — defaults to English; overridden by loadLocale() at boot.
-let _locale = LOCALES.en || null;
+// Keep it undefined (not null) until loaded: boot.js guards `_locale._speech`
+// with `typeof _locale !== 'undefined'`, which null would bypass.
+let _locale = LOCALES.en;
 
 /**
  * Resolve an incoming locale tag to a known LOCALES key.
@@ -398,9 +400,9 @@ function t(key, ...args) {
  */
 function setLocale(lang) {
   const resolved = resolveLocale(lang) || 'en';
-  _locale = LOCALES[resolved];
+  _locale = LOCALES[resolved] || LOCALES.en;
   try { localStorage.setItem('hermes-lang', resolved); } catch (_) {}
-  document.documentElement.lang = _locale._speech || resolved;
+  document.documentElement.lang = (_locale && _locale._speech) || resolved;
 }
 
 /**
