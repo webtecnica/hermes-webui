@@ -19329,30 +19329,6 @@ async function submitEdit(msgIdx, newText) {
   } catch(e) { setStatus(t('edit_failed') + e.message); }
 }
 
-async function regenerateResponse(btn) {
-  if(!S.session || S.busy) return;
-  const row=btn&&btn.closest&&btn.closest('[data-msg-idx]');
-  if(!row)return;
-  const clickedAbsoluteIndex=_oldestIdx+parseInt(row.dataset.msgIdx,10);
-  const initialSid = S.session.session_id;
-  if(typeof _ensureAllMessagesLoaded==='function'){
-    await _ensureAllMessagesLoaded();
-  }
-  if(!S.session || S.session.session_id !== initialSid) return;
-  if(!S.session.regeneration_revision){ setStatus(t('regen_failed')); return; }
-  let latestAssistantIndex=-1;
-  for(let i=S.messages.length-1;i>=0;i--){
-    if(S.messages[i]?.role==='assistant'){latestAssistantIndex=i;break;}
-  }
-  if(clickedAbsoluteIndex!==latestAssistantIndex){
-    setStatus(t('regen_failed'));
-    return;
-  }
-  try {
-    await startRegeneration(initialSid, S.session.regeneration_revision);
-  } catch(e) { setStatus(t('regen_failed') + e.message); }
-}
-
 // #6737: delete a message and everything after it. Reuses the same
 // /api/session/truncate machinery as edit/regenerate — truncating at this
 // message's absolute index removes it and all later messages, keeping the
@@ -19387,6 +19363,30 @@ async function deleteMessage(btn) {
     S.messages = S.messages.slice(0, absoluteKeepCount);
     renderMessages();
   } catch(e) { setStatus(t('delete_failed') + e.message); }
+}
+
+async function regenerateResponse(btn) {
+  if(!S.session || S.busy) return;
+  const row=btn&&btn.closest&&btn.closest('[data-msg-idx]');
+  if(!row)return;
+  const clickedAbsoluteIndex=_oldestIdx+parseInt(row.dataset.msgIdx,10);
+  const initialSid = S.session.session_id;
+  if(typeof _ensureAllMessagesLoaded==='function'){
+    await _ensureAllMessagesLoaded();
+  }
+  if(!S.session || S.session.session_id !== initialSid) return;
+  if(!S.session.regeneration_revision){ setStatus(t('regen_failed')); return; }
+  let latestAssistantIndex=-1;
+  for(let i=S.messages.length-1;i>=0;i--){
+    if(S.messages[i]?.role==='assistant'){latestAssistantIndex=i;break;}
+  }
+  if(clickedAbsoluteIndex!==latestAssistantIndex){
+    setStatus(t('regen_failed'));
+    return;
+  }
+  try {
+    await startRegeneration(initialSid, S.session.regeneration_revision);
+  } catch(e) { setStatus(t('regen_failed') + e.message); }
 }
 
 // postProcessRenderedMessages() runs one frame AFTER the render + JS scroll
