@@ -2247,6 +2247,29 @@ def _model_matches_picker_selection(
     return not selected_provider or not candidate_provider or selected_provider == candidate_provider
 
 
+def _openrouter_model_display_name(model_id: str) -> str:
+    """Return the OpenRouter display name (e.g. ``Ox Alpha``) for *model_id*.
+
+    Reads only the local shared metadata disk cache written by hermes-agent
+    (``cache/openrouter_model_metadata.json``) — never touches the network.
+    Falls back to the raw id when the model is unknown or the cache is
+    unavailable, so picker rows are always populated (#7228).
+    """
+    if not model_id:
+        return model_id
+    try:
+        from agent.model_metadata import _load_model_metadata_disk_cache
+
+        cache = _load_model_metadata_disk_cache() or {}
+    except Exception:
+        return model_id
+    entry = cache.get(model_id)
+    if not isinstance(entry, dict):
+        return model_id
+    name = str(entry.get("name") or "").strip()
+    return name or model_id
+
+
 def _split_picker_overflow_models(
     ordered_models: list[dict],
     *,
@@ -7790,7 +7813,13 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                         for mid, _desc in live_curated:
                             if mid and mid not in seen_ids:
                                 seen_ids.add(mid)
-                                raw_models.append({"id": mid, "label": mid})
+                                # Ship the friendly display name (e.g. "Ox Alpha")
+                                # from the local OpenRouter metadata cache instead
+                                # of the raw id, so the picker search matches what
+                                # users see in Hermes Desktop (#7228).
+                                raw_models.append(
+                                    {"id": mid, "label": _openrouter_model_display_name(mid)}
+                                )
                     except Exception:
                         logger.warning("Failed to load OpenRouter curated catalog from hermes_cli")
 

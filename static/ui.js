@@ -4572,10 +4572,16 @@ function renderModelDropdown(){
     else if(_prevHasSearch){ for(const k in _groupOpenState) delete _groupOpenState[k]; }
     _prevHasSearch=hasSearch;
     const found=new Set();
+    // Fold whitespace/hyphens/dots on both sides so "ox alpha", "ox-alpha" and
+    // "ox.alpha" all match the same model (OpenRouter display names use spaces,
+    // ids use slashes/hyphens) (#7228).
+    const _foldModelSearch=(s)=>String(s||'').toLowerCase().replace(/[\s._-]+/g,'');
+    const foldTerm=_foldModelSearch(term);
     for(const m of _modelData){
       const name=m.name.toLowerCase();
       const id=m.id.toLowerCase();
-      if(name.includes(term)||id.includes(term)){
+      if(name.includes(term)||id.includes(term)
+         ||_foldModelSearch(name).includes(foldTerm)||_foldModelSearch(id).includes(foldTerm)){
         found.add(m.value);
       }
     }
