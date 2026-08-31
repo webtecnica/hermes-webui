@@ -323,9 +323,9 @@ function _i18nToolSummaryJoinCs(parts) {
 
 
 // Active locale — defaults to English; overridden by loadLocale() at boot.
-// Keep it undefined (not null) until loaded: boot.js guards `_locale._speech`
-// with `typeof _locale !== 'undefined'`, which null would bypass.
-let _locale = LOCALES.en;
+// Init as a plain object (never null/undefined) so boot.js guards on
+// `typeof _locale !== 'undefined'` stay intact while `_locale[key]` is safe.
+let _locale = LOCALES.en || {};
 
 /**
  * Resolve an incoming locale tag to a known LOCALES key.
@@ -381,7 +381,7 @@ function resolvePreferredLocale(primary, fallback) {
  * @returns {string}
  */
 function t(key, ...args) {
-  const val = (_locale && _locale[key]) ?? (LOCALES.en && LOCALES.en[key]);
+  const val = _locale[key] ?? LOCALES.en[key];
   if (val === undefined) return key;  // final fallback: return key itself
   if (typeof val === 'function') return val(...args);
   if (args.length) {
