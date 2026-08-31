@@ -13991,6 +13991,14 @@ def handle_get(handler, parsed) -> bool:
                     msg_before=msg_before,
                     expand_renderable=expand_renderable,
                 )
+            else:
+                # ?messages=0 (metadata-only fast switch) must NOT empty the
+                # message payload for foreign sessions: the legacy contract
+                # returned the full synthesized transcript unconditionally
+                # (test_claude_code_profile_agnostic_detail_load expects the
+                # 2 messages even with messages=0). The windowing applies only
+                # to real message loads (#6491).
+                _truncated_msgs = list(msgs)
             sess = {
                 "session_id": synth.session_id,
                 "title": synth.title,
