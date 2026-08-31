@@ -1,14 +1,15 @@
 // ── i18n: locale bundles and t() helper ──────────────────────────────────────
 // Translations live in per-language files under static/locales/ (issue #6652):
 //   static/locales/en.js, static/locales/zh.js, ...
-// Each file registers its bundle on globalThis.I18N_BUNDLES. The locale files
-// MUST be loaded BEFORE this file — index.html lists them as `defer` scripts,
-// and `defer` preserves execution order.
+// Each file registers its bundle on globalThis.I18N_BUNDLES. This runtime is
+// order-independent: locale bundles may register before OR after this file
+// (defer scripts preserve document order, but loadLocale() below waits for
+// DOMContentLoaded so all bundles are registered regardless).
 // To add a new language: create static/locales/<lang>.js (registering its
-// bundle) and add a <script> tag for it in index.html before this file.
+// bundle) and add a <script> tag for it in index.html.
 // Keys missing in a non-English locale fall back to English automatically.
 
-const LOCALES = globalThis.I18N_BUNDLES || {};
+const LOCALES = globalThis.I18N_BUNDLES || (globalThis.I18N_BUNDLES = {});
 
 const _I18N_TOOL_ACTION_TEXT_EN = {
     shell: { running: 'Running', done: 'Ran', fail: 'run', fallback: 'a command' },
@@ -322,7 +323,7 @@ function _i18nToolSummaryJoinCs(parts) {
 
 
 // Active locale — defaults to English; overridden by loadLocale() at boot.
-let _locale = LOCALES.en;
+let _locale = LOCALES.en || null;
 
 /**
  * Resolve an incoming locale tag to a known LOCALES key.
@@ -378,7 +379,7 @@ function resolvePreferredLocale(primary, fallback) {
  * @returns {string}
  */
 function t(key, ...args) {
-  const val = _locale[key] ?? LOCALES.en[key];
+  const val = (_locale && _locale[key]) ?? (LOCALES.en && LOCALES.en[key]);
   if (val === undefined) return key;  // final fallback: return key itself
   if (typeof val === 'function') return val(...args);
   if (args.length) {
@@ -453,4 +454,11 @@ function applyLocaleToDOM() {
 }
 
 // Apply saved locale immediately so there's no flash of English on reload.
-loadLocale();
+// Locale bundles register on globalThis.I18N_BUNDLES either before this file
+// (original order) or after it (defer order) — wait for DOMContentLoaded so
+// every bundle is registered regardless of script order.
+if (typeof document !== 'undefined' && document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', loadLocale);
+} else {
+  loadLocale();
+}

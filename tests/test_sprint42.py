@@ -22,6 +22,7 @@ from tests._i18n_bundles import read_i18n_bundles
 
 REPO_ROOT = pathlib.Path(__file__).parent.parent
 STREAMING_PY = (REPO_ROOT / "api" / "streaming.py").read_text(encoding="utf-8")
+STATIC = REPO_ROOT / "static"
 
 
 # ── Shared helpers for sprint-42 additional tests ────────────────────────────

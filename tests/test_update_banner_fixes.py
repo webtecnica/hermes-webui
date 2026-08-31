@@ -26,6 +26,8 @@ import functools
 
 import pytest
 
+from tests._i18n_bundles import read_i18n_bundles
+
 REPO = pathlib.Path(__file__).parent.parent
 
 

@@ -1,5 +1,7 @@
 """Test: Excalidraw inline embed (#479)"""
 import re
+from pathlib import Path
+
 from tests._i18n_bundles import read_i18n_bundles
 
 
