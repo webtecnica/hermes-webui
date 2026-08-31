@@ -10,6 +10,10 @@
 // Keys missing in a non-English locale fall back to English automatically.
 
 const LOCALES = globalThis.I18N_BUNDLES || (globalThis.I18N_BUNDLES = {});
+// English is the guaranteed fallback in t(); ensure the key always exists so
+// `_locale[key] ?? LOCALES.en[key]` never dereferences undefined. Real locale
+// files overwrite this placeholder via Object.assign on load.
+if (!LOCALES.en) LOCALES.en = {};
 
 const _I18N_TOOL_ACTION_TEXT_EN = {
     shell: { running: 'Running', done: 'Ran', fail: 'run', fallback: 'a command' },
@@ -460,7 +464,7 @@ function applyLocaleToDOM() {
 // (original order) or after it (defer order). Deferred scripts run with
 // readyState already 'interactive', so gate on the DOMContentLoaded event —
 // it always fires after every deferred script has executed.
-if (typeof document !== 'undefined' && document.readyState !== 'complete') {
+if (typeof document !== 'undefined' && typeof document.addEventListener === 'function' && document.readyState !== 'complete') {
   document.addEventListener('DOMContentLoaded', loadLocale);
 } else {
   loadLocale();
