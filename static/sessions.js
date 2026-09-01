@@ -6667,12 +6667,13 @@ function _serverTzOptions() {
   // numeric offset (e.g. "+0800" → "Etc/GMT-8"). The IANA name lets
   // Intl.DateTimeFormat resolve the correct offset PER INSTANT, so DST
   // transitions are handled automatically and a configured-UTC zone renders
-  // as UTC (review #7155). Falls back to undefined (browser timezone) when:
+  // as UTC (review #7155). Falls back to undefined (browser timezone) only
+  // when the server tz is absent or malformed:
   //   - neither _serverTzName nor _serverTz is set
-  //   - _serverTz is UTC, malformed, or has a fractional-hour component
-  //     (India +0530, Iran +0330, Newfoundland -0330, Nepal +0545, etc.) —
-  //     IANA Etc/GMT zones cannot express half/quarter-hour offsets; use
-  //     _formatInServerTz() instead for correct fractional-offset formatting.
+  //   - _serverTz has a fractional-hour component (India +0530, Iran +0330,
+  //     Newfoundland -0330, Nepal +0545, etc.) — IANA Etc/GMT zones cannot
+  //     express half/quarter-hour offsets; use _formatInServerTz() instead
+  //     for correct fractional-offset formatting.
   if (_serverTzName) {
     try {
       // Validate the IANA name by letting Intl parse it; invalid names throw.
@@ -6682,7 +6683,10 @@ function _serverTzOptions() {
       // fall through to the numeric-offset path
     }
   }
-  if (!_serverTz || _serverTz === '+0000' || _serverTz === '-0000') return undefined;
+  if (!_serverTz) return undefined;
+  // Explicit server UTC (offset-only payload, no IANA name) must render as
+  // UTC, NOT the browser's local zone (review #7155 bug 3).
+  if (_serverTz === '+0000' || _serverTz === '-0000') return { timeZone: 'UTC' };
   const m = _serverTz.match(/^([+-])(\d{2})(\d{2})$/);
   if (!m) return undefined;
   if (m[3] !== '00') return undefined;  // fractional offset — caller must use _formatInServerTz
@@ -6705,7 +6709,7 @@ function _formatInServerTz(date, options) {
   // timezone. Handles fractional-hour offsets that Etc/GMT cannot express.
   //
   // Final fallback: plain `date.toLocaleString(undefined, options)` (browser
-  // timezone) when the server tz is absent, UTC, or malformed.
+  // timezone) when the server tz is absent or malformed.
   if (_serverTzName) {
     try {
       return new Intl.DateTimeFormat(undefined, { ...options, timeZone: _serverTzName })
@@ -6714,8 +6718,11 @@ function _formatInServerTz(date, options) {
       // invalid IANA name — fall through to the offset path
     }
   }
-  if (!_serverTz || _serverTz === '+0000' || _serverTz === '-0000') {
-    return date.toLocaleString(undefined, options);
+  if (!_serverTz) return date.toLocaleString(undefined, options);
+  // Explicit server UTC (offset-only payload, no IANA name) must render as
+  // UTC, NOT the browser's local zone (review #7155 bug 3).
+  if (_serverTz === '+0000' || _serverTz === '-0000') {
+    return new Intl.DateTimeFormat(undefined, { ...options, timeZone: 'UTC' }).format(date);
   }
   const m = _serverTz.match(/^([+-])(\d{2})(\d{2})$/);
   if (!m) return date.toLocaleString(undefined, options);

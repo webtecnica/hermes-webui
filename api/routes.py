@@ -2658,13 +2658,21 @@ def _server_tz_info() -> dict:
     if not name:
         # Some tzinfo objects (fixed offsets) have no IANA key — derive a
         # stable Etc/GMT name from the numeric offset so the browser still
-        # gets a timeZone it can apply.
+        # gets a timeZone it can apply. Only whole-hour offsets map cleanly
+        # (Etc/GMT uses inverted sign: UTC+8 → "Etc/GMT-8"); a zero offset is
+        # simply "UTC". Fractional offsets (e.g. +0530) have no Etc/GMT
+        # equivalent, so leave the name empty and let the client fall back to
+        # the numeric-offset shift, which handles them correctly.
         try:
-            _m = re.match(r"([+-])(\d{2})(\d{2})", offset)
+            _m = re.match(r"([+-])(\d{1,2})(?::?(\d{2}))?", offset)
             if _m:
-                _sign = "-" if _m.group(1) == "+" else "+"
-                _hours = str(int(_m.group(2)))
-                name = f"Etc/GMT{_sign}{_hours}"
+                _hours = int(_m.group(2))
+                _mins = int(_m.group(3) or 0)
+                if _mins == 0:
+                    if _hours == 0:
+                        name = "UTC"
+                    else:
+                        name = f"Etc/GMT{'-' if _m.group(1) == '+' else '+'}{_hours}"
         except Exception:
             name = ""
     if not offset:
