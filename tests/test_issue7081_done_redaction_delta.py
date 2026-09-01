@@ -210,6 +210,41 @@ def test_active_turn_token_change_falls_back_to_full_redaction(monkeypatch):
     assert result == redact_session_data(raw2)
 
 
+def test_redaction_toggle_never_reuses_prefix_from_other_settings(monkeypatch):
+    """A mid-session api_redact_enabled toggle must not reuse a cached prefix.
+
+    The dangerous direction: the prefix is cached while redaction is DISABLED
+    (raw content), then redaction is re-enabled. Reusing that raw prefix would
+    leak unredacted credentials into the done payload, so the next pass must
+    re-redact the whole transcript under the new setting.
+    """
+    calls = _counting_projection(monkeypatch)
+
+    settings = {"api_redact_enabled": False}
+    monkeypatch.setattr("api.config.load_settings", lambda: settings)
+
+    base = [_message("user", f"q{i}", ts=i) for i in range(20)]
+    base.append(_message("assistant", "secret sk-1234567890abcdef", ts=20))
+    session = _session(base)
+    raw = _session_payload_with_full_messages(session, tool_calls=[])
+    first = _redact_settled_session_payload(raw, session)
+    assert calls["n"] == 21  # cold pass; redaction disabled -> raw cached prefix
+    assert "sk-1234567890abcdef" in str(first["messages"])
+
+    # Redaction re-enabled mid-session: the cached prefix was produced under
+    # api_redact_enabled=False, so it must NOT be reused.
+    settings["api_redact_enabled"] = True
+    grown = base + [_message("assistant", "next", ts=21)]
+    session2 = _session(grown)
+    raw2 = _session_payload_with_full_messages(session2, tool_calls=[])
+    calls["n"] = 0
+    second = _redact_settled_session_payload(raw2, session2)
+
+    assert calls["n"] == 22  # full pass under the new setting, not a delta reuse
+    assert second == redact_session_data(raw2)
+    assert "sk-1234567890abcdef" not in str(second["messages"])  # no raw leak
+
+
 def test_cache_stays_bounded_across_sessions():
     for idx in range(_DONE_REDACTION_CACHE_MAX + 4):
         session = _session(

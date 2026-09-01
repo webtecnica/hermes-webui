@@ -245,8 +245,9 @@ def _redact_settled_session_payload(raw_session: dict, session: object) -> dict:
     redaction work is limited to messages appended since this session's
     previous settled turn, reusing the cached redacted prefix. Falls back to a
     full ``redact_session_data`` pass whenever the prefix cannot be proven
-    unchanged (first turn, compaction, retry truncation, eviction, or a
-    mismatched active-turn token). See ``_DONE_REDACTION_CACHE``.
+    unchanged (first turn, compaction, retry truncation, eviction, an
+    ``api_redact_enabled`` toggle, or a mismatched active-turn token). See
+    ``_DONE_REDACTION_CACHE``.
     """
     session_id = getattr(session, 'session_id', None)
     profile = getattr(session, 'profile', None)
@@ -257,11 +258,19 @@ def _redact_settled_session_payload(raw_session: dict, session: object) -> dict:
         raw_session.get('active_stream_id'),
         raw_session.get('pending_started_at'),
     )
+    # Mirror redact_session_data's settings read exactly: a mid-session toggle
+    # of api_redact_enabled must invalidate the cached prefix, because a prefix
+    # produced under different settings (notably redaction disabled) can never
+    # be proven safe to reuse. Local import keeps this consistent with
+    # api/helpers.py and monkeypatchable in tests.
+    from api.config import load_settings
+    _enabled = bool(load_settings().get("api_redact_enabled", True))
     cache_key = (profile, session_id)
     with _DONE_REDACTION_LOCK:
         entry = _DONE_REDACTION_CACHE.get(cache_key)
     cache_hit = (
         entry is not None
+        and entry.get('enabled') == _enabled
         and entry.get('active_turn_token') == active_turn_token
         and 0 < entry['count'] <= len(messages)
         and len(entry['redacted']) == entry['count']
@@ -291,6 +300,7 @@ def _redact_settled_session_payload(raw_session: dict, session: object) -> dict:
             # payload's messages list without corrupting the cached prefix.
             'redacted': list(redacted_messages),
             'active_turn_token': active_turn_token,
+            'enabled': _enabled,
             'approx_bytes': prev_bytes + delta_bytes + 1024,
         }
         with _DONE_REDACTION_LOCK:
