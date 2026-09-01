@@ -120,9 +120,19 @@ def test_missing_key_short_circuits_healthcheck_to_healthy():
             f"{fname}: hermes-agent must define a healthcheck"
         )
         test_cmd = " ".join(agent["healthcheck"]["test"])
-        # The healthcheck must short-circuit when API_SERVER_KEY is empty
-        assert "[ -z \"${API_SERVER_KEY}\" ]" in test_cmd, (
-            f"{fname}: healthcheck must short-circuit when API_SERVER_KEY is empty"
+        # The healthcheck must short-circuit when API_SERVER_KEY is empty.
+        # The double-$$ escape is deliberate: Compose must NOT interpolate the
+        # key at config time (that would bake the secret into `docker inspect`
+        # and read the host env instead of the container's runtime env) — the
+        # shell evaluates $API_SERVER_KEY inside the container on each run.
+        assert "[ -z \"$$API_SERVER_KEY\" ]" in test_cmd, (
+            f"{fname}: healthcheck must short-circuit when API_SERVER_KEY is empty "
+            "(escaped as $$ so the container runtime env is evaluated)"
+        )
+        assert "${API_SERVER_KEY}" not in test_cmd, (
+            f"{fname}: healthcheck must not use an unescaped ${API_SERVER_KEY} — "
+            "Compose would interpolate it at config time and bake the key into "
+            "docker inspect"
         )
         # The real probe must still be present for when a key IS configured
         assert "8642" in test_cmd, (
