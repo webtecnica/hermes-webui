@@ -169,7 +169,23 @@ load_env() {
   obfuscate_part="${ENV_OBFUSCATE_PART}"
   if [ -f "$tocheck" ]; then
     echo "-- Loading environment variables from $tocheck (overwrite existing: $overwrite_if_different) (ignorelist: $ignore_list) (obfuscate: $obfuscate_part)"
-    while IFS='=' read -r key value; do
+    # Read whole lines, then split at the FIRST '=' only. Splitting on every
+    # '=' (IFS='=' read -r key value) makes read drop a single trailing '='
+    # from values, corrupting secrets such as openssl rand -base64 32 output
+    # (44 chars ending in '=').
+    while IFS= read -r line; do
+      # Skip empty lines and comment lines.
+      case "$line" in
+        ''|\#*) continue ;;
+      esac
+      if [[ "$line" == *=* ]]; then
+        key=${line%%=*}
+        value=${line#*=}
+      else
+        # Line without '=': whole line is the key with an empty value.
+        key=$line
+        value=
+      fi
       doit=false
       # checking if the key is in the ignorelist
       for i in $ignore_list; do
