@@ -121,3 +121,38 @@ def test_local_venv_is_created_with_symlinks(monkeypatch, tmp_path):
             pass  # expected — fake _python_can_run_webui_and_agent always returns False
 
         mock_builder.assert_called_once_with(with_pip=True, symlinks=True)
+
+
+def test_python_can_run_webui_and_agent_script_imports_agent_first():
+    """#7831: On PM installs, agent import can switch interpreters. Agent must import first."""
+    import inspect
+    src = inspect.getsource(bootstrap._python_can_run_webui_and_agent)
+    agent_pos = src.find("from run_agent import AIAgent")
+    yaml_pos = src.find("import yaml")
+    assert agent_pos >= 0
+    assert yaml_pos >= 0
+    assert agent_pos < yaml_pos, "AIAgent import must precede yaml import to survive PM interpreter switch"
+
+
+def test_ensure_python_discovers_pm_managed_env_python(monkeypatch, tmp_path):
+    """#7831: PM-managed installs in ~/.hermes/installs/*/environments/*/venv must be discovered."""
+    agent_dir = tmp_path / "hermes-agent"
+    agent_dir.mkdir(parents=True)
+    pm_python = tmp_path / "installs" / "gen1" / "environments" / "e1" / "venv" / "bin" / "python"
+    pm_python.parent.mkdir(parents=True)
+    pm_python.write_text("", encoding="utf-8")
+
+    local_python = tmp_path / "webui" / ".venv" / "bin" / "python"
+
+    probes = []
+
+    def fake_can_run(python_exe: str, check_agent_dir: pathlib.Path | None = None) -> bool:
+        probes.append(pathlib.Path(python_exe))
+        return pathlib.Path(python_exe) == pm_python
+
+    monkeypatch.setattr(bootstrap, "_python_can_run_webui_and_agent", fake_can_run)
+
+    selected = bootstrap.ensure_python_has_webui_deps(str(local_python), agent_dir)
+    assert selected == str(pm_python)
+    assert pm_python in probes
+

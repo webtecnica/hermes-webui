@@ -99,6 +99,30 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
+# #7831: after an interpreter switch via hermes_bootstrap or runpy.run_path,
+# sys.path[0] may be reordered or truncated. Ensure server.py's own directory is on sys.path.
+_server_dir = os.path.dirname(os.path.abspath(__file__))
+if _server_dir not in sys.path:
+    sys.path.insert(0, _server_dir)
+
+_agent_dir = os.path.join(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")), "hermes-agent")
+if os.path.isfile(os.path.join(_agent_dir, "run_agent.py")):
+    if _agent_dir not in sys.path:
+        sys.path.insert(0, _agent_dir)
+try:
+    import yaml
+except ImportError:
+    try:
+        import hermes_bootstrap  # activates PM dependency env (may relaunch the process)
+    except Exception:
+        pass
+    if _server_dir not in sys.path:
+        sys.path.insert(0, _server_dir)
+    try:
+        import yaml
+    except ImportError:
+        pass
+
 from api.request_logging import emit_request_log
 from api.auth import check_auth_or_close, reset_trusted_auth_request_state
 from api.config import HOST, PORT, STATE_DIR, SESSION_DIR, DEFAULT_WORKSPACE

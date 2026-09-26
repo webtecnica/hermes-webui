@@ -233,6 +233,31 @@ def discover_agent_dir() -> Path | None:
     return _agent_dir_from_python(discover_launcher_python(None))
 
 
+def _find_pm_store_pythons(agent_dir: Path | None) -> list[Path]:
+    """Find PM-managed virtualenv Python candidates for Hermes Agent (#7831)."""
+    candidates: list[Path] = []
+    if not agent_dir:
+        return candidates
+    hermes_root = (
+        agent_dir.parent
+        if agent_dir.name in ("hermes-agent", "agent")
+        else Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
+    )
+    for base in (agent_dir, hermes_root):
+        installs = base / "installs"
+        if installs.is_dir():
+            try:
+                for p in installs.glob("*/environments/*/venv/bin/python"):
+                    if p.is_file():
+                        candidates.append(p)
+                for p in installs.glob("*/environments/*/venv/Scripts/python.exe"):
+                    if p.is_file():
+                        candidates.append(p)
+            except Exception:
+                pass
+    return candidates
+
+
 def discover_launcher_python(agent_dir: Path | None) -> str:
     env_python = os.getenv("HERMES_WEBUI_PYTHON")
     if env_python:
@@ -242,6 +267,9 @@ def discover_launcher_python(agent_dir: Path | None) -> str:
             candidate = agent_dir / rel
             if candidate.exists():
                 return str(candidate)
+        for pm_candidate in _find_pm_store_pythons(agent_dir):
+            if pm_candidate.exists():
+                return str(pm_candidate)
     for rel in (".venv/bin/python", ".venv/Scripts/python.exe"):
         candidate = REPO_ROOT / rel
         if candidate.exists():
@@ -250,7 +278,9 @@ def discover_launcher_python(agent_dir: Path | None) -> str:
 
 
 def _python_can_run_webui_and_agent(python_exe: str, agent_dir: Path | None = None) -> bool:
-    script = "import yaml\nfrom run_agent import AIAgent\n"
+    # #7831: on PM-managed installs, importing run_agent can switch interpreters mid-process.
+    # The agent import must run FIRST; third-party deps like yaml must be imported afterwards.
+    script = "from run_agent import AIAgent\nimport yaml\n"
     env = os.environ.copy()
     if agent_dir:
         # PREPEND agent_dir to PYTHONPATH so an `agent_dir/run_agent.py` wins
@@ -293,6 +323,7 @@ def ensure_python_has_webui_deps(python_exe: str, agent_dir: Path | None = None)
             ".venv/Scripts/python.exe",
         ):
             agent_candidates.append(agent_dir / rel)
+        agent_candidates.extend(_find_pm_store_pythons(agent_dir))
         for candidate in agent_candidates:
             if str(candidate) != python_exe and candidate.exists():
                 if _python_can_run_webui_and_agent(str(candidate), agent_dir):
