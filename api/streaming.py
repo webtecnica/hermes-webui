@@ -8404,6 +8404,57 @@ def _live_usage_session_snapshot(session_id, current_session, cache_ref, *, load
     return loaded
 
 
+def _is_tool_error(raw) -> bool:
+    """Determine whether a tool execution result indicates failure.
+
+    Checks structured result metadata conservatively:
+    - Exception instance: True
+    - Dict or parsed JSON object:
+      - is_error is explicit bool
+      - success is False or ok is False
+      - status is in {'error', 'failed', 'failure'}
+      - exit_code / returncode / exit_status is non-zero int (and not bool)
+      - error / errors field is non-empty/truthy (and not False/None)
+    """
+    if raw is None:
+        return False
+    if isinstance(raw, Exception):
+        return True
+    data = None
+    if isinstance(raw, dict):
+        data = raw
+    elif isinstance(raw, str):
+        trimmed = raw.strip()
+        if trimmed.startswith('{') and trimmed.endswith('}'):
+            try:
+                parsed = json.loads(trimmed)
+                if isinstance(parsed, dict):
+                    data = parsed
+            except Exception:
+                pass
+    if isinstance(data, dict):
+        if data.get('is_error') is not None:
+            return bool(data.get('is_error'))
+        if data.get('success') is False or data.get('ok') is False:
+            return True
+        status = str(data.get('status') or '').strip().lower()
+        if status in {'error', 'failed', 'failure'}:
+            return True
+        for exit_key in ('exit_code', 'returncode', 'exit_status'):
+            val = data.get(exit_key)
+            if isinstance(val, int) and not isinstance(val, bool) and val != 0:
+                return True
+        if data.get('success') is True or data.get('ok') is True or status in {'success', 'ok', 'completed'}:
+            return False
+        err = data.get('error')
+        if err is not None and err is not False and err != "":
+            return True
+        errs = data.get('errors')
+        if errs is not None and errs is not False and errs != "" and errs != []:
+            return True
+    return False
+
+
 def _tool_result_snippet(raw, limit: int = _TOOL_RESULT_SNIPPET_MAX) -> str:
     """Extract a bounded result preview from a stored tool message payload."""
     if limit <= 0:
@@ -8412,7 +8463,10 @@ def _tool_result_snippet(raw, limit: int = _TOOL_RESULT_SNIPPET_MAX) -> str:
     try:
         data = raw if isinstance(raw, dict) else json.loads(text)
         if isinstance(data, dict):
-            preview = data.get('output') or data.get('result') or data.get('error') or text
+            if _is_tool_error(data) and (data.get('error') or data.get('errors') or data.get('message')):
+                preview = data.get('error') or data.get('errors') or data.get('message')
+            else:
+                preview = data.get('output') or data.get('result') or data.get('error') or text
             text = str(preview)
     except Exception:
         pass
@@ -11060,13 +11114,18 @@ def _run_agent_streaming(
                     return
 
                 if event_type == 'tool.completed':
+                    is_err = (
+                        bool(cb_kwargs.get('is_error'))
+                        or _is_tool_error(cb_kwargs.get('result'))
+                        or _is_tool_error(preview)
+                    )
                     for live_tc in reversed(_live_tool_calls):
                         if live_tc.get('done'):
                             continue
                         if not name or live_tc.get('name') == name:
                             live_tc['done'] = True
                             live_tc['duration'] = cb_kwargs.get('duration')
-                            live_tc['is_error'] = bool(cb_kwargs.get('is_error', False))
+                            live_tc['is_error'] = is_err
                             break
                     # Mirror done state to shared dict (#1361 §B)
                     if stream_id in STREAM_LIVE_TOOL_CALLS:
@@ -11076,7 +11135,7 @@ def _run_agent_streaming(
                             if not name or shared_tc.get('name') == name:
                                 shared_tc['done'] = True
                                 shared_tc['duration'] = cb_kwargs.get('duration')
-                                shared_tc['is_error'] = bool(cb_kwargs.get('is_error', False))
+                                shared_tc['is_error'] = is_err
                                 break
                     # Signal the checkpoint thread that new work has completed (Issue #765).
                     # Each completed tool call is a meaningful unit of progress worth persisting.
@@ -11087,7 +11146,7 @@ def _run_agent_streaming(
                         'preview': preview,
                         'args': args_snap,
                         'duration': cb_kwargs.get('duration'),
-                        'is_error': bool(cb_kwargs.get('is_error', False)),
+                        'is_error': is_err,
                     })
                     # Mirror the todo tool's in-memory state into a
                     # dedicated SSE event so the Todos panel can update
@@ -11163,12 +11222,14 @@ def _run_agent_streaming(
                     if tool_call_id and tool_call_id not in _live_tool_event_complete_ids:
                         _live_tool_event_complete_ids.add(tool_call_id)
                         result_snippet = _tool_result_snippet(function_result)
+                        is_err = _is_tool_error(function_result)
                         for live_tc in reversed(_live_tool_calls):
                             if live_tc.get('done'):
                                 continue
                             if live_tc.get('tid') == tool_call_id or (not live_tc.get('tid') and live_tc.get('name') == name):
                                 live_tc['done'] = True
                                 live_tc['snippet'] = result_snippet
+                                live_tc['is_error'] = is_err
                                 break
                         if stream_id in STREAM_LIVE_TOOL_CALLS:
                             for shared_tc in reversed(STREAM_LIVE_TOOL_CALLS[stream_id]):
@@ -11177,6 +11238,7 @@ def _run_agent_streaming(
                                 if shared_tc.get('tid') == tool_call_id or (not shared_tc.get('tid') and shared_tc.get('name') == name):
                                     shared_tc['done'] = True
                                     shared_tc['snippet'] = result_snippet
+                                    shared_tc['is_error'] = is_err
                                     break
                         _checkpoint_activity[0] += 1
                         put('tool_complete', {
@@ -11185,7 +11247,7 @@ def _run_agent_streaming(
                             'preview': result_snippet,
                             'args': _tool_args_snapshot(args),
                             'tid': tool_call_id,
-                            'is_error': False,
+                            'is_error': is_err,
                         })
                         # Mirror the todo tool's in-memory state into
                         # a dedicated SSE event so the Todos panel can

@@ -528,6 +528,8 @@ def _gateway_tool_progress_event(payload: dict) -> tuple[str, dict] | None:
     status = str(payload.get("status") or "running").strip().lower()
     tid = payload.get("toolCallId") or payload.get("tool_call_id") or payload.get("id")
     is_complete = event_type == "tool.completed" or status in {"completed", "complete", "success", "error", "failed"}
+    from api.streaming import _is_tool_error
+    is_err = bool(payload.get("error")) or status in {"error", "failed"} or _is_tool_error(payload.get("result"))
     event_payload = {
         "event_type": "tool.completed" if is_complete else "tool.started",
         "name": name,
@@ -535,7 +537,7 @@ def _gateway_tool_progress_event(payload: dict) -> tuple[str, dict] | None:
         "args": bound_run_journal_snapshot_args(payload.get("args"))
         if isinstance(payload.get("args"), dict)
         else {},
-        "is_error": bool(payload.get("error")) or status in {"error", "failed"},
+        "is_error": is_err,
     }
     if tid:
         event_payload["tid"] = str(tid)
