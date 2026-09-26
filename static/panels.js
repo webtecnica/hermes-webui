@@ -8775,6 +8775,8 @@ function _preferencesPayloadFromUi(){
   const payload={};
   const sendKeySel=$('settingsSendKey');
   if(sendKeySel) payload.send_key=sendKeySel.value;
+  const imeEnterSendsCb=$('settingsImeEnterSends');
+  if(imeEnterSendsCb) payload.ime_enter_sends=imeEnterSendsCb.checked;
   const langSel=$('settingsLanguage');
   if(langSel) payload.language=langSel.value;
   const showUsageCb=$('settingsShowTokenUsage');
@@ -8934,6 +8936,7 @@ function _setPreferencesAutosaveStatus(state,owner){
 function _rememberPreferencesSaved(payload){
   if(!payload) return;
   if(payload.send_key!==undefined) localStorage.setItem('hermes-pref-send_key',payload.send_key);
+  if(payload.ime_enter_sends!==undefined) localStorage.setItem('hermes-pref-ime_enter_sends',payload.ime_enter_sends?'true':'false');
   if(payload.language!==undefined) localStorage.setItem('hermes-pref-language',payload.language);
 }
 
@@ -9399,6 +9402,8 @@ async function loadSettingsPanel(){
     // Send key preference
     const sendKeySel=$('settingsSendKey');
     if(sendKeySel){sendKeySel.value=settings.send_key||'enter';sendKeySel.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
+    const imeEnterSendsCb=$('settingsImeEnterSends');
+    if(imeEnterSendsCb){imeEnterSendsCb.checked=!!settings.ime_enter_sends;imeEnterSendsCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     // Language preference — populate from LOCALES bundle
     const langSel=$('settingsLanguage');
     if(langSel){
@@ -12862,6 +12867,8 @@ async function saveSettings(andClose){
   Object.assign(body,_speechPreferencesPayloadFromUi());
 
   if(sendKey) body.send_key=sendKey;
+  const imeEnterSends=!!($('settingsImeEnterSends')||{}).checked;
+  body.ime_enter_sends=imeEnterSends;
   body.theme=theme;
   body.skin=skin;
   body.font_size=fontSize;

@@ -1198,6 +1198,13 @@
               </select>
             </div>
             <div class="settings-field">
+              <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+                <input type="checkbox" id="settingsImeEnterSends" style="width:15px;height:15px;accent-color:var(--accent)">
+                <span data-i18n="settings_label_ime_enter_sends">Send message on IME Enter (Korean Hangul)</span>
+              </label>
+              <div style="font-size:11px;color:var(--muted);margin-top:4px" data-i18n="settings_desc_ime_enter_sends">Bypasses the IME composition guard on Enter. Recommended for Korean IME users so the final syllable sends without pressing Enter twice. Leave disabled for Chinese/Japanese candidate selection.</div>
+            </div>
+            <div class="settings-field">
               <label for="settingsLanguage" data-i18n="settings_label_language">Language</label>
               <select id="settingsLanguage" style="width:100%;padding:8px;background:var(--code-bg);color:var(--text);border:1px solid var(--border2);border-radius:6px"></select>
             </div>

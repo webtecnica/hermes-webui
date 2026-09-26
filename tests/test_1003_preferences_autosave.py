@@ -36,6 +36,7 @@ def _load_settings_panel_block() -> str:
 PREFERENCE_FIELDS_AUTOSAVE = [
     # (DOM id, field name in _preferencesPayloadFromUi)
     ("settingsSendKey", "send_key"),
+    ("settingsImeEnterSends", "ime_enter_sends"),
     ("settingsLanguage", "language"),
     ("settingsShowTokenUsage", "show_token_usage"),
     ("settingsShowConversationOutline", "show_conversation_outline"),

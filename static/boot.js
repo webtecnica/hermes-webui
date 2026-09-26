@@ -2377,8 +2377,12 @@ let _imeComposing=false;
   _c.addEventListener('compositionstart',()=>{_imeComposing=true;});
   _c.addEventListener('compositionend',()=>{setTimeout(()=>{_imeComposing=false;},0);});
   _c.addEventListener('blur',()=>{_imeComposing=false;});
+  _c.addEventListener('keyup',e=>{if(!e.isComposing&&e.keyCode!==229)_imeComposing=false;});
 })();
-function _isImeEnter(e){return e.isComposing||e.keyCode===229||_imeComposing;}
+function _isImeEnter(e){
+  if(window._imeEnterSends) return false;
+  return e.isComposing||e.keyCode===229||_imeComposing;
+}
 window._isImeEnter=_isImeEnter;
 // #3076: a touch-primary device (`pointer:coarse`) can still have a
 // physical keyboard attached (Android tablet + Bluetooth keyboard,
@@ -2415,6 +2419,7 @@ function _isNumpadEnter(e){
 // falls through to the `else { send() }` branch — sending the message instead
 // of inserting a newline (issue: mobile Enter sends on fresh page load).
 try{ window._sendKey=localStorage.getItem('hermes-pref-send_key')||'enter'; }catch(_){ window._sendKey='enter'; }
+try{ window._imeEnterSends=localStorage.getItem('hermes-pref-ime_enter_sends')==='true'; }catch(_){ window._imeEnterSends=false; }
 $('msg').addEventListener('keydown',e=>{
   // Autocomplete navigation when dropdown is open
   const dd=$('cmdDropdown');
@@ -3307,6 +3312,7 @@ window._mirrorSpeechSettingsFromServer=_mirrorSpeechSettingsFromServer;
     _bootSettings=s;
     if(typeof checkWebUIVersionSkew==='function'){try{checkWebUIVersionSkew(s);}catch(_){}}
     window._sendKey=s.send_key||'enter';
+    window._imeEnterSends=!!s.ime_enter_sends;
     // Persist default workspace so the blank new-chat page can show it
     // and workspace actions (New file/folder) work before the first session (#804).
     if(s.default_workspace) S._profileDefaultWorkspace=s.default_workspace;

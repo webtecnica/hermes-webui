@@ -11522,6 +11522,7 @@ _SETTINGS_DEFAULTS = {
     "default_workspace": str(DEFAULT_WORKSPACE),
     "onboarding_completed": False,
     "send_key": "enter",  # 'enter', 'ctrl+enter', or 'shift+enter'
+    "ime_enter_sends": False,  # #7348: allow IME Enter to send message directly (Korean Hangul input)
     "show_token_usage": False,  # show input/output token badge below assistant messages
     "show_quota_chip": False,  # show ambient provider quota chip in composer footer (default off; wide desktop only when enabled, see style.css @media)
     "show_conversation_outline": False,  # show opt-in desktop jump-to-question outline panel
@@ -11892,6 +11893,7 @@ _SETTINGS_FLOAT_RANGES = {
 }
 _SETTINGS_BOOL_KEYS = {
     "onboarding_completed",
+    "ime_enter_sends",
     "show_token_usage",
     "show_quota_chip",
     "show_conversation_outline",
