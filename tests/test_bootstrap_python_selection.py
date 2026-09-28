@@ -103,3 +103,31 @@ def test_local_venv_is_created_with_symlinks(monkeypatch, tmp_path):
             pass  # expected — fake _python_can_run_webui_and_agent always returns False
 
         mock_builder.assert_called_once_with(with_pip=True, symlinks=True)
+
+
+def test_probe_imports_agent_before_yaml(monkeypatch):
+    """The probe must import run_agent before yaml so hermes_bootstrap activates
+
+    the managed runtime dependencies (#7848).
+    """
+    executed_scripts = []
+
+    def fake_run(args, capture_output=False, text=False, env=None):
+        if len(args) >= 3 and args[1] == "-c":
+            executed_scripts.append(args[2])
+
+        class FakeResult:
+            returncode = 0
+
+        return FakeResult()
+
+    monkeypatch.setattr(bootstrap.subprocess, "run", fake_run)
+    assert bootstrap._python_can_run_webui_and_agent("python") is True
+    assert len(executed_scripts) == 1
+    script = executed_scripts[0]
+    agent_pos = script.find("from run_agent import AIAgent")
+    yaml_pos = script.find("import yaml")
+    assert agent_pos != -1, "run_agent import missing from probe script"
+    assert yaml_pos != -1, "yaml import missing from probe script"
+    assert agent_pos < yaml_pos, "agent must be imported before yaml"
+
