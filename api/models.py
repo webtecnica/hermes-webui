@@ -9737,6 +9737,9 @@ def _project_state_db_message(row, available, id_col, optional):
         msg['_state_db_row_id'] = row['id']
     if msg.get('role') == 'tool' and msg.get('tool_name') and not msg.get('name'):
         msg['name'] = msg['tool_name']
+    if msg.get('role') == 'user' and msg.get('display_kind') == 'steer':
+        from api.streaming import _unwrap_steer_row_oob_marker
+        _unwrap_steer_row_oob_marker(msg)
     return msg
 
 
@@ -9846,6 +9849,7 @@ def get_state_db_session_messages(
                 # sidecar in the WebUI's internal history; the provider-safe
                 # projection strips it before any direct API request.
                 'api_content',
+                'display_kind',
             ]
             id_col = ['id'] if 'id' in available else []
             revision_cols = []
@@ -10235,6 +10239,8 @@ def get_state_db_regeneration_tail_snapshot(
                 prefix_key_cols += ", tool_calls"
             if 'api_content' in available:
                 prefix_key_cols += ", api_content"
+            if 'display_kind' in available:
+                prefix_key_cols += ", display_kind"
             prefix_key_sql = (
                 f"SELECT {prefix_key_cols} FROM messages "
                 "WHERE session_id = ? AND timestamp IS NOT NULL AND timestamp < ? "
@@ -10245,20 +10251,25 @@ def get_state_db_regeneration_tail_snapshot(
             except Exception:
                 cur.execute("ROLLBACK")
                 return None
-            prefix_keys = [
-                _session_message_visible_key({
+            prefix_rows = cur.fetchall()
+            prefix_keys = []
+            for r in prefix_rows:
+                p_msg = {
                     "role": r["role"],
                     "content": _decode_state_db_content(r["content"]),
                     "tool_calls": _json_loads_if_string(r["tool_calls"]) if "tool_calls" in r.keys() and r["tool_calls"] is not None else None,
                     "api_content": r["api_content"] if "api_content" in r.keys() else None,
-                }, normalize_workspace_prefix=True)
-                for r in cur.fetchall()
-            ]
+                }
+                if "display_kind" in r.keys() and r["display_kind"]:
+                    p_msg["display_kind"] = r["display_kind"]
+                    from api.streaming import _unwrap_steer_row_oob_marker
+                    _unwrap_steer_row_oob_marker(p_msg)
+                prefix_keys.append(_session_message_visible_key(p_msg, normalize_workspace_prefix=True))
             # 3) bounded tail (rows >= floor) with the canonical projection
             optional = [
                 'tool_call_id', 'tool_calls', 'tool_name', 'reasoning',
                 'reasoning_details', 'codex_reasoning_items', 'reasoning_content',
-                'codex_message_items', 'api_content',
+                'codex_message_items', 'api_content', 'display_kind',
             ]
             tail_select = ['id', 'role', 'content', 'timestamp'] if 'id' in available else ['role', 'content', 'timestamp']
             for col in optional + (['active'] if 'active' in available else []):
