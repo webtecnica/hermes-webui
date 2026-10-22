@@ -62,6 +62,24 @@ For multi-tenant or hostile-container environments, rebuild with your own runtim
 and supervisor assumptions. Development images that need package-manager convenience should add
 those tools in a dev-only Dockerfile instead of reintroducing passwordless sudo to production.
 
+## Graceful container shutdown and stop drain
+
+When `docker stop` or `docker compose down` stops the container, Docker sends `SIGTERM` to the container process. The entrypoint drops privileges via `setpriv` (leaving no intermediate `su` process) and `exec`s `python server.py` directly, so the signal reaches the WebUI server immediately.
+
+The server's graceful shutdown drain:
+1. Closes admission to new HTTP and chat requests.
+2. Allows in-flight turns to finish within `HERMES_WEBUI_SHUTDOWN_DRAIN_SECONDS` (default 90s); remaining incomplete runs are settled durably as interrupted.
+3. Flushes in-flight background memory commits via `drain_all_on_shutdown()`.
+4. Closes listeners and exits cleanly with status 0.
+
+To give the server sufficient time to drain in-flight turns and commit memory before Docker sends `SIGKILL`, all provided Compose files configure:
+
+```yaml
+    stop_grace_period: 120s
+```
+
+If you manage containers with custom commands or orchestrators (e.g. Kubernetes, Nomad), set a termination grace period of at least 120 seconds (`docker stop -t 120`).
+
 ## 5-minute quickstart (single container)
 
 ```bash

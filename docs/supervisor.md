@@ -206,7 +206,7 @@ The following set no env var that we can reliably detect. Pass
 - **daemontools** / ``svc``
 - **PM2** (Node.js process manager occasionally repurposed for Python)
 - **Foreman** / **Honcho** (Procfile-style)
-- **Docker** with a custom CMD entrypoint that doesn't already use ``exec``
+- **Docker** with a custom CMD entrypoint that doesn't already use ``exec`` (the official Hermes Web UI image drops privileges via ``setpriv`` and ``exec``s ``python server.py`` directly so ``SIGTERM`` triggers the graceful shutdown drain; custom entrypoints should do the same and set ``stop_grace_period: 120s`` in compose)
 - **Custom shell-script supervisors** that fork-and-wait
 
 If your supervisor isn't in the auto-detect list and you see the orphan-PID

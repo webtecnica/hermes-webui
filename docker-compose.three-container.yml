@@ -171,6 +171,8 @@ services:
       # for the WebUI; do NOT copy this value to the agent service block.
       # - HERMES_SKIP_CHMOD=1
       # - HERMES_HOME_MODE=0640
+    # Allow the server shutdown drain to complete in-flight work and memory commits before SIGKILL (#8487)
+    stop_grace_period: 120s
     restart: unless-stopped
     networks:
       - hermes-net

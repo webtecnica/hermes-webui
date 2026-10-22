@@ -398,7 +398,11 @@ if [ "A${whoami}" == "Aroot" ]; then
 
   # restart the script as hermeswebui set with the correct UID/GID this time
   echo "-- Restarting as hermeswebui user with UID ${WANTED_UID} GID ${WANTED_GID}"
-  exec su -s /bin/bash -c "exec \"${script_fullname}\"" hermeswebui || error_exit "subscript failed"
+  if command -v setpriv >/dev/null 2>&1; then
+    exec setpriv --reuid="${WANTED_UID}" --regid="${WANTED_GID}" --init-groups /bin/bash "${script_fullname}"
+  else
+    exec su -s /bin/bash -c "exec \"${script_fullname}\"" hermeswebui || error_exit "subscript failed"
+  fi
 fi
 
 # If we are here, the script is started as an unprivileged runtime user.
@@ -888,7 +892,6 @@ if [ -n "$_agent_src" ] && [ -f /app/scripts/docker_venv_python.py ] && command 
 fi
 
 echo ""; echo "== Running hermes-webui"
-cd /app; python server.py || error_exit "hermes-webui failed or exited with an error"
-
-# we should never be here because the server should be running indefinitely, but if we are, we exit safely
-ok_exit "Clean exit"
+cd /app || error_exit "Failed to enter /app"
+[ -f server.py ] || error_exit "server.py not found under /app"
+exec python server.py
