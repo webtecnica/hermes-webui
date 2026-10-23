@@ -96,3 +96,63 @@ def test_session_rename_blur_commits_current_title():
         "blur should commit the edited title so rename matches the long-standing "
         "top-level session behavior"
     )
+
+
+# ---------------------------------------------------------------------------
+# #8503: Sidebar freezes when rename starts on a detached row
+# ---------------------------------------------------------------------------
+
+
+def test_session_rename_starter_guards_detached_display_element():
+    """#8503: starting a rename on a detached row must return before setting _renamingSid."""
+    block = _session_rename_block()
+    guard_pos = block.find("if(!displayEl||!displayEl.isConnected) return;")
+    set_pos = block.find("_renamingSid=session.session_id;")
+    assert guard_pos >= 0, (
+        "_buildSessionRenameStarter must check displayEl.isConnected to prevent "
+        "detached rows from capturing global rename state"
+    )
+    assert guard_pos < set_pos, (
+        "isConnected check must occur BEFORE setting _renamingSid"
+    )
+
+
+def test_session_row_dblclick_guards_detached_element():
+    """#8503: double click on a detached row element must bail before calling startRename."""
+    start = SESSIONS_JS.find("el.ondblclick=(e)=>{")
+    assert start >= 0
+    end = SESSIONS_JS.find("el.addEventListener('touchstart'", start)
+    dblclick_block = SESSIONS_JS[start:end]
+    assert "if (!el.isConnected) return;" in dblclick_block
+
+
+def test_session_rename_starter_detached_row_simulation():
+    """#8503: behavioral Node.js simulation: invoking rename starter on detached element leaves _renamingSid null."""
+    import subprocess
+    block = _session_rename_block()
+    script = (
+        "let _renamingSid = null;\n"
+        "let _loadingSessionId = null;\n"
+        "function _isReadOnlySession() { return false; }\n"
+        "function closeSessionActionMenu() {}\n"
+        "function _sessionDisplayTitle() { return 'Test'; }\n"
+        "function _markNonCredentialInput() {}\n"
+        "const S = {};\n"
+        "const _allSessions = [];\n"
+        + block + "\n"
+        "const detachedEl = { isConnected: false };\n"
+        "const starter1 = _buildSessionRenameStarter({ session_id: 'sid-1' }, detachedEl, () => {});\n"
+        "starter1();\n"
+        "if (_renamingSid !== null) throw new Error('_renamingSid was set for detached element: ' + _renamingSid);\n"
+        "let replacedWith = null;\n"
+        "const connectedEl = { isConnected: true, replaceWith: (inp) => { replacedWith = inp; } };\n"
+        "global.document = { createElement: () => ({ addEventListener: () => {}, focus: () => {}, select: () => {} }) };\n"
+        "global.window = {};\n"
+        "global.setTimeout = () => {};\n"
+        "const starter2 = _buildSessionRenameStarter({ session_id: 'sid-2' }, connectedEl, () => {});\n"
+        "starter2();\n"
+        "if (_renamingSid !== 'sid-2') throw new Error('Expected _renamingSid sid-2, got: ' + _renamingSid);\n"
+    )
+    proc = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True)
+    assert proc.returncode == 0
+

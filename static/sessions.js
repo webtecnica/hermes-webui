@@ -6207,6 +6207,8 @@ function _releaseFocusLikeRowPress(pressedTitle){
 
 function _buildSessionRenameStarter(session, displayEl, renderDisplay){
   return ()=>{
+    // #8503: ignore rename activation if the target element was detached from the document
+    if(!displayEl||!displayEl.isConnected) return;
     if(_isReadOnlySession(session)){ if(typeof showToast==='function') showToast('Read-only imported sessions cannot be renamed.',3000); return; }
     if(_loadingSessionId&&_loadingSessionId!==session.session_id) return;
 
@@ -11420,8 +11422,9 @@ function renderSessionListFromCache(){
       if(_renamingSid) return;
       if(actions&&actions.contains(e.target)) return;
       if(_sessionSelectMode){e.stopPropagation();if(!readOnly)toggleSessionSelect(s.session_id);return;}
-      // Guard: prevent renaming if session is currently being loaded
+      // Guard: prevent renaming if session is currently being loaded or row is detached (#8503)
       if (_loadingSessionId && _loadingSessionId !== s.session_id) return;
+      if (!el.isConnected) return;
       startRename();
     };
     el.addEventListener('touchstart',(e)=>{
