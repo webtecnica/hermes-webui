@@ -1728,6 +1728,8 @@ def _reload_dotenv(home: Path):
             if line and not line.startswith('#') and '=' in line:
                 k, v = line.split('=', 1)
                 k = k.strip()
+                if k.startswith('export '):
+                    k = k[len('export '):].strip()
                 v = v.strip().strip('"').strip("'")
                 if k and v:
                     # Operator/deployment-level keys are never overridable by a

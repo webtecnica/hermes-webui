@@ -2550,3 +2550,100 @@ def test_shared_url_key_a_profile_config_naming_the_shared_url_still_sends_the_s
     url, key = gateway_chat._gateway_endpoint_for_profile("beta")
     assert url.rstrip("/") == "http://gw.local:8642" and key == "shared-root-key", (url, key)
 
+
+# ── #8439: ctl.sh preload of named HERMES_HOME .env isolation ─────────────────────────
+
+
+def test_8439_root_process_preloaded_launch_home_env_never_receives_other_keys(tmp_path, monkeypatch):
+    """#8439: Process starts on root profile, but ctl.sh preloaded alpha's .env into os.environ.
+    A key-only profile (beta) must not send its own alias or key to alpha's Gateway,
+    and alpha's own session remains exempt and resolves normally."""
+    import api.profiles as profiles
+
+    envs = {
+        "default": {},
+        "alpha": {
+            "HERMES_WEBUI_GATEWAY_BASE_URL": "http://gw.local/alpha-preloaded",
+            "HERMES_WEBUI_GATEWAY_API_KEY": "alpha-alias",
+        },
+        "beta": {"HERMES_WEBUI_GATEWAY_API_KEY": "beta-alias"},
+        "gamma": {"API_SERVER_KEY": "gamma-key"},
+    }
+    homes = _profile_homes(tmp_path, monkeypatch, envs, config_url=None)
+    monkeypatch.setattr(profiles, "get_process_profile_home", lambda: homes["default"])
+    monkeypatch.setattr(profiles, "_INITIAL_HERMES_HOME", str(homes["alpha"]))
+    monkeypatch.setattr(profiles, "_INITIAL_HERMES_HOME_DOTENV", {
+        "HERMES_WEBUI_GATEWAY_BASE_URL": "http://gw.local/alpha-preloaded",
+        "HERMES_WEBUI_GATEWAY_API_KEY": "alpha-alias",
+    })
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://gw.local/alpha-preloaded")
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_API_KEY", "alpha-alias")
+
+    # beta has its own alias: must resolve to alpha's pair, never beta-alias on alpha's URL
+    assert gateway_chat._gateway_endpoint_for_profile("beta") == ("http://gw.local/alpha-preloaded", "alpha-alias")
+    # gamma has API_SERVER_KEY: must resolve to alpha's pair
+    assert gateway_chat._gateway_endpoint_for_profile("gamma") == ("http://gw.local/alpha-preloaded", "alpha-alias")
+    # alpha's own session is exempt
+    assert gateway_chat._gateway_endpoint_for_profile("alpha") == ("http://gw.local/alpha-preloaded", "alpha-alias")
+
+
+def test_8439_divergent_process_profile_preloaded_launch_home_returns_launch_pair(tmp_path, monkeypatch):
+    """#8439: ctl.sh preloaded alpha's .env, but sticky active_profile is gamma.
+    Beta's session (key only) must resolve to alpha's pair, never mixing alpha's URL with gamma's key."""
+    import api.profiles as profiles
+
+    envs = {
+        "default": {},
+        "alpha": {
+            "HERMES_WEBUI_GATEWAY_BASE_URL": "http://gw.local/alpha-preloaded",
+            "HERMES_WEBUI_GATEWAY_API_KEY": "alpha-alias",
+        },
+        "gamma": {
+            "HERMES_WEBUI_GATEWAY_API_KEY": "gamma-alias",
+        },
+        "beta": {"API_SERVER_KEY": "beta-key"},
+    }
+    homes = _profile_homes(tmp_path, monkeypatch, envs, config_url=None)
+    _mirror_named_process_profile(monkeypatch, homes, envs, process="gamma")
+    monkeypatch.setattr(profiles, "_INITIAL_HERMES_HOME", str(homes["alpha"]))
+    monkeypatch.setattr(profiles, "_INITIAL_HERMES_HOME_DOTENV", {
+        "HERMES_WEBUI_GATEWAY_BASE_URL": "http://gw.local/alpha-preloaded",
+        "HERMES_WEBUI_GATEWAY_API_KEY": "alpha-alias",
+    })
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://gw.local/alpha-preloaded")
+
+    # beta must get alpha's pair, not gamma's key with alpha's URL
+    assert gateway_chat._gateway_endpoint_for_profile("beta") == ("http://gw.local/alpha-preloaded", "alpha-alias")
+    # alpha's own session gets alpha's pair
+    assert gateway_chat._gateway_endpoint_for_profile("alpha") == ("http://gw.local/alpha-preloaded", "alpha-alias")
+
+
+def test_8439_reload_dotenv_strips_export_prefix_and_unloads_cleanly(tmp_path, monkeypatch):
+    """#8439: export KEY=V lines in profile .env have export prefix stripped in _reload_dotenv."""
+    import os
+    import api.profiles as profiles
+
+    profile_dir = tmp_path / "profiles" / "test_export"
+    profile_dir.mkdir(parents=True)
+    env_file = profile_dir / ".env"
+    env_file.write_text("export TEST_VAR_EXPORT=val123\nANOTHER_VAR=val456\n", encoding="utf-8")
+
+    monkeypatch.delenv("TEST_VAR_EXPORT", raising=False)
+    monkeypatch.delenv("ANOTHER_VAR", raising=False)
+    monkeypatch.delenv("export TEST_VAR_EXPORT", raising=False)
+
+    profiles._reload_dotenv(profile_dir)
+
+    assert os.environ.get("TEST_VAR_EXPORT") == "val123"
+    assert "export TEST_VAR_EXPORT" not in os.environ
+    assert "TEST_VAR_EXPORT" in profiles._loaded_profile_env_keys
+
+    # Switching away unloads the key
+    other_dir = tmp_path / "profiles" / "other"
+    other_dir.mkdir(parents=True)
+    (other_dir / ".env").write_text("", encoding="utf-8")
+    profiles._reload_dotenv(other_dir)
+
+    assert "TEST_VAR_EXPORT" not in os.environ
+
+

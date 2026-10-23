@@ -1918,6 +1918,52 @@ def _config_url_may_belong_to_a_profile(profiles_mod, process_home) -> bool:
     return False
 
 
+def _snapshot_supplied_gateway_url(profiles_mod, raw_env_url: str) -> Path | None:
+    """Return the named launch home Path if raw_env_url came from the startup snapshot of its .env, else None."""
+    raw_env_url = str(raw_env_url or "").strip()
+    if not raw_env_url:
+        return None
+    launch_home = str(getattr(profiles_mod, "_INITIAL_HERMES_HOME", "") or "").strip()
+    if not launch_home:
+        return None
+    try:
+        p = Path(launch_home).expanduser()
+        if _same_profile_home(p, profiles_mod.get_hermes_home_for_profile("")):
+            return None
+    except Exception:
+        return None
+    launch_dotenv = getattr(profiles_mod, "_INITIAL_HERMES_HOME_DOTENV", None) or {}
+    if str(launch_dotenv.get(_WEBUI_GATEWAY_BASE_URL_ENV) or "").strip() == raw_env_url:
+        return p
+    return None
+
+
+def _launch_home_endpoint_pair(profiles_mod, launch_home: Path, default_url: str) -> tuple[str, str]:
+    """Resolved (URL, key) pair of a named launch home whose .env preloaded the shared Gateway settings (#8439)."""
+    from api.config import _load_yaml_config_file_raw
+
+    raw_cfg = _load_yaml_config_file_raw(_profile_config_path(launch_home), _copy=False)
+    own_env = profiles_mod.filter_runtime_env_for_gateway_parity(profiles_mod.get_profile_runtime_env(launch_home))
+    snapshot = getattr(profiles_mod, "_INITIAL_HERMES_HOME_DOTENV", None) or {}
+    cfg_url = str(raw_cfg.get("webui_gateway_base_url") or "").strip() if isinstance(raw_cfg, dict) else ""
+    url = (
+        str(own_env.get(_WEBUI_GATEWAY_BASE_URL_ENV) or "").strip()
+        or str(snapshot.get(_WEBUI_GATEWAY_BASE_URL_ENV) or "").strip()
+        or cfg_url
+        or default_url
+    )
+    alias = (
+        str(own_env.get(_WEBUI_GATEWAY_API_KEY_ENV) or "").strip()
+        or str(snapshot.get(_WEBUI_GATEWAY_API_KEY_ENV) or "").strip()
+    )
+    key = (
+        alias
+        or str(own_env.get("API_SERVER_KEY") or "").strip()
+        or str(snapshot.get("API_SERVER_KEY") or "").strip()
+    )
+    return url, key
+
+
 def _shared_url_may_belong_to_process_profile(session_home) -> bool:
     """True unless the shared Gateway URL is provably the launcher's, under a NAMED process profile (#8432).
 
@@ -1932,6 +1978,10 @@ def _shared_url_may_belong_to_process_profile(session_home) -> bool:
     """
     from api import profiles as _profiles
 
+    raw_env_url = str(os.environ.get(_WEBUI_GATEWAY_BASE_URL_ENV) or "").strip()
+    launch_home = _snapshot_supplied_gateway_url(_profiles, raw_env_url)
+    if launch_home is not None and _same_profile_home(session_home, launch_home):
+        return False
     if _process_profile_is_root():
         return False
     try:
@@ -1940,7 +1990,6 @@ def _shared_url_may_belong_to_process_profile(session_home) -> bool:
             return False
     except Exception:
         process_home = None
-    raw_env_url = str(os.environ.get(_WEBUI_GATEWAY_BASE_URL_ENV) or "").strip()
     try:
         if raw_env_url:
             return _env_value_is_profile_sourced(_profiles, _WEBUI_GATEWAY_BASE_URL_ENV, raw_env_url)
@@ -1984,6 +2033,8 @@ def _gateway_endpoint_for_profile(profile_name) -> tuple[str, str]:
       (URL and key from one source, as v0.52.492 sends) unless the shared URL is provably the launcher's (an
       export that no profile .env supplied, or an operator config file outside every profile home), because that
       URL may be a profile's own Gateway and must never receive another profile's key.
+    - Exception (#8439): when a shell launcher preloaded a NAMED launch home's .env, a key-only profile never
+      sends its key to that Gateway; it returns the launch-home profile's own resolved pair.
     """
     from api import profiles as _profiles
     from api.config import _expand_env_vars, _load_yaml_config_file_raw, _thread_ctx, get_config
@@ -2003,8 +2054,14 @@ def _gateway_endpoint_for_profile(profile_name) -> tuple[str, str]:
     # An alias the profile loader mirrored from a NAMED active profile's .env is that profile's, not shared; one
     # mirrored from the root profile's ~/.hermes/.env is the shared alias.
     shared_alias = str(os.environ.get(_WEBUI_GATEWAY_API_KEY_ENV) or "").strip()
-    if _WEBUI_GATEWAY_API_KEY_ENV in _profiles._loaded_profile_env_keys and not _process_profile_is_root():
-        shared_alias = ""
+    if shared_alias and _env_value_is_profile_sourced(_profiles, _WEBUI_GATEWAY_API_KEY_ENV, shared_alias):
+        launch_home = _snapshot_supplied_gateway_url(_profiles, str(os.environ.get(_WEBUI_GATEWAY_BASE_URL_ENV) or ""))
+        is_owner = (
+            (_session_is_process_profile(home) and not _process_profile_is_root())
+            or (launch_home is not None and _same_profile_home(home, launch_home))
+        )
+        if not is_owner:
+            shared_alias = ""
 
     if not (own_url_env or own_url_cfg or own_key):
         return shared_url, shared_key
@@ -2033,11 +2090,18 @@ def _gateway_endpoint_for_profile(profile_name) -> tuple[str, str]:
             )
     if url != shared_url:
         return url, own_key  # the profile's own Gateway: its own key or none, never the shared one
-    if not own_url_env and not own_url_cfg and own_key and _shared_url_may_belong_to_process_profile(home):
-        # #8432: this profile set a key but no URL, and the "shared" URL may be the NAMED process profile's own
-        # (mirrored from its .env or read from its config). Never send this profile's key there; use the process
-        # pair, URL and key from one source, exactly what v0.52.492 sends for every fresh turn.
-        return shared_url, shared_key
+    if not own_url_env and not own_url_cfg and own_key:
+        launch_home = _snapshot_supplied_gateway_url(_profiles, shared_url)
+        if launch_home is not None and not _same_profile_home(home, launch_home):
+            # #8439: the shared URL was preloaded by a shell launcher from a NAMED launch home's .env.
+            # Never send another profile's key there, under either the root profile or a divergent
+            # process profile; return the launch-home profile's own resolved pair.
+            return _launch_home_endpoint_pair(_profiles, launch_home, shared_url)
+        if _shared_url_may_belong_to_process_profile(home):
+            # #8432: this profile set a key but no URL, and the "shared" URL may be the NAMED process profile's own
+            # (mirrored from its .env or read from its config). Never send this profile's key there; use the process
+            # pair, URL and key from one source, exactly what v0.52.492 sends for every fresh turn.
+            return shared_url, shared_key
     if _session_is_process_profile(home):
         # The process profile's own sessions: the shared key IS this profile's key, read fresh from its .env.
         return url, (own_alias or shared_alias or own_key or shared_key)
